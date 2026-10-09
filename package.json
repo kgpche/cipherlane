@@ -1,0 +1,13 @@
+{
+  "name": "cipherlane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "密道 · cipherlane —— 局域网端到端加密文件传输：一个链接收发，HTTP 明文环境下内容依然加密",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/aesgcm.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
