@@ -27,8 +27,20 @@ const ACK_IDLE_MS = 2 * 60 * 1000
 const LONGPOLL_MS = 25 * 1000
 const ROOM_RE = new RegExp(`^[0-9A-Za-z]{${ROOM_ID_LEN}}$`)
 
+// 设备直发（定向传输）：一个局域网 IP 视为一台终端
+const DEVICE_TTL_MS = 20 * 1000        // 心跳超时即离线（客户端 5s 心跳）
+const DEVICE_MEM_MS = 5 * 60 * 1000    // 离线后内存保留时长（清扫用）
+const DEVICES_MAX = 256
+const DEVICE_NAME_MAX = 32
+const PUB_RE = /^[A-Za-z0-9_-]{43}$/   // 32 字节 base64url（X25519 公钥）
+const OFFER_TTL_MS = 5 * 60 * 1000     // 待处理邀请有效期
+const OFFERS_MAX = 8                   // 单设备待处理邀请上限
+const REJECT_GRACE_MS = 2 * 60 * 1000  // 被拒房间保留时长（发送方能读到 rejected 再回收）
+
 const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 const rooms = new Map()
+const devices = new Map()      // ip → { ip, id, secret, name, pub, since, lastSeen }
+const offersById = new Map()   // 邀请 id → room（房间销毁时连带清理）
 let globalBuffered = 0
 
 // ---------- 工具 ----------
@@ -37,6 +49,13 @@ function randRoomId() {
   let s = ''
   for (let i = 0; i < ROOM_ID_LEN; i++) s += B62[b[i] % 62]
   return s
+}
+const randId = () => crypto.randomBytes(8).toString('hex')
+
+function clientIp(req) {
+  let ip = req.socket.remoteAddress || ''
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7) // IPv4 映射地址归一化
+  return ip
 }
 
 function sendJson(res, code, obj) {
@@ -79,6 +98,9 @@ for (const [route, file, type] of [
   ['/index.html', 'index.html', 'text/html; charset=utf-8'],
   ['/app.js', 'app.js', 'text/javascript; charset=utf-8'],
   ['/aesgcm.js', 'aesgcm.js', 'text/javascript; charset=utf-8'],
+  ['/sha256.js', 'sha256.js', 'text/javascript; charset=utf-8'],
+  ['/x25519.js', 'x25519.js', 'text/javascript; charset=utf-8'],
+  ['/avatar.js', 'avatar.js', 'text/javascript; charset=utf-8'],
   ['/style.css', 'style.css', 'text/css; charset=utf-8'],
 ]) {
   try {
@@ -141,7 +163,39 @@ function destroyRoom(room) {
     w.fail(410, 'gone')
   }
   room.waiters.length = 0
+  if (room.offer) {
+    offersById.delete(room.offer.id)
+    console.log(`[offer] - ${room.offer.id}（房间销毁）`)
+  }
   console.log(`[room] - ${room.id}`)
+}
+
+// ---------- 设备与邀请 ----------
+function deviceAlive(d) {
+  return d && Date.now() - d.lastSeen <= DEVICE_TTL_MS
+}
+
+// 某设备当前待处理的邀请（跳过已过期的）
+function pendingOffersFor(ip) {
+  const now = Date.now()
+  const list = []
+  for (const room of rooms.values()) {
+    const o = room.offer
+    if (o && o.state === 'pending' && o.toIp === ip && now - o.createdAt <= OFFER_TTL_MS)
+      list.push({ id: o.id, room: room.id, pub: o.pub, hint: o.hint, from: { ip: o.fromIp, name: o.fromName } })
+  }
+  return list
+}
+
+const offerWaiters = new Map() // ip → Set<长轮询等待者>
+function notifyOffers(ip) {
+  const set = offerWaiters.get(ip)
+  if (!set) return
+  offerWaiters.set(ip, new Set())
+  for (const w of set) {
+    w.clearTimer()
+    w.ok()
+  }
 }
 
 // GET /api/rooms/:id/chunk?i=N —— 长轮询取分片（接收方顺序拉取）
@@ -213,6 +267,97 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/favicon.ico') { res.writeHead(204); return res.end() }
 
+    // POST /api/presence —— 设备心跳注册（一个 IP 一台终端，最后写入者生效）
+    if (p === '/api/presence' && req.method === 'POST') {
+      const ip = clientIp(req)
+      let body
+      try { body = JSON.parse((await readBody(req, 2048)).toString('utf8') || '{}') }
+      catch { return sendJson(res, 400, { error: 'bad-body' }) }
+      const name = typeof body.name === 'string' && body.name.trim()
+        ? body.name.trim().slice(0, DEVICE_NAME_MAX) : '未命名设备'
+      if (typeof body.pub !== 'string' || !PUB_RE.test(body.pub)) return sendJson(res, 400, { error: 'bad-pub' })
+
+      const prev = devices.get(ip)
+      if (prev && req.headers['x-device-secret'] === prev.secret) {
+        prev.name = name
+        prev.pub = body.pub
+        prev.lastSeen = Date.now()
+        return sendJson(res, 200, { ip, id: prev.id, secret: prev.secret })
+      }
+      if (devices.size >= DEVICES_MAX && !prev) return sendJson(res, 503, { error: 'too-many-devices' })
+      const fresh = { ip, id: randId(), secret: crypto.randomBytes(16).toString('hex'), name, pub: body.pub, since: Date.now(), lastSeen: Date.now() }
+      devices.set(ip, fresh)
+      console.log(`[device] + ${ip} ${name}`)
+      return sendJson(res, 200, { ip, id: fresh.id, secret: fresh.secret })
+    }
+
+    // GET /api/devices —— 在线设备列表
+    if (p === '/api/devices' && req.method === 'GET') {
+      const now = Date.now()
+      const list = []
+      for (const d of devices.values())
+        if (now - d.lastSeen <= DEVICE_TTL_MS) list.push({ ip: d.ip, id: d.id, name: d.name, pub: d.pub })
+      return sendJson(res, 200, { devices: list })
+    }
+
+    // GET /api/offers —— 长轮询本机待处理邀请
+    if (p === '/api/offers' && req.method === 'GET') {
+      const ip = clientIp(req)
+      const dev = devices.get(ip)
+      if (!dev || req.headers['x-device-secret'] !== dev.secret) return sendJson(res, 401, { error: 'bad-secret' })
+      dev.lastSeen = Date.now()
+      const respond = () => sendJson(res, 200, { offers: pendingOffersFor(ip) })
+      if (pendingOffersFor(ip).length) return respond()
+      const w = {
+        settled: false,
+        clearTimer() { clearTimeout(this.timer) },
+        ok() {
+          if (this.settled) return
+          this.settled = true
+          respond()
+        },
+      }
+      w.timer = setTimeout(() => {
+        w.settled = true
+        const set = offerWaiters.get(ip)
+        if (set) set.delete(w)
+        respond() // 到期返回空列表，客户端立即重试
+      }, LONGPOLL_MS)
+      if (!offerWaiters.has(ip)) offerWaiters.set(ip, new Set())
+      offerWaiters.get(ip).add(w)
+      res.on('close', () => {
+        w.settled = true
+        clearTimeout(w.timer)
+        const set = offerWaiters.get(ip)
+        if (set) set.delete(w)
+      })
+      return
+    }
+
+    // POST /api/offers/:id/accept | reject —— 接收方处理邀请
+    {
+      const mo = p.match(/^\/api\/offers\/([0-9a-f]{16})\/(accept|reject)\/?$/)
+      if (mo) {
+        const ip = clientIp(req)
+        const dev = devices.get(ip)
+        if (!dev || req.headers['x-device-secret'] !== dev.secret) return sendJson(res, 401, { error: 'bad-secret' })
+        const room = offersById.get(mo[1])
+        if (!room || room.offer.state !== 'pending' || room.offer.toIp !== ip)
+          return sendJson(res, 410, { error: 'gone' })
+        await readBody(req, 1024).catch(() => {})
+        room.lastActive = Date.now()
+        if (mo[2] === 'accept') {
+          room.offer.state = 'accepted'
+          console.log(`[offer] ✓ ${room.offer.id} ${room.offer.fromIp} → ${ip}`)
+          return sendJson(res, 200, { ok: true, room: room.id })
+        }
+        room.offer.state = 'rejected'
+        room.rejectedAt = Date.now()
+        console.log(`[offer] ✗ ${room.offer.id} ${room.offer.fromIp} → ${ip}`)
+        return sendJson(res, 200, { ok: true })
+      }
+    }
+
     // POST /api/rooms —— 发送方创建房间
     if (p === '/api/rooms' && req.method === 'POST') {
       await readBody(req, 1024).catch(() => {})
@@ -222,7 +367,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // /api/rooms/:id/...
-    const m = p.match(/^\/api\/rooms\/([0-9A-Za-z]{10})(?:\/(state|chunk|done|ack))?\/?$/)
+    const m = p.match(/^\/api\/rooms\/([0-9A-Za-z]{10})(?:\/(state|chunk|done|ack|offer))?\/?$/)
     if (m) {
       const room = rooms.get(m[1])
       const sub = m[2] || ''
@@ -244,7 +389,43 @@ const server = http.createServer(async (req, res) => {
           receiverSeen: room.receiverSeen,
           senderDone: room.senderDone,
           acked: room.acked,
+          offer: room.offer ? room.offer.state : null,
         })
+      }
+
+      // POST /api/rooms/:id/offer —— 发送方把定向邀请挂到房间（须在投递分片之前）
+      if (sub === 'offer' && req.method === 'POST') {
+        if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
+        if (room.offer) return sendJson(res, 409, { error: 'offer-exists' })
+        if (room.posted > 0) return sendJson(res, 409, { error: 'late-offer' })
+        let body
+        try { body = JSON.parse((await readBody(req, 8192)).toString('utf8') || '{}') }
+        catch { return sendJson(res, 400, { error: 'bad-body' }) }
+        const target = devices.get(String(body.to || ''))
+        if (!deviceAlive(target)) return sendJson(res, 404, { error: 'device-offline' })
+        if (typeof body.pub !== 'string' || !PUB_RE.test(body.pub)) return sendJson(res, 400, { error: 'bad-pub' })
+        if (typeof body.hint !== 'string' || body.hint.length > 4096) return sendJson(res, 400, { error: 'bad-hint' })
+        let pending = 0
+        for (const r of rooms.values())
+          if (r.offer && r.offer.state === 'pending' && r.offer.toIp === target.ip) pending++
+        if (pending >= OFFERS_MAX) return sendJson(res, 429, { error: 'too-many-offers' })
+        const fromIp = clientIp(req)
+        const sender = devices.get(fromIp)
+        room.offer = {
+          id: randId(),
+          toIp: target.ip,
+          fromIp,
+          fromName: deviceAlive(sender) ? sender.name : null,
+          pub: body.pub,
+          hint: body.hint,
+          state: 'pending',
+          createdAt: Date.now(),
+        }
+        offersById.set(room.offer.id, room)
+        room.lastActive = Date.now()
+        notifyOffers(target.ip)
+        console.log(`[offer] + ${room.offer.id} ${fromIp} → ${target.ip}`)
+        return sendJson(res, 200, { offer: room.offer.id })
       }
 
       if (sub === 'chunk' && req.method === 'POST') {
@@ -310,7 +491,10 @@ setInterval(() => {
   for (const room of rooms.values()) {
     const idle = now - room.lastActive
     if ((room.acked && idle > ACK_IDLE_MS) || idle > ROOM_IDLE_MS) destroyRoom(room)
+    else if (room.offer && room.offer.state === 'pending' && now - room.offer.createdAt > OFFER_TTL_MS) destroyRoom(room)
+    else if (room.rejectedAt && now - room.rejectedAt > REJECT_GRACE_MS) destroyRoom(room)
   }
+  for (const d of devices.values()) if (now - d.lastSeen > DEVICE_MEM_MS) devices.delete(d.ip)
 }, 30 * 1000)
 
 // ---------- 启动 ----------

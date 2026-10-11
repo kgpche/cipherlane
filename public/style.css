@@ -53,11 +53,11 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 
 /* 文本框 */
 .text-box { margin-top: 16px; }
-.text-box summary { cursor: pointer; color: var(--dim); padding: 6px 0; }
+.tb-label { color: var(--dim); font-size: 0.85rem; margin: 0 0 6px; }
 .text-box textarea {
   width: 100%;
   min-height: 110px;
-  margin: 10px 0;
+  margin: 0 0 10px;
   padding: 12px;
   border-radius: 10px;
   border: 1px solid var(--line);
@@ -65,6 +65,119 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
   color: var(--fg);
   font-size: 0.95rem;
   resize: vertical;
+}
+
+/* 我的名片 */
+.me-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin-bottom: 14px;
+}
+.me-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.me-name-row { display: flex; align-items: center; gap: 6px; }
+#me-name {
+  background: transparent;
+  border: none;
+  border-bottom: 1px dashed var(--line);
+  color: var(--fg);
+  font-size: 0.98rem;
+  font-weight: 600;
+  padding: 2px 0;
+  width: 200px;
+  outline: none;
+}
+#me-name:focus { border-bottom-color: var(--accent); }
+.dim { color: var(--dim); font-size: 0.78rem; }
+
+/* 几何头像 */
+.avatar { border-radius: 22%; display: block; }
+.avatar-wrap { display: inline-flex; align-items: center; flex-shrink: 0; }
+
+/* 在线设备网格 */
+.devices-title { margin: 6px 0 10px; }
+.devices {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.device {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 8px 10px;
+  background: var(--bg);
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  color: var(--fg);
+  transition: border-color 0.15s, background 0.15s;
+  min-width: 0;
+}
+.device:hover { border-color: var(--accent); }
+.device.selected { border-color: var(--accent2); background: rgba(55, 212, 160, 0.08); }
+.device .d-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device .d-ip { color: var(--dim); font-size: 0.75rem; }
+
+/* 收到的邀请 */
+#incoming-wrap { margin-bottom: 18px; }
+#incoming-wrap h2 { color: var(--warn); }
+.offer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg);
+  border: 1px solid var(--warn);
+  border-radius: 12px;
+  padding: 12px;
+  margin: 8px 0;
+}
+.o-body { flex: 1; min-width: 0; }
+.o-title { display: flex; gap: 6px; align-items: baseline; }
+.o-title .o-ip { color: var(--dim); font-size: 0.78rem; }
+.o-preview { font-size: 0.88rem; margin-top: 4px; }
+.o-error { color: var(--danger); font-size: 0.82rem; margin-top: 4px; }
+.o-actions { display: flex; flex-direction: column; gap: 8px; }
+.o-actions .btn { padding: 7px 16px; }
+
+/* 发送/接收视图中的对象行 */
+.target-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 0 0 14px;
+  font-size: 0.95rem;
+}
+.target-row .dim { font-size: 0.8rem; }
+
+/* 链接展示 */
+#link-row .link-flex { display: flex; gap: 10px; align-items: stretch; margin: 10px 0 18px; }
+#link-row code {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  word-break: break-all;
+  color: var(--accent2);
 }
 
 /* 按钮 */
@@ -83,19 +196,6 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 .btn.primary:hover { background: #3d7bf0; }
 .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 .btn.danger:hover { background: rgba(255, 95, 107, 0.1); }
-
-/* 链接展示 */
-.link-row { display: flex; gap: 10px; align-items: stretch; margin: 10px 0 18px; }
-.link-row code {
-  flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 12px;
-  font-size: 0.85rem;
-  word-break: break-all;
-  color: var(--accent2);
-}
 
 /* 进度条 */
 .bar { height: 10px; background: var(--bg); border-radius: 6px; overflow: hidden; margin: 6px 0; }

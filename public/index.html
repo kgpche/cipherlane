@@ -9,33 +9,58 @@
 <body>
 <header>
   <h1>🔐 cipherlane <span class="zh">密道</span></h1>
-  <p class="sub">一个链接收发 · 端到端加密（AES-256-GCM）· 局域网直传</p>
+  <p class="sub">选设备直发 · 端到端加密（AES-256-GCM）· 局域网 AirDrop</p>
 </header>
 
 <main>
-  <!-- 首页：发送入口 -->
+  <!-- 首页：设备直发 / 链接发送 -->
   <section id="view-landing" class="view card">
+    <div id="incoming-wrap" hidden>
+      <h2>📮 收到传输请求</h2>
+      <div id="incoming"></div>
+    </div>
+
+    <div class="me-row">
+      <span id="me-avatar"></span>
+      <div class="me-info">
+        <div class="me-name-row">
+          <input id="me-name" maxlength="32" spellcheck="false" title="你的设备名称（对方可见，随时可改）">
+          <span class="dim" title="点击修改名称">✎</span>
+        </div>
+        <span id="me-ip" class="dim"></span>
+      </div>
+    </div>
+
+    <h2 class="devices-title">在线设备 <span id="devices-count" class="dim"></span></h2>
+    <div id="devices" class="devices"></div>
+    <p id="devices-empty" class="hint">同一局域网的设备打开本页后会出现在这里；点击选中即可直发，无需传递链接。</p>
+
     <div id="drop" class="drop">
       <div class="drop-icon">📦</div>
       <p>把文件拖到这里，或 <button id="pick" class="btn">选择文件</button></p>
       <input id="file" type="file" hidden>
     </div>
-    <details class="text-box">
-      <summary>发送一段文本（剪贴板内容、密码、笔记…）</summary>
-      <textarea id="text" placeholder="粘贴要发送的文本（≤ 1MB）…"></textarea>
+
+    <div class="text-box">
+      <p class="tb-label">或发送一段文本（剪贴板内容、密码、笔记…）</p>
+      <textarea id="text" placeholder="粘贴要发送的文本（≤ 1MB）…（页面任意位置 Ctrl+V 也可以）"></textarea>
       <button id="send-text" class="btn primary">加密发送文本</button>
-    </details>
+      <p class="hint" id="mode-hint"></p>
+    </div>
     <p class="hint">内容在<b>你的浏览器里</b>加密后才发出，服务器只中转密文。<br>
-    密钥藏在链接 <code>#</code> 后面，按浏览器规范永远不会发送到服务器。</p>
+    设备直发的密钥由 X25519 在双方浏览器内派生，全程不过网；链接模式的密钥藏在链接 <code>#</code> 后面。</p>
   </section>
 
   <!-- 发送中 -->
   <section id="view-send" class="view card" hidden>
     <h2 id="send-title">📤 发送中</h2>
-    <p class="hint">把下面的链接发给对方（同一局域网内，任意设备浏览器打开即可）：</p>
-    <div class="link-row">
-      <code id="link"></code>
-      <button id="copy" class="btn">复制链接</button>
+    <p id="send-target" class="target-row" hidden></p>
+    <div id="link-row" class="link-row" hidden>
+      <p class="hint">把下面的链接发给对方（同一局域网内，任意设备浏览器打开即可）：</p>
+      <div class="link-flex">
+        <code id="link"></code>
+        <button id="copy" class="btn">复制链接</button>
+      </div>
     </div>
     <p id="send-status" class="status">🟡 等待接收方打开链接…</p>
     <div class="bar"><div id="bar-sent"></div></div>
@@ -48,6 +73,7 @@
   <!-- 接收 -->
   <section id="view-recv" class="view card" hidden>
     <h2>📥 接收</h2>
+    <p id="recv-from" class="target-row" hidden></p>
     <p id="recv-status" class="status">🟡 正在连接，等待发送方…</p>
     <div id="recv-fileinfo" class="fileinfo" hidden></div>
     <div class="bar"><div id="bar-recv"></div></div>
@@ -64,10 +90,13 @@
 </main>
 
 <footer>
-  <p>零依赖服务器 · 零知识中继 · 密钥不落服务器 · 篡改即报错</p>
+  <p>零依赖服务器 · X25519 设备直发 · 零知识中继 · 篡改即报错</p>
 </footer>
 
 <script src="/aesgcm.js"></script>
+<script src="/sha256.js"></script>
+<script src="/x25519.js"></script>
+<script src="/avatar.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

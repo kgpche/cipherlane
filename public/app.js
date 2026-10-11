@@ -1,5 +1,10 @@
 /* cipherlane · 密道 —— 前端逻辑
  *
+ * 两种模式：
+ *   - 设备直发：一个局域网 IP = 一台终端（名字 + 几何头像 + X25519 身份密钥）。
+ *     选设备 → 邀请（hint 预览加密）→ 对方接受 → X25519 派生房间密钥传输。
+ *   - 链接模式：随机密钥藏 URL #fragment，零知识中继（跨网段 / 经聊天工具）。
+ *
  * 加密层自动选择：
  *   - 安全上下文（localhost / https）→ 原生 WebCrypto
  *   - 局域网 http（非安全上下文，无 crypto.subtle）→ 纯 JS AES-256-GCM（aesgcm.js）
@@ -73,30 +78,33 @@ async function copyText(t) {
   } catch { return false }
 }
 
-// ---------- 加密层（每页一把密钥） ----------
+// ---------- 几何头像（avatar.js，单色相 Bauhaus 构图） ----------
+const avatarSvg = (seed, size) => Avatar.svg(seed, size)
+
+// ---------- 加密层（AES-GCM，双路径） ----------
 let sessionKey = null
 let importedKey = null
 
-async function seal(pt) {
+async function sealWith(rawKey, pt) {
   if (subtle) {
-    if (!importedKey)
-      importedKey = await subtle.importKey('raw', sessionKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
+    const k = await subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
     const iv = crypto.getRandomValues(new Uint8Array(12))
-    const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, importedKey, pt))
+    const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, k, pt))
     return concat(iv, ct)
   }
-  return AESGCM.seal(sessionKey, pt)
+  return AESGCM.seal(rawKey, pt)
 }
-async function unseal(packed) {
+async function unsealWith(rawKey, packed) {
   if (subtle) {
-    if (!importedKey)
-      importedKey = await subtle.importKey('raw', sessionKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
+    const k = await subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
     const iv = packed.subarray(0, 12)
     const ct = packed.subarray(12)
-    return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv }, importedKey, ct))
+    return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv }, k, ct))
   }
-  return AESGCM.open(sessionKey, packed)
+  return AESGCM.open(rawKey, packed)
 }
+const seal = (pt) => sealWith(sessionKey, pt)
+const unseal = (packed) => unsealWith(sessionKey, packed)
 
 // ---------- API ----------
 async function api(path, opts) {
@@ -146,15 +154,207 @@ const setStatus = (id, text, cls) => {
   el.className = 'status' + (cls ? ' ' + cls : '')
 }
 
+// ---------- 设备身份 / 在线状态 ----------
+function guessName() {
+  const ua = navigator.userAgent
+  const os = /Windows/.test(ua) ? 'Windows' : /Android/.test(ua) ? 'Android'
+    : /iPhone|iPad/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS'
+    : /Linux/.test(ua) ? 'Linux' : '未知系统'
+  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera'
+    : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox'
+    : /Safari\//.test(ua) ? 'Safari' : '浏览器'
+  return br + ' · ' + os
+}
+const store = {
+  get(k) { try { return localStorage.getItem(k) } catch { return null } },
+  set(k, v) { try { localStorage.setItem(k, v) } catch {} },
+}
+
+// X25519 长期身份密钥（本浏览器唯一；localStorage 不可用时退化为内存）
+const identity = (() => {
+  const saved = store.get('cipherlane-sk')
+  if (saved) {
+    try {
+      const sk = fromB64(saved)
+      if (sk.length === 32) return { sk, pk: X25519.publicFromSecret(sk) }
+    } catch {}
+  }
+  const kp = X25519.genKey()
+  store.set('cipherlane-sk', toB64(kp.sk))
+  return kp
+})()
+
+const my = {
+  name: store.get('cipherlane-name') || guessName(),
+  ip: null,
+  secret: null,
+}
+let selectedIp = null       // 设备直发的目标
+let deviceCache = []        // 最近一次设备列表
+
+async function heartbeat() {
+  try {
+    const r = await api('/api/presence', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(my.secret ? { 'X-Device-Secret': my.secret } : {}),
+      },
+      body: JSON.stringify({ name: my.name, pub: toB64(identity.pk) }),
+    })
+    const j = await r.json()
+    my.ip = j.ip
+    my.secret = j.secret
+  } catch { /* 网络抖动，下个心跳重试 */ }
+}
+
+async function refreshDevices() {
+  try {
+    const j = await (await fetch('/api/devices')).json()
+    deviceCache = j.devices || []
+    renderDevices()
+  } catch {}
+}
+
+function renderDevices() {
+  const box = $('#devices')
+  box.innerHTML = ''
+  const others = deviceCache.filter((d) => d.ip !== my.ip)
+  $('#devices-count').textContent = others.length ? `· ${others.length} 台在线` : ''
+  if (selectedIp && !others.some((d) => d.ip === selectedIp)) selectedIp = null
+  const empty = $('#devices-empty')
+  empty.hidden = others.length > 0
+  for (const d of others) {
+    const card = document.createElement('button')
+    card.className = 'device' + (d.ip === selectedIp ? ' selected' : '')
+    card.innerHTML = `${avatarSvg(d.ip, 40)}<span class="d-name"></span><span class="d-ip"></span>`
+    card.querySelector('.d-name').textContent = d.name || '未命名设备'
+    card.querySelector('.d-ip').textContent = d.ip
+    card.onclick = () => {
+      selectedIp = selectedIp === d.ip ? null : d.ip
+      renderDevices()
+    }
+    box.appendChild(card)
+  }
+  updateModeHint()
+}
+
+function selectedDevice() {
+  return deviceCache.find((d) => d.ip === selectedIp && d.ip !== my.ip) || null
+}
+function updateModeHint() {
+  const dev = selectedDevice()
+  $('#mode-hint').innerHTML = dev
+    ? `发送目标：<b></b>（点击设备卡片可取消）`
+    : `未选设备 → 生成接收链接。在页面任意位置 <code>Ctrl+V</code> 可直接粘贴发送。`
+  if (dev) {
+    const b = $('#mode-hint').querySelector('b')
+    b.textContent = (dev.name || '未命名设备') + ' (' + dev.ip + ')'
+  }
+}
+
+// ---------- 收到的邀请 ----------
+const incomingOffers = new Map() // id → offer
+
+function renderIncoming() {
+  const wrap = $('#incoming-wrap')
+  const box = $('#incoming')
+  box.innerHTML = ''
+  wrap.hidden = incomingOffers.size === 0
+  for (const o of incomingOffers.values()) {
+    const card = document.createElement('div')
+    card.className = 'offer'
+    card.innerHTML = `${avatarSvg(o.from.ip || '?', 40)}
+      <div class="o-body">
+        <div class="o-title"><b class="o-name"></b><span class="o-ip"></span></div>
+        <div class="o-preview dim"></div>
+        <div class="o-error err" hidden></div>
+      </div>
+      <div class="o-actions">
+        <button class="btn primary o-accept">接受</button>
+        <button class="btn o-reject">拒绝</button>
+      </div>`
+    card.querySelector('.o-name').textContent = o.from.name || '未知设备'
+    card.querySelector('.o-ip').textContent = ' @ ' + (o.from.ip || '?')
+    card.querySelector('.o-preview').textContent = '正在解密预览…'
+    const acceptBtn = card.querySelector('.o-accept')
+    acceptBtn.disabled = true // 预览解密成功后才可接受
+    previewOffer(o, card).then(() => { if (o._key) acceptBtn.disabled = false })
+    acceptBtn.onclick = () => acceptOffer(o)
+    card.querySelector('.o-reject').onclick = () => rejectOffer(o)
+    box.appendChild(card)
+  }
+}
+
+// 用会话密钥解密邀请预览（文件名 / 大小 / 类型），服务器全程只见密文
+async function previewOffer(o, card) {
+  try {
+    const theirPub = fromB64(o.pub)
+    const key = X25519.sessionKey(X25519.dh(identity.sk, theirPub), theirPub, identity.pk, o.room)
+    const info = JSON.parse(dec.decode(await unsealWith(key, fromB64(o.hint))))
+    o._key = key
+    const p = card.querySelector('.o-preview')
+    p.textContent = info.kind === 'text'
+      ? '一段文本 · ' + fmtBytes(info.size || 0)
+      : (info.name || '未命名文件') + ' · ' + fmtBytes(info.size || 0)
+  } catch {
+    card.querySelector('.o-preview').hidden = true
+    const err = card.querySelector('.o-error')
+    err.hidden = false
+    err.textContent = '预览解密失败（邀请可能被篡改），建议拒绝'
+    card.querySelector('.o-accept').disabled = true
+  }
+}
+
+async function rejectOffer(o) {
+  incomingOffers.delete(o.id)
+  renderIncoming()
+  api(`/api/offers/${o.id}/reject`, { method: 'POST', headers: { 'X-Device-Secret': my.secret } }).catch(() => {})
+}
+
+async function acceptOffer(o) {
+  if (!o._key) return
+  // 先锁定邀请，避免双击重复接受
+  incomingOffers.delete(o.id)
+  renderIncoming()
+  try {
+    await api(`/api/offers/${o.id}/accept`, { method: 'POST', headers: { 'X-Device-Secret': my.secret } })
+  } catch (e) {
+    alert('接受失败：' + e.message)
+    return
+  }
+  const from = o.from || {}
+  $('#recv-from').hidden = false
+  $('#recv-from').innerHTML = `来自 ${avatarSvg(from.ip || '?', 34)} <b class="rf-name"></b> <span class="dim rf-ip"></span>`
+  $('#recv-from').querySelector('.rf-name').textContent = from.name || '未知设备'
+  $('#recv-from').querySelector('.rf-ip').textContent = '@ ' + (from.ip || '?')
+  receiveInto(o.room, o._key)
+}
+
+// 长轮询本机邀请（任意视图期间都保持监听，回到首页即可看到）
+async function pollOffers() {
+  for (;;) {
+    if (!my.secret) { await sleep(1000); continue }
+    try {
+      const r = await fetch('/api/offers', { headers: { 'X-Device-Secret': my.secret } })
+      if (r.status === 401) { my.secret = null; await heartbeat(); continue }
+      if (!r.ok) { await sleep(2000); continue }
+      const j = await r.json()
+      let changed = false
+      for (const o of j.offers || []) {
+        if (!incomingOffers.has(o.id)) { incomingOffers.set(o.id, o); changed = true }
+      }
+      if (changed && !$('#view-landing').hidden) renderIncoming()
+    } catch { await sleep(2000) }
+  }
+}
+
 // ---------- 发送 ----------
 const sendState = { ctl: null, stopPoll: null }
 
-async function startSend(kind, payload) {
-  // kind: 'file' | 'text'；payload: File | string
+async function startSend(kind, payload, target) {
+  // kind: 'file' | 'text'；payload: File | string；target: 设备对象（null = 链接模式）
   showView('send')
-  $('#send-title').textContent = kind === 'text' ? '📤 发送文本' : '📤 发送文件'
-  setStatus('send-status', '⚙️ 正在建立密道…', 'warn')
-
   const isText = kind === 'text'
   const size = isText ? enc.encode(payload).length : payload.size
   const name = isText ? null : payload.name
@@ -162,14 +362,42 @@ async function startSend(kind, payload) {
   const dataChunks = isText ? 1 : Math.ceil(size / CHUNK)
   const count = 1 + dataChunks // 0 号是加密元信息
 
-  // 建房 + 生成密钥（密钥只存在于双方浏览器内存与 URL fragment）
+  $('#send-title').textContent = target
+    ? `📤 发送给 ${target.name || '未命名设备'}`
+    : isText ? '📤 发送文本（链接模式）' : '📤 发送文件（链接模式）'
+  $('#send-target').hidden = !target
+  if (target) {
+    $('#send-target').innerHTML = `${avatarSvg(target.ip, 30)} <b class="st-name"></b> <span class="dim st-ip"></span>`
+    $('#send-target').querySelector('.st-name').textContent = target.name || '未命名设备'
+    $('#send-target').querySelector('.st-ip').textContent = '@ ' + target.ip
+  }
+  setStatus('send-status', '⚙️ 正在建立密道…', 'warn')
+
+  // 建房 + 协商密钥（密钥只存在于双方浏览器内存；定向模式的密钥经 X25519 派生，永不过网）
   const { room, token } = await (await api('/api/rooms', { method: 'POST' })).json()
-  sessionKey = new Uint8Array(32)
-  crypto.getRandomValues(sessionKey)
-  importedKey = null
-  const link = location.origin + '/#' + room + '.' + toB64(sessionKey)
-  $('#link').textContent = link
-  setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
+  let link = null
+  if (target) {
+    const theirPub = fromB64(target.pub)
+    const shared = X25519.dh(identity.sk, theirPub)
+    sessionKey = X25519.sessionKey(shared, identity.pk, theirPub, room)
+    importedKey = null
+    const hintInfo = { kind, name: isText ? null : name, size }
+    const hint = toB64(await sealWith(sessionKey, enc.encode(JSON.stringify(hintInfo))))
+    await api(`/api/rooms/${room}/offer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Room-Token': token },
+      body: JSON.stringify({ to: target.ip, pub: toB64(identity.pk), hint }),
+    })
+    setStatus('send-status', `🟡 等待 ${target.name || '对方'} 接受…`, 'warn')
+  } else {
+    sessionKey = new Uint8Array(32)
+    crypto.getRandomValues(sessionKey)
+    importedKey = null
+    link = location.origin + '/#' + room + '.' + toB64(sessionKey)
+    setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
+  }
+  $('#link-row').hidden = !link
+  if (link) $('#link').textContent = link
   setBar('bar-sent', 0); setBar('bar-pulled', 0)
   $('#sent-meta').textContent = '已发送 0 B / ' + fmtBytes(size)
   $('#pulled-meta').textContent = '对方已接收 0 B'
@@ -187,13 +415,19 @@ async function startSend(kind, payload) {
     setTimeout(() => ($('#copy').textContent = '复制链接'), 1500)
   }
 
-  // 状态轮询：对方是否打开 / 接收进度 / 是否收完
+  // 状态轮询：对方是否接受 / 接收进度 / 是否收完
   sendState.stopPoll = (() => {
     const timer = setInterval(async () => {
       try {
-        const st = await (await fetch(`/api/rooms/${room}/state`)).json()
+        const r = await fetch(`/api/rooms/${room}/state`)
+        if (r.status === 404) {
+          setStatus('send-status', '❌ 传输已中断（房间过期或被回收）', 'err')
+          clearInterval(timer)
+          return
+        }
+        const st = await r.json()
         if (st.acked) {
-          setStatus('send-status', '✅ 对方已完整接收', 'ok')
+          setStatus('send-status', target ? `✅ ${target.name || '对方'}已完整接收` : '✅ 对方已完整接收', 'ok')
           clearInterval(timer)
           return
         }
@@ -209,6 +443,23 @@ async function startSend(kind, payload) {
     return () => clearInterval(timer)
   })()
 
+  // 定向模式：等对方接受后才投递分片（背压窗口需要接收方在拉取）
+  if (target) {
+    for (;;) {
+      if (ctl.signal.aborted) return
+      let st
+      try {
+        const r = await fetch(`/api/rooms/${room}/state`)
+        if (r.status === 404) { setStatus('send-status', '❌ 对方超时未接受，邀请已过期', 'err'); return }
+        st = await r.json()
+      } catch { await sleep(1000); continue }
+      if (st.offer === 'accepted') break
+      if (st.offer === 'rejected') { setStatus('send-status', `❌ ${target.name || '对方'}拒绝了传输`, 'err'); return }
+      await sleep(800)
+    }
+    setStatus('send-status', '📡 对方已接受，传输中…', 'warn')
+  }
+
   try {
     // 0 号分片：加密元信息（文件名也加密）
     const meta = { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
@@ -216,7 +467,6 @@ async function startSend(kind, payload) {
 
     // 数据分片
     const speed = makeSpeed()
-    const t0 = performance.now()
     if (isText) {
       await postChunk(room, token, await seal(enc.encode(payload)), ctl.signal)
       setBar('bar-sent', 1)
@@ -245,15 +495,12 @@ async function startSend(kind, payload) {
 // ---------- 接收 ----------
 const recvState = { ctl: null }
 
-async function startReceive() {
-  const frag = location.hash.slice(1)
-  const m = /^([0-9A-Za-z]{10})\.([A-Za-z0-9_-]{43})$/.exec(frag)
-  if (!m) { showView('landing'); return }
-  const room = m[1]
-  sessionKey = fromB64(m[2])
+// 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
+async function receiveInto(room, key) {
+  sessionKey = key
   importedKey = null
   showView('recv')
-  setStatus('recv-status', '🟡 正在连接，等待发送方投递…（发送方需要先点开始）', 'warn')
+  setStatus('recv-status', '🟡 正在拉取加密内容…', 'warn')
 
   const ctl = new AbortController()
   recvState.ctl = ctl
@@ -261,7 +508,7 @@ async function startReceive() {
 
   let meta
   try {
-    // 0 号分片 = 加密元信息（长轮询：发送方就绪前会一直等）
+    // 0 号分片 = 加密元信息
     const packed = await getChunk(room, 0, ctl.signal)
     meta = JSON.parse(dec.decode(await unseal(packed)))
   } catch (e) {
@@ -381,12 +628,25 @@ function saveEmpty(name) {
   setStatus('recv-status', '✅ 空文件已保存', 'ok')
 }
 
+// 链接模式入口：从 URL fragment 取房间号与密钥
+async function startReceive() {
+  const frag = location.hash.slice(1)
+  const m = /^([0-9A-Za-z]{10})\.([A-Za-z0-9_-]{43})$/.exec(frag)
+  if (!m) { showView('landing'); return }
+  $('#recv-from').hidden = true
+  $('#recv-fileinfo').hidden = true
+  $('#recv-text').hidden = true
+  $('#recv-text-actions').hidden = true
+  $('#recv-actions').hidden = true
+  receiveInto(m[1], fromB64(m[2]))
+}
+
 // ---------- 入口 ----------
 $('#pick').onclick = (e) => { e.stopPropagation(); $('#file').click() }
 $('#drop').onclick = () => $('#file').click()
 $('#file').onchange = () => {
   const f = $('#file').files[0]
-  if (f) startSend('file', f)
+  if (f) startSend('file', f, selectedDevice())
   $('#file').value = ''
 }
 const drop = $('#drop')
@@ -394,14 +654,73 @@ for (const ev of ['dragover', 'dragenter']) drop.addEventListener(ev, (e) => { e
 for (const ev of ['dragleave', 'drop']) drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over') })
 drop.addEventListener('drop', (e) => {
   const f = e.dataTransfer.files[0]
-  if (f) startSend('file', f)
+  if (f) startSend('file', f, selectedDevice())
 })
 $('#send-text').onclick = () => {
   const t = $('#text').value
   if (!t.trim()) return
   if (enc.encode(t).length > CHUNK) return alert('文本超过 1MB 上限')
-  startSend('text', t)
+  startSend('text', t, selectedDevice())
 }
 
-if (location.hash.length > 1) startReceive()
-else showView('landing')
+// 全局粘贴：粘贴文件/截图直接发送；粘贴文本时已选设备则直接发、否则填入文本框
+document.addEventListener('paste', (e) => {
+  if ($('#view-landing').hidden) return
+  const t = e.target
+  if (t && (t.id === 'text' || t.id === 'me-name')) return // 输入框内正常粘贴
+  const files = e.clipboardData && e.clipboardData.files
+  if (files && files.length) {
+    e.preventDefault()
+    startSend('file', files[0], selectedDevice())
+    return
+  }
+  const text = e.clipboardData && e.clipboardData.getData('text/plain')
+  if (text) {
+    const dev = selectedDevice()
+    if (dev) {
+      e.preventDefault()
+      if (enc.encode(text).length > CHUNK) {
+        $('#text').value = text
+        alert('文本超过 1MB 上限，已填入文本框')
+        $('#text').focus()
+        return
+      }
+      startSend('text', text, dev)
+    } else if (document.activeElement !== $('#text')) {
+      e.preventDefault()
+      $('#text').value = text
+      $('#text').focus()
+    }
+  }
+})
+
+// 我的名片：名称可编辑（对方看到的发送者名称）
+{
+  const input = $('#me-name')
+  input.value = my.name
+  input.onchange = () => {
+    my.name = input.value.trim().slice(0, 32) || guessName()
+    input.value = my.name
+    store.set('cipherlane-name', my.name)
+    heartbeat()
+  }
+}
+
+// ---------- 启动 ----------
+if (location.hash.length > 1) {
+  startReceive()
+} else {
+  showView('landing')
+}
+// 心跳 + 设备列表刷新 + 邀请监听（所有模式下常驻）
+heartbeat().then(refreshDevices)
+setInterval(() => { heartbeat().then(refreshDevices) }, 5000)
+$('#me-avatar').innerHTML = avatarSvg('…', 36) // 注册后替换为真实 IP
+;(async () => {
+  for (let i = 0; i < 50 && !my.ip; i++) await sleep(100)
+  if (my.ip) {
+    $('#me-avatar').innerHTML = avatarSvg(my.ip, 36)
+    $('#me-ip').textContent = my.ip
+  }
+})()
+pollOffers()
