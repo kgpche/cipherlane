@@ -715,7 +715,7 @@ if (location.hash.length > 1) {
 // 心跳 + 设备列表刷新 + 邀请监听（所有模式下常驻）
 heartbeat().then(refreshDevices)
 setInterval(() => { heartbeat().then(refreshDevices) }, 5000)
-$('#me-avatar').innerHTML = avatarSvg('…', 36) // 注册后替换为真实 IP
+$('#me-avatar').innerHTML = Avatar.placeholder(36) // 中性占位，拿到真实 IP 后显示真头像
 ;(async () => {
   for (let i = 0; i < 50 && !my.ip; i++) await sleep(100)
   if (my.ip) {
