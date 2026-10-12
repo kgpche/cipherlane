@@ -68,6 +68,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const b64u = (u8) => Buffer.from(u8).toString('base64url')
 const fromB64u = (s) => new Uint8Array(Buffer.from(s, 'base64url'))
 
+// 接收文件名净化：去路径分隔符与非法字符，剥掉前导点/空白（防点文件植入，如 .bashrc）
+function safeName(raw) {
+  const base = String(raw || '').split(/[/\\]/).pop()
+    .replace(/[^\w.\-\u4e00-\u9fa5 ]+/g, '_')
+    .replace(/^[.\s]+/, '')
+  return base || 'received'
+}
+
 // ---------- AES-GCM（与浏览器端格式一致：IV(12) || 密文 || TAG(16)） ----------
 function seal(key, pt) {
   const iv = randomBytes(12)
@@ -138,6 +146,7 @@ async function getChunkAt(origin, room, i) {
   for (;;) {
     const r = await fetch(`${origin}/api/rooms/${room}/chunk?i=${i}`)
     if (r.status === 408) continue
+    if (r.status === 409) throw new Error('链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')
     if (r.status === 410) throw new Error('链接已被使用、过期，或发送方中断')
     if (!r.ok) throw new Error('拉取分片失败 ' + r.status)
@@ -145,6 +154,29 @@ async function getChunkAt(origin, room, i) {
   }
 }
 const getState = (room) => jget(`/api/rooms/${room}/state`)
+
+// ---------- 接收文件落盘（.part 临时名 + 成功后改名；失败清理，不留半截文件冒充完整文件） ----------
+async function receiveToFile(target, meta, pull) {
+  const part = target + '.part'
+  const ws = fs.createWriteStream(part)
+  const t0 = Date.now()
+  let got = 0
+  try {
+    for (let i = 1; i < meta.count; i++) {
+      const pt = await pull(i)
+      got += pt.length
+      ws.write(pt)
+      const sp = got / Math.max(0.001, (Date.now() - t0) / 1000)
+      process.stdout.write(`\r  已接收 ${fmt(got)} / ${fmt(meta.size)} · ${fmt(sp)}/s`)
+    }
+    await new Promise((r) => ws.end(r))
+  } catch (e) {
+    ws.destroy()
+    await fsp.unlink(part).catch(() => {})
+    throw e
+  }
+  await fsp.rename(part, target)
+}
 
 // ---------- 设备在线 ----------
 let presence = null // { ip, id, secret }
@@ -271,19 +303,8 @@ async function doRecv(link) {
     await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
     return
   }
-  const safe = (meta.name || 'received').split(/[/\\]/).pop().replace(/[^\w.\-\u4e00-\u9fa5 ]+/g, '_') || 'received'
-  const target = opts.out || safe
-  const ws = fs.createWriteStream(target)
-  const t0 = Date.now()
-  let got = 0
-  for (let i = 1; i < meta.count; i++) {
-    const pt = unseal(key, await getChunkAt(origin, room, i))
-    got += pt.length
-    ws.write(pt)
-    const sp = got / Math.max(0.001, (Date.now() - t0) / 1000)
-    process.stdout.write(`\r  已接收 ${fmt(got)} / ${fmt(meta.size)} · ${fmt(sp)}/s`)
-  }
-  await new Promise((r) => ws.end(r))
+  const target = opts.out || safeName(meta.name)
+  await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(origin, room, i)))
   await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
   console.log(`\n\n✅ 已解密并保存到 ${target}（${fmt(meta.size)}）\n`)
 }
@@ -363,19 +384,8 @@ async function handleOffer(o, identity, ask) {
     return
   }
 
-  const safe = (meta.name || 'received').split(/[/\\]/).pop().replace(/[^\w.\-\u4e00-\u9fa5 ]+/g, '_') || 'received'
-  const target = path.join(opts.out || '.', safe)
-  const ws = fs.createWriteStream(target)
-  const t0 = Date.now()
-  let got = 0
-  for (let i = 1; i < meta.count; i++) {
-    const pt = unseal(key, await getChunkAt(server, o.room, i))
-    got += pt.length
-    ws.write(pt)
-    const sp = got / Math.max(0.001, (Date.now() - t0) / 1000)
-    process.stdout.write(`\r  已接收 ${fmt(got)} / ${fmt(meta.size)} · ${fmt(sp)}/s`)
-  }
-  await new Promise((r2) => ws.end(r2))
+  const target = path.join(opts.out || '.', safeName(meta.name))
+  await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(server, o.room, i)))
   await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST' }).catch(() => {})
   console.log(`\n  ✅ 已解密保存到 ${target}（${fmt(meta.size)}）\n`)
 }
@@ -393,9 +403,15 @@ try {
       name: path.basename(filePath),
       size,
       readChunk: async (idx) => {
-        const buf = Buffer.allocUnsafe(Math.min(CHUNK, size - idx * CHUNK))
-        await fh.read(buf, 0, buf.length, idx * CHUNK)
-        return buf
+        const len = Math.min(CHUNK, size - idx * CHUNK)
+        const buf = Buffer.allocUnsafe(len)
+        let read = 0
+        while (read < len) { // 循环读满：网络盘等场景 fh.read 可能短读
+          const { bytesRead } = await fh.read(buf, read, len - read, idx * CHUNK + read)
+          if (!bytesRead) break
+          read += bytesRead
+        }
+        return read === len ? buf : buf.subarray(0, read)
       },
     })
     await fh.close()
