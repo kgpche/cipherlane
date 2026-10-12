@@ -8,7 +8,7 @@
 
 选设备直发（X25519 密钥协商）或链接收发，HTTP 明文环境下内容依然全程加密。
 
-![version](https://img.shields.io/badge/version-0.2.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-6%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![version](https://img.shields.io/badge/version-0.2.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -123,6 +123,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 - 设备名称与在线状态对服务器及局域网内打开页面的用户可见——这是"设备发现"的固有代价
 - 接收不支持断点续传：分片顺序一次性消费，刷新页面需发送方重发
 - 恶意丢弃流量属于 DoS，可检测（传输卡住/报错）但无法防止
+- 房间号在 HTTP 请求中明文过线：流量可被完整嗅探的网络（开放 WiFi 等）上，攻击者可抢先拉取分片（拿到密文、无法解密，但接收方会收不到）或伪造 ack 让发送方误判成功；保密性不受影响，可用性受影响
 - 同一 IP 多个**不同浏览器**同时在线时，设备条目以后注册者为准（同浏览器多标签已通过共享 secret 解决）
 
 **技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 node:crypto 原生逐字节一致（有测试）。

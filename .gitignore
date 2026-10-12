@@ -1,5 +1,6 @@
-# 构建产物（三平台安装包，dist 在 build/dist/）
-build/
+# 构建产物（三平台安装包，dist 在 build/dist/；缓存二进制等）——打包脚本本身入库
+build/*
+!build/package.sh
 
 # 会话/工具
 .zcode/
