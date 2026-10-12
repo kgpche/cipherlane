@@ -1,0 +1,20 @@
+{
+  "main": "server.js",
+  "output": "build/sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": false,
+  "assets": {
+    "public/index.html": "public/index.html",
+    "public/app.js": "public/app.js",
+    "public/aesgcm.js": "public/aesgcm.js",
+    "public/sha256.js": "public/sha256.js",
+    "public/x25519.js": "public/x25519.js",
+    "public/avatar.js": "public/avatar.js",
+    "public/qrcode.js": "public/qrcode.js",
+    "public/crypto-worker.js": "public/crypto-worker.js",
+    "public/style.css": "public/style.css",
+    "logo/02-shield-lane.svg": "logo/02-shield-lane.svg",
+    "logo/02-shield-lane-small.svg": "logo/02-shield-lane-small.svg"
+  }
+}

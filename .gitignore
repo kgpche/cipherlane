@@ -1,2 +1,3 @@
 .zcode/
 node_modules/
+build/

@@ -19,6 +19,7 @@
 - [两种发送方式](#两种发送方式)
 - [截图](#截图)
 - [快速开始](#快速开始)
+- [打包与部署](#打包与部署)
 - [工作原理与协议](#工作原理与协议)
 - [安全模型](#安全模型)
 - [浏览器兼容性](#浏览器兼容性)
@@ -126,6 +127,24 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 
 **技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 node:crypto 原生逐字节一致（有测试）。
 
+## 打包与部署（多平台分发）
+
+一条命令产出三个平台的安装/分发物（目标机器**无需安装 Node**）：
+
+```bash
+sh build/package.sh            # 产物在 build/dist/
+```
+
+| 产物 | 平台 | 安装/使用 |
+| --- | --- | --- |
+| `cipherlane_<v>_amd64.deb` | Linux x64（Ubuntu/Debian） | `sudo dpkg -i …deb && sudo systemctl enable --now cipherlane`（自带 systemd 单元，开机自启） |
+| `cipherlane_<v>_windows_x64.zip` | Windows x64 | 解压后双击 `cipherlane.exe`（控制台显示地址与二维码） |
+| `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | 解压后双击 `cipherlane.command`（首次若被 Gatekeeper 拦截：右键→打开） |
+
+技术：Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进各平台官方 Node 二进制；Linux/Windows 为纯单文件（125MB/87MB，压缩后 31MB/33MB），macOS 为双架构源码包（75MB）。打包脚本自动缓存官方二进制与 postject 工具，重复执行不重复下载；`build/` 已在 .gitignore。
+
+纯源码部署仍然零依赖：`node server.js` 即可（Node ≥ 18）。
+
 ## 浏览器兼容性
 
 | 要求 | 说明 |
@@ -162,6 +181,8 @@ CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
 cipherlane/
 ├── server.js           # 零依赖中继服务器：房间 + 设备在线 + 邀请（Node 内置模块 only）
 ├── cli.mjs             # 命令行：devices / 定向发送 / listen 常驻接收 / 链接收发
+├── sea-config.json     # SEA 单文件可执行配置（资源内嵌清单）
+├── build/package.sh    # 一键打包：.deb / Windows exe / macOS 通用包
 ├── logo/               # Logo：盾上密径（主/小尺寸母版 + 全部提案 preview.html）
 ├── docs/screenshots/   # README 截图
 ├── public/

@@ -88,27 +88,35 @@ function readBody(req, cap) {
 }
 
 // ---------- 静态资源（启动时读入内存） ----------
-const PUBLIC_DIR = path.join(__dirname, 'public')
+// SEA（单文件可执行）模式下资源内嵌于二进制；源码运行时从磁盘读取
+// 注意：node:sea 在普通 Node 里也可 require，必须用 isSea() 区分
+const sea = (() => {
+  try {
+    const m = require('node:sea')
+    return m && typeof m.isSea === 'function' && m.isSea() ? m : null
+  } catch { return null }
+})()
+const readAsset = (rel) => (sea ? Buffer.from(sea.getAsset(rel)) : fs.readFileSync(path.join(__dirname, rel)))
 const CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
   "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 const staticFiles = new Map()
 for (const [route, file, type] of [
-  ['/', 'index.html', 'text/html; charset=utf-8'],
-  ['/index.html', 'index.html', 'text/html; charset=utf-8'],
-  ['/app.js', 'app.js', 'text/javascript; charset=utf-8'],
-  ['/aesgcm.js', 'aesgcm.js', 'text/javascript; charset=utf-8'],
-  ['/sha256.js', 'sha256.js', 'text/javascript; charset=utf-8'],
-  ['/x25519.js', 'x25519.js', 'text/javascript; charset=utf-8'],
-  ['/avatar.js', 'avatar.js', 'text/javascript; charset=utf-8'],
-  ['/qrcode.js', 'qrcode.js', 'text/javascript; charset=utf-8'],
-  ['/crypto-worker.js', 'crypto-worker.js', 'text/javascript; charset=utf-8'],
-  ['/logo.svg', '../logo/02-shield-lane.svg', 'image/svg+xml'],
-  ['/logo-small.svg', '../logo/02-shield-lane-small.svg', 'image/svg+xml'],
-  ['/style.css', 'style.css', 'text/css; charset=utf-8'],
+  ['/', 'public/index.html', 'text/html; charset=utf-8'],
+  ['/index.html', 'public/index.html', 'text/html; charset=utf-8'],
+  ['/app.js', 'public/app.js', 'text/javascript; charset=utf-8'],
+  ['/aesgcm.js', 'public/aesgcm.js', 'text/javascript; charset=utf-8'],
+  ['/sha256.js', 'public/sha256.js', 'text/javascript; charset=utf-8'],
+  ['/x25519.js', 'public/x25519.js', 'text/javascript; charset=utf-8'],
+  ['/avatar.js', 'public/avatar.js', 'text/javascript; charset=utf-8'],
+  ['/qrcode.js', 'public/qrcode.js', 'text/javascript; charset=utf-8'],
+  ['/crypto-worker.js', 'public/crypto-worker.js', 'text/javascript; charset=utf-8'],
+  ['/logo.svg', 'logo/02-shield-lane.svg', 'image/svg+xml'],
+  ['/logo-small.svg', 'logo/02-shield-lane-small.svg', 'image/svg+xml'],
+  ['/style.css', 'public/style.css', 'text/css; charset=utf-8'],
 ]) {
   try {
-    staticFiles.set(route, { data: fs.readFileSync(path.join(PUBLIC_DIR, file)), type })
+    staticFiles.set(route, { data: readAsset(file), type })
   } catch { /* 文件缺失时该路由 500 */ }
 }
 
@@ -516,8 +524,20 @@ server.listen(PORT, HOST, () => {
   const lanIp = ips.find((ip) => ip !== '127.0.0.1')
   if (lanIp) {
     const url = `http://${lanIp}:${PORT}/`
+    let ascii = null
     try {
-      const qr = require('./public/qrcode.js').ascii(url)
+      ascii = require('./public/qrcode.js').ascii
+    } catch {
+      // SEA 单文件模式：qrcode.js 已内嵌为资源，按 CommonJS 方式求值加载
+      try {
+        const mod = { exports: {} }
+        const src = Buffer.from(sea.getAsset('public/qrcode.js')).toString('utf8')
+        new Function('module', 'exports', src)(mod, mod.exports)
+        ascii = mod.exports.ascii
+      } catch {}
+    }
+    try {
+      const qr = ascii && ascii(url)
       if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
     } catch { /* 二维码不可用时仅打印 URL */ }
   }
