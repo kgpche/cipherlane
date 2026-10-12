@@ -117,7 +117,8 @@ const ok = (name) => { passed++; console.log(`  ✓ ${name}`) }
 {
   const link = 'http://192.168.137.91:7788/#Ab3xYz9kLm.0u2VGVpDrE81B9GbT4tk0Me0D_Z8eCf3dTe9cihOnRk'
   const svg = QRCode.svg(link, 132)
-  assert.ok(svg.startsWith('<svg') && svg.includes('viewBox="0 0 45 45"') && svg.includes('<path'), 'V5 = 37+8 静区 = 45')
+  assert.ok(svg.startsWith('<svg') && svg.includes('viewBox="0 0 45 45"'), 'V5 = 37+8 静区 = 45')
+  assert.ok(svg.includes('<circle') && svg.includes('stroke'), '样式化：圆点模块 + 定位眼描边')
   const ascii = QRCode.ascii('hi')
   assert.ok(ascii.includes('█') && ascii.split('\n').length >= 13, '终端码含半块字符（25 行并 13 行）')
   assert.strictEqual(QRCode.svg('a'.repeat(109)), null)

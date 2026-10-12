@@ -253,19 +253,42 @@
     return build(ver, codewords(bytes, ver))
   }
 
-  // svg(text, sizePx, dark, light) → 内联 SVG（含 4 模块静区），超长返回 null
-  function svg(text, sizePx = 132, dark = '#0f1420', light = '#ffffff') {
+  // svg(text, sizePx, dark, light) → 样式化内联 SVG（圆点模块 + 圆角定位眼），超长返回 null
+  // 可扫性保障：数据点直径 0.88 模块、定位眼保持 1:1:3:1:1 结构、4 模块静区
+  function svg(text, sizePx = 148, dark = '#0f1420', light = '#ffffff') {
     const qr = encode(text)
     if (!qr) return null
+    const s = qr.size
     const q = 4 // 静区
-    const n = qr.size + q * 2
-    let path = ''
-    for (let r = 0; r < qr.size; r++)
-      for (let c = 0; c < qr.size; c++)
-        if (qr.modules[r * qr.size + c]) path += `M${c + q} ${r + q}h1v1h-1z`
+    const n = s + q * 2
+    const at = (r, c) => qr.modules[r * s + c] === 1
+    const inFinder = (r, c) => (r < 8 && c < 8) || (r < 8 && c >= s - 8) || (r >= s - 8 && c < 8)
+    const ALIGN = { 2: 18, 3: 22, 4: 26, 5: 30 }[qr.version] || 0
+    const inAlign = (r, c) => ALIGN > 0 && Math.abs(r - ALIGN) <= 2 && Math.abs(c - ALIGN) <= 2
+
+    // 数据区：圆点
+    let dots = ''
+    for (let r = 0; r < s; r++)
+      for (let c = 0; c < s; c++)
+        if (at(r, c) && !inFinder(r, c) && !inAlign(r, c))
+          dots += `<circle cx="${c + q + 0.5}" cy="${r + q + 0.5}" r="0.42"/>`
+
+    // 三个定位眼：圆角外环 + 圆角瞳孔
+    let eyes = ''
+    for (const [r0, c0] of [[0, 0], [0, s - 7], [s - 7, 0]]) {
+      eyes += `<rect x="${c0 + q}" y="${r0 + q}" width="7" height="7" rx="2.1" fill="none" stroke="${dark}" stroke-width="1"/>`
+        + `<rect x="${c0 + q + 2}" y="${r0 + q + 2}" width="3" height="3" rx="1" fill="${dark}"/>`
+    }
+    // 校正小眼（V2+）
+    let alignEye = ''
+    if (ALIGN > 0) {
+      alignEye = `<rect x="${ALIGN + q - 2}" y="${ALIGN + q - 2}" width="5" height="5" rx="1.5" fill="none" stroke="${dark}" stroke-width="0.9"/>`
+        + `<circle cx="${ALIGN + q + 0.5}" cy="${ALIGN + q + 0.5}" r="0.58" fill="${dark}"/>`
+    }
+
     return `<svg class="qr" width="${sizePx}" height="${sizePx}" viewBox="0 0 ${n} ${n}" aria-label="接收链接二维码">` +
-      `<rect width="${n}" height="${n}" fill="${light}"/>` +
-      `<path fill="${dark}" d="${path}"/></svg>`
+      `<rect width="${n}" height="${n}" rx="3" fill="${light}"/>` +
+      `<g fill="${dark}">${dots}</g>${eyes}${alignEye}</svg>`
   }
 
   // ascii(text) → 终端二维码（半块字符，浅色背景终端），超长返回 null

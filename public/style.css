@@ -169,7 +169,9 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 .target-row .dim { font-size: 0.8rem; }
 
 /* 链接展示 */
-.qr { display: flex; justify-content: center; margin: 16px 0 4px; }
+.qr { display: flex; flex-direction: column; align-items: center; margin: 16px 0 4px; gap: 9px; }
+.qr svg { border-radius: 16px; box-shadow: 0 6px 28px rgba(0, 0, 0, 0.4); }
+.qr-cap { color: var(--dim); font-size: 0.82rem; margin: 0; }
 #link-row .link-flex { display: flex; gap: 10px; align-items: stretch; margin: 10px 0 18px; }
 #link-row code {
   flex: 1;

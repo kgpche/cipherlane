@@ -489,8 +489,9 @@ async function startSend(kind, payload, target) {
   if (link) {
     $('#link').textContent = link
     try {
-      const qrSvg = QRCode.svg(link, 132) // 手机扫码直达；链接超长（>108B）则隐藏二维码
-      qrBox.innerHTML = qrSvg || ''
+      // 手机扫码直达；链接超长（>108B）则隐藏二维码
+      const qrSvg = QRCode.svg(link, 148)
+      qrBox.innerHTML = qrSvg ? qrSvg + '<p class="qr-cap">📱 手机扫码接收</p>' : ''
       qrBox.hidden = !qrSvg
     } catch { qrBox.hidden = true }
   } else {
