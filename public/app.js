@@ -430,7 +430,7 @@ document.addEventListener('click', function askOnce() {
 })
 
 // ---------- 发送 ----------
-const sendState = { ctl: null, stopPoll: null }
+const sendState = { stopPoll: null } // stopPoll：取消发送时停状态轮询
 
 async function startSend(kind, payload, target) {
   // kind: 'file' | 'text'；payload: File | string；target: 设备对象（null = 链接模式）
@@ -502,7 +502,6 @@ async function startSend(kind, payload, target) {
   $('#pulled-meta').textContent = '对方已接收 0 B'
 
   const ctl = new AbortController()
-  sendState.ctl = ctl
   const cancelBtn = $('#cancel-send')
   cancelBtn.className = 'btn danger'
   cancelBtn.textContent = '取消发送'
@@ -605,7 +604,6 @@ async function startSend(kind, payload, target) {
 }
 
 // ---------- 接收（文本 / 文件 两套独立布局） ----------
-const recvState = { ctl: null }
 
 // 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
 async function receiveInto(room, key, fromInfo) {
@@ -622,7 +620,6 @@ async function receiveInto(room, key, fromInfo) {
   }
 
   const ctl = new AbortController()
-  recvState.ctl = ctl
   const back = () => { ctl.abort(); showView('landing') }
   $('#recv-text-back').onclick = back
   $('#recv-file-back').onclick = back

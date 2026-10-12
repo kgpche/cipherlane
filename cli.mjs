@@ -22,6 +22,7 @@ import readline from 'node:readline'
 const require = createRequire(import.meta.url)
 const X25519 = require('./public/x25519.js')
 const QRCode = require('./public/qrcode.js')
+const { fnv1a } = require('./public/avatar.js')
 
 const CHUNK = 1024 * 1024
 const ROOM_RE = /^[0-9A-Za-z]{10}$/
@@ -38,7 +39,8 @@ for (let i = 0; i < args.length; i++) {
   else pos.push(args[i])
 }
 const cmd = pos[0]
-const server = (opts.server || process.env.LANDROP_SERVER || 'http://127.0.0.1:7777').replace(/\/+$/, '')
+// CIPHERLANE_SERVER 环境变量可设默认服务器（旧名 LANDROP_SERVER 仍兼容）
+const server = (opts.server || process.env.CIPHERLANE_SERVER || process.env.LANDROP_SERVER || 'http://127.0.0.1:7777').replace(/\/+$/, '')
 
 function usage() {
   console.log(`cipherlane · 密道 CLI
@@ -101,13 +103,9 @@ function dh(seed, theirPubRaw) {
 const roomKey = (shared, senderPub, receiverPub, room) =>
   X25519.sessionKey(new Uint8Array(shared), senderPub, receiverPub, room)
 
-// ---------- 头像（与浏览器同款 FNV-1a 种子，终端版几何字符） ----------
+// ---------- 头像（与浏览器同款 fnv1a 种子，终端版几何字符） ----------
 function avatarOf(seedStr) {
-  let h = 0x811c9dc5
-  for (const ch of 'cipherlane·' + seedStr) {
-    h ^= ch.codePointAt(0)
-    h = Math.imul(h, 0x01000193) >>> 0
-  }
+  const h = fnv1a('cipherlane·' + seedStr)
   const colors = [39, 48, 178, 203, 170, 214]
   const glyphs = ['◆', '▲', '●', '■', '✦', '◐', '◀', '▼']
   return `\x1b[38;5;${colors[h % colors.length]}m${glyphs[(h >>> 8) % glyphs.length]}${glyphs[(h >>> 16) % glyphs.length]}\x1b[0m`
