@@ -183,7 +183,7 @@ cipherlane/
 ├── cli.mjs             # 命令行：devices / 定向发送 / listen 常驻接收 / 链接收发
 ├── sea-config.json     # SEA 单文件可执行配置（资源内嵌清单）
 ├── build/package.sh    # 一键打包：.deb / Windows exe / macOS 通用包
-├── logo/               # Logo：盾上密径（主/小尺寸母版 + 全部提案 preview.html）
+├── logo/               # Logo：盾上密径（主图 + favicon 小尺寸母版）
 ├── docs/screenshots/   # README 截图
 ├── public/
 │   ├── index.html      # 单页应用（设备网格 · 几何头像 · 邀请卡片 · 双接收布局）

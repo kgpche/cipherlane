@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <!-- 方案1 拱门钥匙孔：密道入口 + 加密 -->
-  <rect width="100" height="100" rx="22" fill="#4285F4"/>
-  <path d="M28 76 V50 a22 22 0 0 1 44 0 V76" fill="none" stroke="#ffffff" stroke-width="10"/>
-  <path d="M22 82 H78" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
-  <circle cx="50" cy="47" r="6.5" fill="#ffffff"/>
-  <path d="M46.5 51 h7 l2.5 13 h-12 Z" fill="#ffffff"/>
-</svg>
