@@ -187,7 +187,7 @@ const identity = (() => {
 const my = {
   name: store.get('cipherlane-name') || guessName(),
   ip: null,
-  secret: null,
+  secret: store.get('cipherlane-secret') || null, // 存 localStorage：同浏览器多标签共享，避免互踩轮换
 }
 let selectedIp = null       // 设备直发的目标
 let deviceCache = []        // 最近一次设备列表
@@ -205,6 +205,7 @@ async function heartbeat() {
     const j = await r.json()
     my.ip = j.ip
     my.secret = j.secret
+    store.set('cipherlane-secret', j.secret)
   } catch { /* 网络抖动，下个心跳重试 */ }
 }
 
@@ -354,6 +355,14 @@ const sendState = { ctl: null, stopPoll: null }
 
 async function startSend(kind, payload, target) {
   // kind: 'file' | 'text'；payload: File | string；target: 设备对象（null = 链接模式）
+  // 已选设备但此刻拿不到（刚掉线）→ 明确报错，绝不静默降级成链接模式
+  if (!target && selectedIp) {
+    alert('所选设备已离线，请重新选择（本次未发送）')
+    selectedIp = null
+    renderDevices()
+    refreshDevices()
+    return
+  }
   showView('send')
   const isText = kind === 'text'
   const size = isText ? enc.encode(payload).length : payload.size
@@ -404,7 +413,10 @@ async function startSend(kind, payload, target) {
 
   const ctl = new AbortController()
   sendState.ctl = ctl
-  $('#cancel-send').onclick = async () => {
+  const cancelBtn = $('#cancel-send')
+  cancelBtn.className = 'btn danger'
+  cancelBtn.textContent = '取消发送'
+  cancelBtn.onclick = async () => {
     ctl.abort()
     if (sendState.stopPoll) sendState.stopPoll()
     api(`/api/rooms/${room}`, { method: 'DELETE', headers: { 'X-Room-Token': token } }).catch(() => {})
@@ -415,22 +427,27 @@ async function startSend(kind, payload, target) {
     setTimeout(() => ($('#copy').textContent = '复制链接'), 1500)
   }
 
-  // 状态轮询：对方是否接受 / 接收进度 / 是否收完
+  // 终态：成功时把进度补到 100%，停轮询，"取消发送"换成语义正确的"返回首页"
+  const finish = (ok, msg) => {
+    if (sendState.stopPoll) sendState.stopPoll()
+    if (ok) {
+      setBar('bar-pulled', 1)
+      $('#pulled-meta').textContent = '对方已接收 ' + fmtBytes(size) + '（100%）'
+    }
+    if (msg) setStatus('send-status', msg, ok ? 'ok' : 'err')
+    cancelBtn.className = 'btn' + (ok ? ' primary' : ' danger')
+    cancelBtn.textContent = '返回首页'
+    cancelBtn.onclick = () => showView('landing')
+  }
+
+  // 状态轮询：对方是否接受 / 接收进度 / 是否收完（终态一律走 finish，防止消息被后续轮询覆盖）
   sendState.stopPoll = (() => {
     const timer = setInterval(async () => {
       try {
         const r = await fetch(`/api/rooms/${room}/state`)
-        if (r.status === 404) {
-          setStatus('send-status', '❌ 传输已中断（房间过期或被回收）', 'err')
-          clearInterval(timer)
-          return
-        }
+        if (r.status === 404) return finish(false, '❌ 传输已中断（房间过期或被回收）')
         const st = await r.json()
-        if (st.acked) {
-          setStatus('send-status', target ? `✅ ${target.name || '对方'}已完整接收` : '✅ 对方已完整接收', 'ok')
-          clearInterval(timer)
-          return
-        }
+        if (st.acked) return finish(true, target ? `✅ ${target.name || '对方'}已完整接收` : '✅ 对方已完整接收')
         if (st.receiverSeen && !st.acked)
           setStatus('send-status', '📡 传输中…', 'warn')
         const gotBytes = Math.max(0, Math.min(st.pulled - 1, dataChunks)) * CHUNK
@@ -450,11 +467,11 @@ async function startSend(kind, payload, target) {
       let st
       try {
         const r = await fetch(`/api/rooms/${room}/state`)
-        if (r.status === 404) { setStatus('send-status', '❌ 对方超时未接受，邀请已过期', 'err'); return }
+        if (r.status === 404) return finish(false, '❌ 对方超时未接受，邀请已过期')
         st = await r.json()
       } catch { await sleep(1000); continue }
       if (st.offer === 'accepted') break
-      if (st.offer === 'rejected') { setStatus('send-status', `❌ ${target.name || '对方'}拒绝了传输`, 'err'); return }
+      if (st.offer === 'rejected') return finish(false, `❌ ${target.name || '对方'}拒绝了传输`)
       await sleep(800)
     }
     setStatus('send-status', '📡 对方已接受，传输中…', 'warn')
@@ -488,7 +505,7 @@ async function startSend(kind, payload, target) {
     setStatus('send-status', '🟢 已全部发出，等待对方接收完成…', 'warn')
   } catch (e) {
     if (ctl.signal.aborted) return
-    setStatus('send-status', '❌ 发送失败：' + e.message, 'err')
+    finish(false, '❌ 发送失败：' + e.message)
   }
 }
 
