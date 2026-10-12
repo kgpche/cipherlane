@@ -101,6 +101,8 @@ for (const [route, file, type] of [
   ['/sha256.js', 'sha256.js', 'text/javascript; charset=utf-8'],
   ['/x25519.js', 'x25519.js', 'text/javascript; charset=utf-8'],
   ['/avatar.js', 'avatar.js', 'text/javascript; charset=utf-8'],
+  ['/logo.svg', '../logo/02-shield-lane.svg', 'image/svg+xml'],
+  ['/logo-small.svg', '../logo/02-shield-lane-small.svg', 'image/svg+xml'],
   ['/style.css', 'style.css', 'text/css; charset=utf-8'],
 ]) {
   try {

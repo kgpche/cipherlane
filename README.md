@@ -1,5 +1,7 @@
 # cipherlane · 密道
 
+<img src="logo/02-shield-lane.svg" width="86" height="86" align="left" alt="cipherlane logo" />
+
 **局域网端到端加密传输**，两种方式任选：
 
 - **设备直发**（局域网 AirDrop）：一个 IP = 一台终端，每台设备有名字和几何头像。在线设备列表里点选目标，直接发文件或文本——对方接受即收，**全程无需传递链接**。密钥由 X25519 在双方浏览器内派生，永不明文过网。
@@ -73,6 +75,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 cipherlane/
 ├── server.js           # 零依赖中继服务器：房间 + 设备在线 + 邀请（Node 内置模块 only）
 ├── cli.mjs             # 命令行：devices / 定向发送 / listen 常驻接收 / 链接收发
+├── logo/               # Logo：盾上密径（主/小尺寸母版 + 全部提案 preview.html）
 ├── public/
 │   ├── index.html      # 单页应用（设备网格 · 几何头像 · 邀请卡片）
 │   ├── app.js          # 收发逻辑 + 双加密路径 + X25519 身份

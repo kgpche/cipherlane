@@ -1,15 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <!-- 方案2 盾上密径：防护盾被加密通路真·贯穿（镂空），数据点驶出盾缘 -->
+  <!-- cipherlane 主 Logo · 盾上密径（正式母版）
+       圆拱顶纹章盾，被加密通路真镂空贯穿；阶梯绿虚线驶入，橙色数据点穿出盾缘。
+       颜色取产品色板：盾=accent2 绿，点=Material 橙。任意背景可用（真镂空）。 -->
   <defs>
     <mask id="cl-slit">
       <rect width="100" height="100" fill="#ffffff"/>
       <rect x="0" y="43" width="100" height="14" fill="#000000"/>
     </mask>
   </defs>
-  <path d="M50 10 L86 24 V50 C86 72 70 86 50 92 C30 86 14 72 14 50 V24 Z"
+  <path d="M28 18 Q50 8 72 18 L86 24 V50 C86 72 70 86 50 92 C30 86 14 72 14 50 V24 Z"
         fill="#37D4A0" mask="url(#cl-slit)"/>
   <rect x="18" y="47" width="10" height="6" rx="3" fill="#37D4A0"/>
   <rect x="33" y="47" width="10" height="6" rx="3" fill="#2AA37E"/>
   <rect x="48" y="47" width="10" height="6" rx="3" fill="#1F7A5E"/>
-  <circle cx="88" cy="50" r="5" fill="#F9AB00"/>
+  <circle cx="86" cy="50" r="5" fill="#F9AB00"/>
 </svg>

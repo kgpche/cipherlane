@@ -22,7 +22,8 @@ body {
   flex-direction: column;
 }
 header { text-align: center; padding: 28px 16px 8px; }
-header h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.5px; }
+header h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.5px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+header h1 .logo { width: 30px; height: 30px; flex-shrink: 0; }
 header h1 .zh { color: var(--dim); font-size: 1rem; font-weight: normal; }
 header .sub { color: var(--dim); margin: 8px 0 0; font-size: 0.9rem; }
 
