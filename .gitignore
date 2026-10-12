@@ -1,3 +1,19 @@
+# 构建产物（三平台安装包，dist 在 build/dist/）
+build/
+
+# 会话/工具
 .zcode/
 node_modules/
-build/
+
+# 日志与临时
+*.log
+*.tmp
+*.pid
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
