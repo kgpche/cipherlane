@@ -223,18 +223,54 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 .fileinfo b { color: var(--fg); }
 .actions { display: flex; gap: 10px; margin: 12px 0; }
 
+/* 接收：文本布局（消息气泡） */
 #recv-text {
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 12px;
+  border-radius: 14px;
+  border-top-left-radius: 4px;
+  padding: 14px 16px;
   white-space: pre-wrap;
-  word-break: break-all;
-  font-size: 0.88rem;
-  max-height: 320px;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.75;
+  max-height: 46vh;
   overflow: auto;
-  margin: 10px 0;
+  margin: 12px 0 6px;
 }
+#recv-text-meta { margin: 2px 0 12px; }
+
+/* 接收：文件布局（文件卡） */
+.filecard {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+.filecard .fc-icon {
+  font-size: 1.8rem;
+  width: 46px;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #243048;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.filecard .fc-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.filecard b {
+  font-size: 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#recv-file-layout .actions { margin-top: 14px; }
 
 .hint { color: var(--dim); font-size: 0.85rem; line-height: 1.8; }
 .hint code { color: var(--accent2); }

@@ -296,8 +296,8 @@ async function previewOffer(o, card) {
     o._key = key
     const p = card.querySelector('.o-preview')
     p.textContent = info.kind === 'text'
-      ? '一段文本 · ' + fmtBytes(info.size || 0)
-      : (info.name || '未命名文件') + ' · ' + fmtBytes(info.size || 0)
+      ? '📝 一段文本 · ' + fmtBytes(info.size || 0)
+      : '📄 ' + (info.name || '未命名文件') + ' · ' + fmtBytes(info.size || 0)
   } catch {
     card.querySelector('.o-preview').hidden = true
     const err = card.querySelector('.o-error')
@@ -324,12 +324,8 @@ async function acceptOffer(o) {
     alert('接受失败：' + e.message)
     return
   }
-  const from = o.from || {}
-  $('#recv-from').hidden = false
-  $('#recv-from').innerHTML = `来自 ${avatarSvg(from.ip || '?', 34)} <b class="rf-name"></b> <span class="dim rf-ip"></span>`
-  $('#recv-from').querySelector('.rf-name').textContent = from.name || '未知设备'
-  $('#recv-from').querySelector('.rf-ip').textContent = '@ ' + (from.ip || '?')
-  receiveInto(o.room, o._key)
+  const from = o.from || null
+  receiveInto(o.room, o._key, from)
 }
 
 // 长轮询本机邀请（任意视图期间都保持监听，回到首页即可看到）
@@ -509,19 +505,28 @@ async function startSend(kind, payload, target) {
   }
 }
 
-// ---------- 接收 ----------
+// ---------- 接收（文本 / 文件 两套独立布局） ----------
 const recvState = { ctl: null }
 
 // 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
-async function receiveInto(room, key) {
+async function receiveInto(room, key, fromInfo) {
   sessionKey = key
   importedKey = null
   showView('recv')
-  setStatus('recv-status', '🟡 正在拉取加密内容…', 'warn')
+  $('#recv-text-layout').hidden = true
+  $('#recv-file-layout').hidden = true
+  $('#recv-from').hidden = !fromInfo
+  if (fromInfo) {
+    $('#recv-from').innerHTML = `来自 ${avatarSvg(fromInfo.ip || '?', 34)} <b class="rf-name"></b> <span class="dim rf-ip"></span>`
+    $('#recv-from').querySelector('.rf-name').textContent = fromInfo.name || '未知设备'
+    $('#recv-from').querySelector('.rf-ip').textContent = '@ ' + (fromInfo.ip || '?')
+  }
 
   const ctl = new AbortController()
   recvState.ctl = ctl
-  $('#cancel-recv').onclick = () => location.replace('/')
+  const back = () => { ctl.abort(); showView('landing') }
+  $('#recv-text-back').onclick = back
+  $('#recv-file-back').onclick = back
 
   let meta
   try {
@@ -530,83 +535,102 @@ async function receiveInto(room, key) {
     meta = JSON.parse(dec.decode(await unseal(packed)))
   } catch (e) {
     if (ctl.signal.aborted) return
-    return setStatus('recv-status', '❌ ' + e.message, 'err')
-  }
-
-  if (meta.type === 'text') {
-    try {
-      const pt = dec.decode(await unseal(await getChunk(room, 1, ctl.signal)))
-      $('#recv-text').hidden = false
-      $('#recv-text').textContent = pt
-      $('#recv-text-actions').hidden = false
-      $('#recv-copy').onclick = async () => copyText(pt)
-      setStatus('recv-status', '✅ 已解密收到文本（' + fmtBytes(pt.length) + '）', 'ok')
-      await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
-    } catch (e) {
-      if (!ctl.signal.aborted) setStatus('recv-status', '❌ ' + e.message, 'err')
-    }
+    $('#recv-title').textContent = '📥 接收'
+    $('#recv-file-layout').hidden = false
+    setStatus('recv-file-status', '❌ ' + e.message, 'err')
     return
   }
 
-  // 文件：先展示（解密后的）信息，再由用户点击保存（浏览器要求用户手势才能选保存位置）
-  const info = $('#recv-fileinfo')
-  info.hidden = false
-  info.innerHTML = ''
-  const rows = [
-    ['文件名', '<b></b>'],
-    ['大小', fmtBytes(meta.size)],
-    ['分片数', String(meta.count - 1)],
-  ]
-  for (const [k, v] of rows) {
-    const div = document.createElement('div')
-    const span = document.createElement('span')
-    span.textContent = k + '：'
-    span.style.color = 'var(--dim)'
-    div.appendChild(span)
-    if (k === '文件名') {
-      const b = document.createElement('b')
-      b.textContent = meta.name || '(未命名)'
-      div.appendChild(b)
-    } else {
-      div.appendChild(document.createTextNode(v))
+  if (meta.type === 'text') return receiveText(room, ctl)
+  return receiveFile(room, meta, ctl)
+}
+
+// 文本：解密即呈现，无进度条无保存动作
+async function receiveText(room, ctl) {
+  $('#recv-title').textContent = '📥 接收文本'
+  $('#recv-text-layout').hidden = false
+  setStatus('recv-text-status', '🟡 正在解密…', 'warn')
+  $('#recv-text').hidden = true
+  $('#recv-text-meta').hidden = true
+  $('#recv-copy').hidden = true
+  try {
+    const pt = dec.decode(await unseal(await getChunk(room, 1, ctl.signal)))
+    $('#recv-text').hidden = false
+    $('#recv-text').textContent = pt
+    $('#recv-text-meta').hidden = false
+    $('#recv-text-meta').textContent =
+      `共 ${[...pt].length} 字 · ${fmtBytes(enc.encode(pt).length)} · 端到端加密已验签`
+    const copyBtn = $('#recv-copy')
+    copyBtn.hidden = false
+    copyBtn.textContent = '复制文本'
+    copyBtn.onclick = async () => {
+      copyBtn.textContent = (await copyText(pt)) ? '已复制 ✓' : '复制失败'
+      setTimeout(() => (copyBtn.textContent = '复制文本'), 1500)
     }
-    info.appendChild(div)
+    setStatus('recv-text-status', '✅ 已解密接收', 'ok')
+    await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+  } catch (e) {
+    if (!ctl.signal.aborted) setStatus('recv-text-status', '❌ ' + e.message, 'err')
   }
+}
+
+// 文件：文件卡为主角；接受时的手势还在有效期内，自动拉起保存选择器
+async function receiveFile(room, meta, ctl) {
+  $('#recv-title').textContent = '📥 接收文件'
+  $('#recv-file-layout').hidden = false
+  $('#recv-filecard').hidden = !meta.size
+  $('#fc-name').textContent = meta.name || '(未命名)'
+  $('#fc-size').textContent = fmtBytes(meta.size)
+  $('#fc-bar-wrap').hidden = true
+  $('#recv-meta').textContent = ''
+  $('#recv-actions').hidden = true
 
   if (!meta.size && meta.count === 1) {
-    // 空文件
     saveEmpty(meta.name)
+    setStatus('recv-file-status', '✅ 空文件已保存', 'ok')
     await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
     return
   }
 
-  setStatus('recv-status', '🟢 发送方就绪，可以开始接收', 'ok')
-  const btn = $('#start-recv')
-  $('#recv-actions').hidden = false
-  btn.onclick = () => receiveFile(room, meta, ctl.signal).catch((e) => {
-    if (!ctl.signal.aborted) setStatus('recv-status', '❌ ' + e.message, 'err')
+  setStatus('recv-file-status', '🟡 准备接收…', 'warn')
+  const start = () => doReceiveFile(room, meta, ctl.signal).then((r) => {
+    if (r === 'picker-dismissed') {
+      $('#recv-actions').hidden = false
+      setStatus('recv-file-status', '🟢 已就绪，点击接收并保存', 'ok')
+    }
+  }).catch((e) => {
+    if (!ctl.signal.aborted) setStatus('recv-file-status', '❌ ' + e.message, 'err')
   })
+  $('#start-recv').onclick = start
+  start() // 自动开始：手势新鲜时直接弹保存选择器；被关闭/失败则显示手动按钮
 }
 
-async function receiveFile(room, meta, signal) {
-  $('#recv-actions').hidden = true
-  const useFSA = 'showSaveFilePicker' in window
-  let sink
+async function doReceiveFile(room, meta, signal) {
+  // 仅在有激活手势时才自动拉起保存选择器（接受邀请的点击）；
+  // 无手势（链接模式直接打开/手势过期/嵌入式 webview）直接走内存模式自动下载，
+  // 避免个别环境（如 Electron webview）无手势时选择器 Promise 永久挂起
+  let hasGesture = false
+  try {
+    hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive && navigator.userActivation.isActive())
+  } catch { /* 部分嵌入式 webview 的 userActivation 实现不完整 */ }
+  const useFSA = 'showSaveFilePicker' in window && hasGesture
+  let sink = null
   if (useFSA) {
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: meta.name || 'received' })
       sink = { mode: 'fs', ws: await handle.createWritable() }
     } catch (e) {
-      if (e && e.name === 'AbortError') return
-      sink = null // 权限等异常 → 退回内存模式
+      if (e && e.name === 'AbortError') return 'picker-dismissed' // 用户关闭了选择器 → 显示手动按钮
+      // 手势过期等其他异常 → 内存模式兜底（完成后自动下载）
     }
   }
   if (!sink) {
-    if (meta.size > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式保存，大文件将占用较多内存，继续？')) return
+    if (meta.size > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
     sink = { mode: 'mem', parts: [] }
   }
 
-  setStatus('recv-status', '📡 接收中…', 'warn')
+  setStatus('recv-file-status', '📡 接收中…', 'warn')
+  $('#fc-bar-wrap').hidden = false
   const speed = makeSpeed()
   let got = 0
   for (let i = 1; i < meta.count; i++) {
@@ -632,7 +656,7 @@ async function receiveFile(room, meta, signal) {
     setTimeout(() => URL.revokeObjectURL(a.href), 60_000)
   }
   setBar('bar-recv', 1)
-  setStatus('recv-status', '✅ 已完整接收并解密保存', 'ok')
+  setStatus('recv-file-status', `✅ 已保存 ${meta.name || 'received'}（${fmtBytes(meta.size)}）`, 'ok')
   await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
 }
 
@@ -642,7 +666,6 @@ function saveEmpty(name) {
   a.href = URL.createObjectURL(blob)
   a.download = name || 'received'
   a.click()
-  setStatus('recv-status', '✅ 空文件已保存', 'ok')
 }
 
 // 链接模式入口：从 URL fragment 取房间号与密钥
@@ -650,12 +673,7 @@ async function startReceive() {
   const frag = location.hash.slice(1)
   const m = /^([0-9A-Za-z]{10})\.([A-Za-z0-9_-]{43})$/.exec(frag)
   if (!m) { showView('landing'); return }
-  $('#recv-from').hidden = true
-  $('#recv-fileinfo').hidden = true
-  $('#recv-text').hidden = true
-  $('#recv-text-actions').hidden = true
-  $('#recv-actions').hidden = true
-  receiveInto(m[1], fromB64(m[2]))
+  receiveInto(m[1], fromB64(m[2]), null)
 }
 
 // ---------- 入口 ----------
@@ -729,6 +747,10 @@ if (location.hash.length > 1) {
 } else {
   showView('landing')
 }
+// 同标签页粘贴新接收链接时（仅 hash 变化不重载文档）重新进入接收
+window.addEventListener('hashchange', () => {
+  if (location.hash.length > 1) startReceive()
+})
 // 心跳 + 设备列表刷新 + 邀请监听（所有模式下常驻）
 heartbeat().then(refreshDevices)
 setInterval(() => { heartbeat().then(refreshDevices) }, 5000)

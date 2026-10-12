@@ -70,22 +70,41 @@
     <button id="cancel-send" class="btn danger">取消发送</button>
   </section>
 
-  <!-- 接收 -->
+  <!-- 接收：文本 / 文件 两套独立布局 -->
   <section id="view-recv" class="view card" hidden>
-    <h2>📥 接收</h2>
+    <h2 id="recv-title">📥 接收</h2>
     <p id="recv-from" class="target-row" hidden></p>
-    <p id="recv-status" class="status">🟡 正在连接，等待发送方…</p>
-    <div id="recv-fileinfo" class="fileinfo" hidden></div>
-    <div class="bar"><div id="bar-recv"></div></div>
-    <p class="meta" id="recv-meta"></p>
-    <div id="recv-actions" class="actions" hidden>
-      <button id="start-recv" class="btn primary">开始接收并保存</button>
+
+    <!-- 文本接收：解密即呈现 -->
+    <div id="recv-text-layout" hidden>
+      <p id="recv-text-status" class="status">🟡 正在解密…</p>
+      <pre id="recv-text" hidden></pre>
+      <p class="meta" id="recv-text-meta" hidden></p>
+      <div class="actions">
+        <button id="recv-copy" class="btn primary" hidden>复制文本</button>
+        <button id="recv-text-back" class="btn">返回</button>
+      </div>
     </div>
-    <pre id="recv-text" hidden></pre>
-    <div id="recv-text-actions" class="actions" hidden>
-      <button id="recv-copy" class="btn">复制文本</button>
+
+    <!-- 文件接收：文件卡 + 自动保存 -->
+    <div id="recv-file-layout" hidden>
+      <p id="recv-file-status" class="status">🟡 准备接收…</p>
+      <div id="recv-filecard" class="filecard" hidden>
+        <div class="fc-icon">📄</div>
+        <div class="fc-body">
+          <b id="fc-name"></b>
+          <span class="dim" id="fc-size"></span>
+        </div>
+      </div>
+      <div class="bar" id="fc-bar-wrap" hidden><div id="bar-recv"></div></div>
+      <p class="meta" id="recv-meta"></p>
+      <div class="actions" id="recv-actions" hidden>
+        <button id="start-recv" class="btn primary">接收并保存</button>
+      </div>
+      <div class="actions">
+        <button id="recv-file-back" class="btn">返回</button>
+      </div>
     </div>
-    <button id="cancel-recv" class="btn danger">放弃并返回</button>
   </section>
 </main>
 
