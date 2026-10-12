@@ -21,6 +21,7 @@ import readline from 'node:readline'
 
 const require = createRequire(import.meta.url)
 const X25519 = require('./public/x25519.js')
+const QRCode = require('./public/qrcode.js')
 
 const CHUNK = 1024 * 1024
 const ROOM_RE = /^[0-9A-Za-z]{10}$/
@@ -220,6 +221,8 @@ async function doSend({ type, name, size, readChunk }) {
     console.log('║  把下面的接收链接发给对方（浏览器打开即可）  ║')
     console.log('╚══════════════════════════════════════════╝\n')
     console.log('  ' + link + '\n')
+    const qr = QRCode.ascii(link) // 手机扫码直达；链接超长（>108B）返回 null 跳过
+    if (qr) console.log(qr + '  ↑ 手机扫码接收\n')
   }
 
   const meta = { v: 1, type, name: type === 'text' ? null : name, mime: null, size, count }

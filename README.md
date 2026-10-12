@@ -8,7 +8,7 @@
 
 选设备直发（X25519 密钥协商）或链接收发，HTTP 明文环境下内容依然全程加密。
 
-![version](https://img.shields.io/badge/version-0.2.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-4%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![version](https://img.shields.io/badge/version-0.2.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-5%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -188,6 +188,13 @@ npm test    # 或逐个: node test/<name>.test.mjs
 
 ## 更新日志
 
+**v0.2.1**（2026-10-12）
+- 二维码：纯 JS QR 编码器（V1-5 字节模式 ECC-L，结构测试含 RS 代数自检）；
+  发送页链接旁显示二维码、服务器启动横幅与 CLI 链接打印终端二维码，手机扫码即达
+- Web Worker 加解密：分片加密挪出主线程（大文件传输进度不再卡顿），
+  发送端增加一片预加密流水线（网络发送与加密重叠）；Worker 不可用自动回退主线程
+- 到货提醒：收到直发邀请时系统通知（localhost/https）+ 标签页标题闪烁（任意环境）+ 移动端震动
+
 **v0.2.0**（2026-10-12）
 - 设备直发：一个 IP = 一台终端（名称 / 几何头像 / X25519 身份），选设备即发、邀请卡片、接受/拒绝
 - 纯 JS X25519 + SHA-256（RFC 7748 / FIPS 180-4，与 node 原生互通有测试）
@@ -202,7 +209,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
 ## 路线图
 
 - [ ] 纯 JS AES 路径性能优化（T-table / SIMD 化 GHASH）
-- [ ] 二维码展示接收链接（手机扫码）
+- [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [ ] 多文件 / 目录传输
 - [ ] 断点续传（分片可重放 + 位置协商）
 - [ ] 设备直发的公钥指纹核验（对抗服务器主动 MITM）

@@ -101,6 +101,8 @@ for (const [route, file, type] of [
   ['/sha256.js', 'sha256.js', 'text/javascript; charset=utf-8'],
   ['/x25519.js', 'x25519.js', 'text/javascript; charset=utf-8'],
   ['/avatar.js', 'avatar.js', 'text/javascript; charset=utf-8'],
+  ['/qrcode.js', 'qrcode.js', 'text/javascript; charset=utf-8'],
+  ['/crypto-worker.js', 'crypto-worker.js', 'text/javascript; charset=utf-8'],
   ['/logo.svg', '../logo/02-shield-lane.svg', 'image/svg+xml'],
   ['/logo-small.svg', '../logo/02-shield-lane-small.svg', 'image/svg+xml'],
   ['/style.css', 'style.css', 'text/css; charset=utf-8'],
@@ -510,6 +512,15 @@ server.listen(PORT, HOST, () => {
   console.log('cipherlane · 密道 —— 局域网端到端加密传输')
   console.log('  服务器零知识：只中转密文，密钥永不离开收发双方的浏览器\n')
   for (const ip of ips) console.log(`  →  http://${ip}:${PORT}`)
+  // 主局域网地址附带终端二维码，手机扫码即开
+  const lanIp = ips.find((ip) => ip !== '127.0.0.1')
+  if (lanIp) {
+    const url = `http://${lanIp}:${PORT}/`
+    try {
+      const qr = require('./public/qrcode.js').ascii(url)
+      if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
+    } catch { /* 二维码不可用时仅打印 URL */ }
+  }
   console.log('\n等待传输…（Ctrl+C 退出）')
 })
 

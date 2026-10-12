@@ -106,6 +106,53 @@ async function unsealWith(rawKey, packed) {
 const seal = (pt) => sealWith(sessionKey, pt)
 const unseal = (packed) => unsealWith(sessionKey, packed)
 
+// ---------- 加密 RPC：分片加解密走 Worker（不卡进度条），Worker 不可用/崩溃回退主线程 ----------
+const cryptoRPC = (() => {
+  let worker = null // null=未初始化 false=不可用
+  const pending = new Map()
+  let seq = 0
+  function ensure() {
+    if (worker !== null) return worker
+    try {
+      const w = new Worker('/crypto-worker.js')
+      w.onmessage = (e) => {
+        const p = pending.get(e.data.id)
+        if (!p) return
+        pending.delete(e.data.id)
+        if (e.data.ok) p.resolve(new Uint8Array(e.data.data))
+        else p.reject(new Error(e.data.error || 'crypto worker error'))
+      }
+      w.onerror = () => {
+        worker = false
+        try { w.terminate() } catch {}
+        for (const p of pending.values()) p.reject(new Error('crypto worker 异常'))
+        pending.clear()
+      }
+      worker = w
+    } catch { worker = false }
+    return worker
+  }
+  async function call(op, key, data) {
+    const w = ensure()
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+    if (!w) return op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes)
+    try {
+      return await new Promise((resolve, reject) => {
+        const id = ++seq
+        pending.set(id, { resolve, reject })
+        // 输入不 transfer（保留主线程副本供回退），输出由 worker 零拷贝回传
+        w.postMessage({ id, op, key, data: bytes })
+      })
+    } catch (e) {
+      if (worker === false) return op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes)
+      throw e
+    }
+  }
+  return call
+})()
+const sealRPC = (pt) => cryptoRPC('seal', sessionKey, pt)
+const unsealRPC = (packed) => cryptoRPC('unseal', sessionKey, packed)
+
 // ---------- API ----------
 async function api(path, opts) {
   const r = await fetch(path, opts)
@@ -339,12 +386,48 @@ async function pollOffers() {
       const j = await r.json()
       let changed = false
       for (const o of j.offers || []) {
-        if (!incomingOffers.has(o.id)) { incomingOffers.set(o.id, o); changed = true }
+        if (!incomingOffers.has(o.id)) {
+          incomingOffers.set(o.id, o)
+          changed = true
+          notifyNewOffer('📮 密道 · 收到传输请求', `${(o.from && o.from.name) || '未知设备'}（${(o.from && o.from.ip) || '?'}）想发给你内容`)
+        }
       }
       if (changed && !$('#view-landing').hidden) renderIncoming()
     } catch { await sleep(2000) }
   }
 }
+
+// ---------- 到货提醒：系统通知（localhost/https）+ 标题闪烁（任何环境）+ 震动（移动端） ----------
+const notifyNewOffer = (() => {
+  let flashTimer = null
+  const origTitle = document.title
+  const stopFlash = () => {
+    if (flashTimer) { clearInterval(flashTimer); flashTimer = null; document.title = origTitle }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) stopFlash() })
+  return (title, body) => {
+    try {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        const n = new Notification(title, { body, tag: 'cipherlane-offer' })
+        n.onclick = () => { window.focus(); n.close() }
+      }
+    } catch {}
+    try { navigator.vibrate && navigator.vibrate([120, 60, 120]) } catch {}
+    if (!flashTimer) {
+      let on = false
+      flashTimer = setInterval(() => {
+        document.title = (on = !on) ? '📮 收到传输请求！' : origTitle
+      }, 900)
+    }
+  }
+})()
+// 首次点击时申请通知权限（局域网 http 无 Notification API 时静默跳过）
+document.addEventListener('click', function askOnce() {
+  document.removeEventListener('click', askOnce)
+  try {
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission()
+  } catch {}
+})
 
 // ---------- 发送 ----------
 const sendState = { ctl: null, stopPoll: null }
@@ -402,7 +485,17 @@ async function startSend(kind, payload, target) {
     setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
   }
   $('#link-row').hidden = !link
-  if (link) $('#link').textContent = link
+  const qrBox = $('#qr')
+  if (link) {
+    $('#link').textContent = link
+    try {
+      const qrSvg = QRCode.svg(link, 132) // 手机扫码直达；链接超长（>108B）则隐藏二维码
+      qrBox.innerHTML = qrSvg || ''
+      qrBox.hidden = !qrSvg
+    } catch { qrBox.hidden = true }
+  } else {
+    qrBox.hidden = true
+  }
   setBar('bar-sent', 0); setBar('bar-pulled', 0)
   $('#sent-meta').textContent = '已发送 0 B / ' + fmtBytes(size)
   $('#pulled-meta').textContent = '对方已接收 0 B'
@@ -476,20 +569,25 @@ async function startSend(kind, payload, target) {
   try {
     // 0 号分片：加密元信息（文件名也加密）
     const meta = { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
-    await postChunk(room, token, await seal(enc.encode(JSON.stringify(meta))), ctl.signal)
+    await postChunk(room, token, await sealRPC(enc.encode(JSON.stringify(meta))), ctl.signal)
 
-    // 数据分片
+    // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
     const speed = makeSpeed()
     if (isText) {
-      await postChunk(room, token, await seal(enc.encode(payload)), ctl.signal)
+      await postChunk(room, token, await sealRPC(enc.encode(payload)), ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
     } else {
       let off = 0
+      let nextEnc = null
       while (off < size) {
-        const slice = new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer())
-        await postChunk(room, token, await seal(slice), ctl.signal)
-        off += slice.length
+        const encThis = nextEnc || sealRPC(new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()))
+        const nextOff = off + CHUNK
+        nextEnc = nextOff < size
+          ? sealRPC(new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()))
+          : null
+        await postChunk(room, token, await encThis, ctl.signal)
+        off = Math.min(nextOff, size)
         setBar('bar-sent', off / size)
         const sp = speed(off)
         $('#sent-meta').textContent =
@@ -554,7 +652,7 @@ async function receiveText(room, ctl) {
   $('#recv-text-meta').hidden = true
   $('#recv-copy').hidden = true
   try {
-    const pt = dec.decode(await unseal(await getChunk(room, 1, ctl.signal)))
+    const pt = dec.decode(await unsealRPC(await getChunk(room, 1, ctl.signal)))
     $('#recv-text').hidden = false
     $('#recv-text').textContent = pt
     $('#recv-text-meta').hidden = false
@@ -635,7 +733,7 @@ async function doReceiveFile(room, meta, signal) {
   let got = 0
   for (let i = 1; i < meta.count; i++) {
     const packed = await getChunk(room, i, signal)
-    const pt = await unseal(packed) // GCM 验签失败会直接抛错
+    const pt = await unsealRPC(packed) // GCM 验签失败会直接抛错
     got += pt.length
     if (sink.mode === 'fs') await sink.ws.write(pt)
     else sink.parts.push(pt)
