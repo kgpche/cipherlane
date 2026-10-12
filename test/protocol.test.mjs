@@ -267,6 +267,29 @@ async function main() {
     await jfetch(`/api/rooms/${lr.room}/ack`, { method: 'POST' })
     ok('链接模式回归：随机密钥分片收发逐字节一致')
 
+    // ---------- 8) 并发拉取同一分片：先到先得，后来者明确失败，发送方不受影响 ----------
+    // 回归：曾经 notifyChunk 会唤醒全部同序号 waiter 并在第二个 takeChunk 上崩溃
+    // （发送方 POST 500、后来者响应永久挂起）。
+    r = await jfetch('/api/rooms', { method: 'POST' })
+    const cr = r.json
+    const ckey = randomBytes(32)
+    const g1 = fetch(`${S}/api/rooms/${cr.room}/chunk?i=0`)
+    const g2 = fetch(`${S}/api/rooms/${cr.room}/chunk?i=0`)
+    await sleep(300) // 两个长轮询均已挂起为 waiter
+    r = await jfetch(`/api/rooms/${cr.room}/chunk`, {
+      method: 'POST', headers: { 'X-Room-Token': cr.token },
+      body: seal(ckey, Buffer.from('concurrent-pull')),
+    })
+    assert.strictEqual(r.status, 200, '发送方 POST 不应被并发拉取拖垮')
+    const [ga, gb] = await Promise.all([g1, g2])
+    assert.deepStrictEqual([ga.status, gb.status].sort((x, y) => x - y), [200, 409], '一者 200 一者 409')
+    const winner = ga.status === 200 ? ga : gb
+    assert.strictEqual(open(ckey, Buffer.from(await winner.arrayBuffer())).toString(), 'concurrent-pull')
+    const g3 = await fetch(`${S}/api/rooms/${cr.room}/chunk?i=0`) // 分片已消费 → 410
+    assert.strictEqual(g3.status, 410)
+    await jfetch(`/api/rooms/${cr.room}`, { method: 'DELETE', headers: { 'X-Room-Token': cr.token } })
+    ok('并发拉取同一分片：先到 200 / 后来者 409 / 再来者 410 / 发送方 200')
+
     console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')

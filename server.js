@@ -45,9 +45,13 @@ let globalBuffered = 0
 
 // ---------- 工具 ----------
 function randRoomId() {
-  const b = crypto.randomBytes(ROOM_ID_LEN)
+  // 拒绝采样消除模偏置：62 × 4 = 248，≥248 的字节丢弃重取
   let s = ''
-  for (let i = 0; i < ROOM_ID_LEN; i++) s += B62[b[i] % 62]
+  while (s.length < ROOM_ID_LEN) {
+    const b = crypto.randomBytes(ROOM_ID_LEN * 2)
+    for (let i = 0; i < b.length && s.length < ROOM_ID_LEN; i++)
+      if (b[i] < 248) s += B62[b[i] % 62]
+  }
   return s
 }
 const randId = () => crypto.randomBytes(8).toString('hex')
@@ -145,6 +149,7 @@ function createRoom() {
 
 function takeChunk(room, i) {
   const c = room.buffer.get(i)
+  if (!c) return null // 已被并发拉取取走（分片一次性，不会再出现）
   room.buffer.delete(i)
   room.bytes -= c.length
   globalBuffered -= c.length
@@ -156,10 +161,16 @@ function takeChunk(room, i) {
 }
 
 function notifyChunk(room, i) {
+  // 无等待者：分片留在缓冲区，供接收方稍后 GET（先发后收的链接模式依赖此语义）
+  if (!room.waiters.some((w) => w.i === i)) return
+  const c = takeChunk(room, i)
+  if (!c) return
+  let first = true
   room.waiters = room.waiters.filter((w) => {
     if (w.i !== i) return true
     w.clearTimer()
-    w.ok(takeChunk(room, i))
+    if (first) { w.ok(c); first = false }
+    else w.fail(409, 'conflict') // 同序号并发等待：先到先得，后来者明确失败而非挂起
     return false
   })
 }
@@ -213,9 +224,8 @@ function notifyOffers(ip) {
 // GET /api/rooms/:id/chunk?i=N —— 长轮询取分片（接收方顺序拉取）
 function handlePull(room, i, res) {
   if (i < room.head) return sendJson(res, 410, { error: 'consumed' })
-  const c = room.buffer.get(i)
-  if (c) {
-    const body = takeChunk(room, i)
+  const body = takeChunk(room, i)
+  if (body) {
     res.writeHead(200, {
       'Content-Type': 'application/octet-stream',
       'X-Chunk-Index': String(i),
