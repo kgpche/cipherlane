@@ -82,9 +82,7 @@ async function copyText(t) {
 const avatarSvg = (seed, size) => Avatar.svg(seed, size)
 
 // ---------- 加密层（AES-GCM，双路径） ----------
-let sessionKey = null
-let importedKey = null
-
+// 密钥按次传输经参数传递（不做全局状态：同页并发收发会互相污染对方的密钥）
 async function sealWith(rawKey, pt) {
   if (subtle) {
     const k = await subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
@@ -103,9 +101,6 @@ async function unsealWith(rawKey, packed) {
   }
   return AESGCM.open(rawKey, packed)
 }
-const seal = (pt) => sealWith(sessionKey, pt)
-const unseal = (packed) => unsealWith(sessionKey, packed)
-
 // ---------- 加密 RPC：分片加解密走 Worker（不卡进度条），Worker 不可用/崩溃回退主线程 ----------
 const cryptoRPC = (() => {
   let worker = null // null=未初始化 false=不可用
@@ -150,8 +145,8 @@ const cryptoRPC = (() => {
   }
   return call
 })()
-const sealRPC = (pt) => cryptoRPC('seal', sessionKey, pt)
-const unsealRPC = (packed) => cryptoRPC('unseal', sessionKey, packed)
+const sealRPC = (key, pt) => cryptoRPC('seal', key, pt)
+const unsealRPC = (key, packed) => cryptoRPC('unseal', key, packed)
 
 // ---------- API ----------
 async function api(path, opts) {
@@ -183,6 +178,7 @@ async function getChunk(room, i, signal) {
   for (;;) {
     const r = await fetch(`/api/rooms/${room}/chunk?i=${i}`, { signal })
     if (r.status === 408) continue // 长轮询到期，立刻重试继续等
+    if (r.status === 409) throw new Error('此链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')
     if (r.status === 410) throw new Error('此链接已被使用、已过期，或发送方已中断')
     if (!r.ok) throw new Error('网络错误 ' + r.status)
@@ -461,28 +457,50 @@ async function startSend(kind, payload, target) {
   }
   setStatus('send-status', '⚙️ 正在建立密道…', 'warn')
 
-  // 建房 + 协商密钥（密钥只存在于双方浏览器内存；定向模式的密钥经 X25519 派生，永不过网）
-  const { room, token } = await (await api('/api/rooms', { method: 'POST' })).json()
+  // 先绑定取消按钮：建立阶段任何一步失败都必须保证有退路
+  let room = null, token = null
+  const ctl = new AbortController()
+  const cancelBtn = $('#cancel-send')
+  cancelBtn.className = 'btn danger'
+  cancelBtn.textContent = '取消发送'
+  cancelBtn.onclick = async () => {
+    ctl.abort()
+    if (sendState.stopPoll) sendState.stopPoll()
+    if (room) api(`/api/rooms/${room}`, { method: 'DELETE', headers: { 'X-Room-Token': token } }).catch(() => {})
+    showView('landing')
+  }
+
   let link = null
-  if (target) {
-    const theirPub = fromB64(target.pub)
-    const shared = X25519.dh(identity.sk, theirPub)
-    sessionKey = X25519.sessionKey(shared, identity.pk, theirPub, room)
-    importedKey = null
-    const hintInfo = { kind, name: isText ? null : name, size }
-    const hint = toB64(await sealWith(sessionKey, enc.encode(JSON.stringify(hintInfo))))
-    await api(`/api/rooms/${room}/offer`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Room-Token': token },
-      body: JSON.stringify({ to: target.ip, pub: toB64(identity.pk), hint }),
-    })
-    setStatus('send-status', `🟡 等待 ${target.name || '对方'} 接受…`, 'warn')
-  } else {
-    sessionKey = new Uint8Array(32)
-    crypto.getRandomValues(sessionKey)
-    importedKey = null
-    link = location.origin + '/#' + room + '.' + toB64(sessionKey)
-    setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
+  let key
+  try {
+    // 建房 + 协商密钥（密钥只存在于双方浏览器内存；定向模式的密钥经 X25519 派生，永不过网）
+    ;({ room, token } = await (await api('/api/rooms', { method: 'POST', signal: ctl.signal })).json())
+    if (target) {
+      const theirPub = fromB64(target.pub)
+      const shared = X25519.dh(identity.sk, theirPub)
+      key = X25519.sessionKey(shared, identity.pk, theirPub, room)
+      const hintInfo = { kind, name: isText ? null : name, size }
+      const hint = toB64(await sealWith(key, enc.encode(JSON.stringify(hintInfo))))
+      await api(`/api/rooms/${room}/offer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Room-Token': token },
+        body: JSON.stringify({ to: target.ip, pub: toB64(identity.pk), hint }),
+        signal: ctl.signal,
+      })
+      setStatus('send-status', `🟡 等待 ${target.name || '对方'} 接受…`, 'warn')
+    } else {
+      key = new Uint8Array(32)
+      crypto.getRandomValues(key)
+      link = location.origin + '/#' + room + '.' + toB64(key)
+      setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
+    }
+  } catch (e) {
+    if (ctl.signal.aborted) return
+    setStatus('send-status', '❌ 建立密道失败：' + e.message, 'err')
+    cancelBtn.className = 'btn'
+    cancelBtn.textContent = '返回首页'
+    cancelBtn.onclick = () => showView('landing')
+    return
   }
   $('#link-row').hidden = !link
   const qrBox = $('#qr')
@@ -501,16 +519,6 @@ async function startSend(kind, payload, target) {
   $('#sent-meta').textContent = '已发送 0 B / ' + fmtBytes(size)
   $('#pulled-meta').textContent = '对方已接收 0 B'
 
-  const ctl = new AbortController()
-  const cancelBtn = $('#cancel-send')
-  cancelBtn.className = 'btn danger'
-  cancelBtn.textContent = '取消发送'
-  cancelBtn.onclick = async () => {
-    ctl.abort()
-    if (sendState.stopPoll) sendState.stopPoll()
-    api(`/api/rooms/${room}`, { method: 'DELETE', headers: { 'X-Room-Token': token } }).catch(() => {})
-    showView('landing')
-  }
   $('#copy').onclick = async () => {
     $('#copy').textContent = (await copyText(link)) ? '已复制 ✓' : '复制失败'
     setTimeout(() => ($('#copy').textContent = '复制链接'), 1500)
@@ -569,22 +577,22 @@ async function startSend(kind, payload, target) {
   try {
     // 0 号分片：加密元信息（文件名也加密）
     const meta = { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
-    await postChunk(room, token, await sealRPC(enc.encode(JSON.stringify(meta))), ctl.signal)
+    await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta))), ctl.signal)
 
     // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
     const speed = makeSpeed()
     if (isText) {
-      await postChunk(room, token, await sealRPC(enc.encode(payload)), ctl.signal)
+      await postChunk(room, token, await sealRPC(key, enc.encode(payload)), ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
     } else {
       let off = 0
       let nextEnc = null
       while (off < size) {
-        const encThis = nextEnc || sealRPC(new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()))
+        const encThis = nextEnc || sealRPC(key, new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()))
         const nextOff = off + CHUNK
         nextEnc = nextOff < size
-          ? sealRPC(new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()))
+          ? sealRPC(key, new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()))
           : null
         await postChunk(room, token, await encThis, ctl.signal)
         off = Math.min(nextOff, size)
@@ -607,8 +615,6 @@ async function startSend(kind, payload, target) {
 
 // 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
 async function receiveInto(room, key, fromInfo) {
-  sessionKey = key
-  importedKey = null
   showView('recv')
   $('#recv-text-layout').hidden = true
   $('#recv-file-layout').hidden = true
@@ -628,7 +634,7 @@ async function receiveInto(room, key, fromInfo) {
   try {
     // 0 号分片 = 加密元信息
     const packed = await getChunk(room, 0, ctl.signal)
-    meta = JSON.parse(dec.decode(await unseal(packed)))
+    meta = JSON.parse(dec.decode(await unsealWith(key, packed)))
   } catch (e) {
     if (ctl.signal.aborted) return
     $('#recv-title').textContent = '📥 接收'
@@ -637,12 +643,12 @@ async function receiveInto(room, key, fromInfo) {
     return
   }
 
-  if (meta.type === 'text') return receiveText(room, ctl)
-  return receiveFile(room, meta, ctl)
+  if (meta.type === 'text') return receiveText(room, key, ctl)
+  return receiveFile(room, key, meta, ctl)
 }
 
 // 文本：解密即呈现，无进度条无保存动作
-async function receiveText(room, ctl) {
+async function receiveText(room, key, ctl) {
   $('#recv-title').textContent = '📥 接收文本'
   $('#recv-text-layout').hidden = false
   setStatus('recv-text-status', '🟡 正在解密…', 'warn')
@@ -650,7 +656,7 @@ async function receiveText(room, ctl) {
   $('#recv-text-meta').hidden = true
   $('#recv-copy').hidden = true
   try {
-    const pt = dec.decode(await unsealRPC(await getChunk(room, 1, ctl.signal)))
+    const pt = dec.decode(await unsealRPC(key, await getChunk(room, 1, ctl.signal)))
     $('#recv-text').hidden = false
     $('#recv-text').textContent = pt
     $('#recv-text-meta').hidden = false
@@ -671,7 +677,7 @@ async function receiveText(room, ctl) {
 }
 
 // 文件：文件卡为主角；接受时的手势还在有效期内，自动拉起保存选择器
-async function receiveFile(room, meta, ctl) {
+async function receiveFile(room, key, meta, ctl) {
   $('#recv-title').textContent = '📥 接收文件'
   $('#recv-file-layout').hidden = false
   $('#recv-filecard').hidden = !meta.size
@@ -689,7 +695,7 @@ async function receiveFile(room, meta, ctl) {
   }
 
   setStatus('recv-file-status', '🟡 准备接收…', 'warn')
-  const start = () => doReceiveFile(room, meta, ctl.signal).then((r) => {
+  const start = () => doReceiveFile(room, key, meta, ctl.signal).then((r) => {
     if (r === 'picker-dismissed') {
       $('#recv-actions').hidden = false
       setStatus('recv-file-status', '🟢 已就绪，点击接收并保存', 'ok')
@@ -701,7 +707,7 @@ async function receiveFile(room, meta, ctl) {
   start() // 自动开始：手势新鲜时直接弹保存选择器；被关闭/失败则显示手动按钮
 }
 
-async function doReceiveFile(room, meta, signal) {
+async function doReceiveFile(room, key, meta, signal) {
   // 仅在有激活手势时才自动拉起保存选择器（接受邀请的点击）；
   // 无手势（链接模式直接打开/手势过期/嵌入式 webview）直接走内存模式自动下载，
   // 避免个别环境（如 Electron webview）无手势时选择器 Promise 永久挂起
@@ -731,7 +737,7 @@ async function doReceiveFile(room, meta, signal) {
   let got = 0
   for (let i = 1; i < meta.count; i++) {
     const packed = await getChunk(room, i, signal)
-    const pt = await unsealRPC(packed) // GCM 验签失败会直接抛错
+    const pt = await unsealRPC(key, packed) // GCM 验签失败会直接抛错
     got += pt.length
     if (sink.mode === 'fs') await sink.ws.write(pt)
     else sink.parts.push(pt)
