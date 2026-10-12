@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- 方案4 双端密径：两台设备（蓝/绿）经中间加密节点（黄菱）相连 -->
+  <rect x="10" y="37" width="26" height="26" rx="7" fill="#4285F4"/>
+  <rect x="64" y="37" width="26" height="26" rx="7" fill="#37D4A0"/>
+  <rect x="36" y="46.5" width="7" height="7" rx="2" fill="#ffffff"/>
+  <rect x="44" y="44" width="12" height="12" rx="2.5" fill="#F9AB00" transform="rotate(45 50 50)"/>
+  <rect x="57" y="46.5" width="7" height="7" rx="2" fill="#ffffff"/>
+</svg>

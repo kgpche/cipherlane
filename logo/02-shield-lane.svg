@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- 方案2 盾上密径：防护盾被一条加密通路水平贯穿，数据点驶向出口 -->
+  <path d="M50 10 L86 24 V50 C86 72 70 86 50 92 C30 86 14 72 14 50 V24 Z" fill="#37D4A0"/>
+  <rect x="8" y="43" width="84" height="14" fill="#0F1420"/>
+  <rect x="18" y="47" width="10" height="6" rx="3" fill="#37D4A0"/>
+  <rect x="33" y="47" width="10" height="6" rx="3" fill="#2AA37E"/>
+  <rect x="48" y="47" width="10" height="6" rx="3" fill="#1F7A5E"/>
+  <circle cx="76" cy="50" r="5" fill="#ffffff"/>
+</svg>

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- 方案3 字母 C：C 的开口即隧道入口，橙色数据块正要驶入 -->
+  <path d="M72.9 35.9 A28 28 0 1 0 72.9 68.1" fill="none" stroke="#4285F4" stroke-width="16" stroke-linecap="round"/>
+  <rect x="78" y="45.5" width="12" height="13" rx="2.5" fill="#F9AB00"/>
+</svg>
