@@ -111,8 +111,8 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  padding: 14px 8px 10px;
+  gap: 8px;
+  padding: 10px 6px 8px;
   background: var(--bg);
   border: 2px solid var(--line);
   border-radius: 12px;
@@ -131,7 +131,17 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.device .d-ip { color: var(--dim); font-size: 0.75rem; }
+.device .d-sub {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+  justify-content: center;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.device .d-sub.warn { color: var(--danger); font-size: 0.75rem; }
+.device .d-ip { color: var(--dim); font-size: 0.72rem; }
 
 /* 收到的邀请 */
 #incoming-wrap { margin-bottom: 18px; }
@@ -287,7 +297,7 @@ footer { text-align: center; color: var(--dim); font-size: 0.78rem; padding: 18p
   font-size: 11px;
   letter-spacing: 0.4px;
 }
-.device .d-fp { margin-left: auto; }
+.device .d-fp { color: var(--dim); flex-shrink: 0; }
 .device .d-fp.warn, .device.fp-changed { color: var(--danger); }
 .device.fp-changed { border-color: var(--danger); }
 .o-title .o-fp { margin-left: 6px; }

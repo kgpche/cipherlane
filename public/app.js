@@ -370,7 +370,11 @@ async function refreshDevices() {
 function renderDevices() {
   const box = $('#devices')
   box.innerHTML = ''
-  const others = deviceCache.filter((d) => d.ip !== my.ip)
+  // 按名称本地化排序(zh 拼序,中英混排稳定):首见顺序无规律,设备多了找不到了
+  const collator = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' })
+  const others = deviceCache
+    .filter((d) => d.ip !== my.ip)
+    .sort((a, b) => collator.compare(a.name || '', b.name || '') || (a.ip < b.ip ? -1 : 1))
   $('#devices-count').textContent = others.length ? `· ${others.length} 台在线` : ''
   if (selectedIp && !others.some((d) => d.ip === selectedIp)) selectedIp = null
   const empty = $('#devices-empty')
@@ -383,12 +387,22 @@ function renderDevices() {
     if (!changed && known[d.ip] !== d.pub) { known[d.ip] = d.pub; dirty = true }
     const card = document.createElement('button')
     card.className = 'device' + (d.ip === selectedIp ? ' selected' : '') + (changed ? ' fp-changed' : '')
-    card.innerHTML = `${avatarSvg(d.ip, 40)}<span class="d-name"></span><span class="d-ip"></span><span class="d-fp${changed ? ' warn' : ' dim'}"></span>`
+    card.innerHTML = `${avatarSvg(d.ip, 36)}<span class="d-name"></span><span class="d-sub${changed ? ' warn' : ''}"></span>`
     card.querySelector('.d-name').textContent = d.name || '未命名设备'
-    card.querySelector('.d-ip').textContent = d.ip
-    const fpEl = card.querySelector('.d-fp')
-    fpEl.textContent = (changed ? '⚠ 公钥已变化 ' : '') + '#' + fpOf(d.pub)
-    fpEl.title = '公钥指纹（与对方页面显示的比对，防调包）'
+    const sub = card.querySelector('.d-sub')
+    if (changed) {
+      // 变化警示占满副行:变化后的指纹无比对意义,提示本身就比指纹重要
+      sub.textContent = '⚠ 公钥已变化'
+    } else {
+      const ipEl = document.createElement('span')
+      ipEl.className = 'd-ip'
+      ipEl.textContent = d.ip
+      const fpEl = document.createElement('span')
+      fpEl.className = 'd-fp'
+      fpEl.textContent = '#' + fpOf(d.pub)
+      fpEl.title = '公钥指纹（与对方页面显示的比对，防调包）'
+      sub.append(ipEl, fpEl)
+    }
     card.onclick = () => {
       selectedIp = selectedIp === d.ip ? null : d.ip
       renderDevices()
