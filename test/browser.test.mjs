@@ -86,9 +86,14 @@ const textOf = (sel) => `document.querySelector('${sel}') ? document.querySelect
 
 // ---------- 启动:服务器 + 无头浏览器 ----------
 function launchServer() {
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
-  })
+  // CL_SERVER_BIN: 直接测试打包产物（SEA 单文件二进制），而非源码
+  const child = process.env.CL_SERVER_BIN
+    ? spawn(process.env.CL_SERVER_BIN, [], {
+        env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
+      })
+    : spawn(process.execPath, ['server.js'], {
+        cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
+      })
   child.stderr.on('data', () => {}) // 丢弃启动横幅,避免管道写满
   return child
 }
