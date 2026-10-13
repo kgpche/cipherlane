@@ -13,7 +13,8 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const PORT = Number(process.env.PORT || 7777)
-const HOST = process.env.HOST || '0.0.0.0'
+// HOST 空(默认)= 自动:绑 127.0.0.1 + 局域网(RFC1918)网卡;显式指定(如 0.0.0.0)则只绑该地址
+const HOST = process.env.HOST || ''
 
 // ---------- 限制 ----------
 const ROOM_ID_LEN = 10
@@ -270,7 +271,7 @@ function handlePull(room, i, res) {
 }
 
 // ---------- HTTP 服务 ----------
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   try {
     const u = new URL(req.url, 'http://localhost')
     const p = u.pathname
@@ -515,19 +516,7 @@ const server = http.createServer(async (req, res) => {
     try { sendJson(res, 500, { error: 'internal' }) } catch {}
     console.error('[http]', e)
   }
-})
-
-server.on('clientError', (_err, socket) => socket.destroy())
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`\n✗ 端口 ${PORT} 已被占用——可能有一个旧的密道实例还在运行。\n`)
-    console.error(`  · 到旧实例所在终端按 Ctrl+C 停止，或执行：fuser -k ${PORT}/tcp`)
-    console.error(`  · 或换端口启动：PORT=7788 node server.js\n`)
-  } else {
-    console.error('\n✗ 服务器错误：', err)
-  }
-  process.exit(1)
-})
+}
 
 // ---------- 过期清扫 ----------
 setInterval(() => {
@@ -542,18 +531,53 @@ setInterval(() => {
 }, 30 * 1000)
 
 // ---------- 启动 ----------
-server.listen(PORT, HOST, async () => {
-  const ips = ['127.0.0.1']
+// 默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不再默认 0.0.0.0——
+// 避免把服务暴露到 VPN/tun（如 198.18/15 fake-ip 段）、虚拟网卡等非信任网段。
+// 显式 HOST=（含 0.0.0.0，deb/容器模板如此）时只绑指定地址，维持旧行为。
+function lanAddresses() {
+  const out = []
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list || []) {
-      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address)
+      if (ni.family === 'IPv4' && !ni.internal && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ni.address))
+        out.push(ni.address)
     }
   }
+  return [...new Set(out)]
+}
+const listenAddrs = HOST ? [HOST] : ['127.0.0.1', ...lanAddresses()]
+let listenReady = 0
+for (const addr of listenAddrs) {
+  const s = http.createServer(handleRequest)
+  s.on('clientError', (_err, socket) => socket.destroy())
+  s.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`\n✗ ${addr}:${PORT} 已被占用——可能有一个旧的密道实例还在运行。\n`)
+      console.error(`  · 到旧实例所在终端按 Ctrl+C 停止，或执行：fuser -k ${PORT}/tcp`)
+      console.error(`  · 或换端口启动：PORT=7788 node server.js\n`)
+    } else {
+      console.error(`\n✗ 监听 ${addr} 失败：`, err)
+    }
+    process.exit(1)
+  })
+  s.listen(PORT, addr, () => { if (++listenReady === listenAddrs.length) banner() })
+}
+
+async function banner() {
+  // 展示地址：显式绑 0.0.0.0（= 全网卡）时列出全部网卡地址，其余只列实际绑定地址
+  const ips = listenAddrs.includes('0.0.0.0')
+    ? ['127.0.0.1', ...Object.values(os.networkInterfaces()).flatMap((l) => l || [])
+        .filter((ni) => ni.family === 'IPv4' && !ni.internal).map((ni) => ni.address)]
+    : listenAddrs
   console.log('cipherlane · 密道 —— 局域网端到端加密传输')
   console.log('  服务器零知识：只中转密文，密钥永不离开收发双方的浏览器\n')
   for (const ip of ips) console.log(`  →  http://${ip}:${PORT}`)
   // 主局域网地址附带终端二维码，手机扫码即开
   const lanIp = ips.find((ip) => ip !== '127.0.0.1')
+  if (!lanIp) {
+    console.log('  （未发现局域网网卡：当前仅本机可访问；需要全网卡监听用 HOST=0.0.0.0）')
+    console.log('\n等待传输…（Ctrl+C 退出）')
+    return
+  }
   if (lanIp) {
     const url = `http://${lanIp}:${PORT}/`
     let qrMod = null
@@ -587,7 +611,7 @@ server.listen(PORT, HOST, async () => {
     } catch { /* 写入失败则跳过 */ }
   }
   console.log('\n等待传输…（Ctrl+C 退出）')
-})
+}
 
 process.on('SIGINT', () => {
   console.log('\n再见')

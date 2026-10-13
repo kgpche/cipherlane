@@ -319,6 +319,21 @@ async function main() {
       ok('ack 密钥凭证：双侧构造一致 / state 透出 / 无凭证与非法凭证为 null')
     }
 
+    // ---------- 10) 默认绑定面：仅回环 + RFC1918，不暴露 tun/公网地址 ----------
+    {
+      // 127.0.0.1 可达已由本测试全程隐式验证；再断言横幅列出的地址全为回环/RFC1918
+      // （本测试未设 HOST，走默认绑定；无多余网卡的 CI 上仅 127.0.0.1）
+      const shown = [...logs.matchAll(/→\s+http:\/\/([0-9.]+):/g)].map((m) => m[1])
+      assert(shown.length >= 1, '横幅未列出任何地址')
+      for (const ip of shown) {
+        assert(
+          /^(127\.0\.0\.1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip),
+          `默认绑定面出现非信任网段地址: ${ip}`,
+        )
+      }
+      ok(`默认绑定面仅回环/RFC1918（横幅 ${shown.join(', ')}）`)
+    }
+
     console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')
