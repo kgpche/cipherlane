@@ -19,6 +19,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// 全局 WebSocket 为 Node 22+ 稳定能力；18/20 跳过浏览器组（CI 矩阵里由 22 全跑）
+if (typeof WebSocket === 'undefined') {
+  console.log('  – 此 Node 版本无全局 WebSocket（需 22+），跳过浏览器冒烟测试')
+  process.exit(0)
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 const PORT = 20000 + Math.floor(Math.random() * 20000)
