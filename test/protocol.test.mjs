@@ -334,6 +334,29 @@ async function main() {
       ok(`默认绑定面仅回环/RFC1918（横幅 ${shown.join(', ')}）`)
     }
 
+    // ---------- 12) 长轮询并发上限：单 IP 第 9 个挂起 GET → 429，释放后可再挂 ----------
+    {
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      const lr = r.json
+      const ctl = new AbortController()
+      const polls = Array.from({ length: 9 }, (_, k) => {
+        const p = fetch(`${S}/api/rooms/${lr.room}/chunk?i=0&n=${k}`, { signal: ctl.signal }).then((x) => x.status)
+        p.catch(() => {}) // abort 后的 AbortError 不成为 unhandledRejection
+        return p
+      })
+      assert.strictEqual(await polls[8], 429, '第 9 个并发长轮询应 429') // 前 8 个挂起中,仅它立即返回
+      ctl.abort() // 断开前 8 个 → close 释放计数
+      await sleep(300)
+      const ctl2 = new AbortController()
+      const again = fetch(`${S}/api/rooms/${lr.room}/chunk?i=0&n=99`, { signal: ctl2.signal })
+      const verdict = await Promise.race([again.then((x) => x.status), sleep(1200).then(() => 'parked')])
+      assert.strictEqual(verdict, 'parked', '释放后应允许新的长轮询挂起（而不是 429）')
+      ctl2.abort()
+      await Promise.allSettled(polls)
+      await jfetch(`/api/rooms/${lr.room}`, { method: 'DELETE', headers: { 'X-Room-Token': lr.token } })
+      ok('长轮询并发上限：第 9 个 429 / 断开释放后可再挂')
+    }
+
     console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')

@@ -243,6 +243,7 @@ async function getChunk(room, i, signal) {
       throw e
     }
     if (r.status === 408) continue // 长轮询到期，立刻重试继续等
+    if (r.status === 429) { await sleep(500); continue } // 并发长轮询上限:稍候重试
     if (r.status === 409) throw new Error('此链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')
     if (r.status === 410) throw new Error('此链接已被使用、已过期，或发送方已中断')
@@ -939,6 +940,14 @@ document.addEventListener('paste', (e) => {
     input.value = my.name
     store.set('cipherlane-name', my.name)
     heartbeat()
+  }
+  // 重置身份密钥：换新 X25519 身份（identity 是启动时读入的模块常量，重载页面生效最干净）。
+  // 曾向你发过的设备会看到"⚠ 公钥已变化"——这正是 TOFU 在起作用
+  $('#me-reset').onclick = () => {
+    if (!confirm('重置身份密钥？你的公钥指纹将变化，向你要过文件的设备会看到"公钥已变化"警示。')) return
+    const kp = X25519.genKey()
+    store.set('cipherlane-sk', toB64(kp.sk))
+    location.reload()
   }
 }
 

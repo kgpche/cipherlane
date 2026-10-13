@@ -291,3 +291,15 @@ footer { text-align: center; color: var(--dim); font-size: 0.78rem; padding: 18p
 .device .d-fp.warn, .device.fp-changed { color: var(--danger); }
 .device.fp-changed { border-color: var(--danger); }
 .o-title .o-fp { margin-left: 6px; }
+
+/* 名片上的幽灵按钮（重置身份密钥） */
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.link-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }

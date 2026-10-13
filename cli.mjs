@@ -127,6 +127,27 @@ function avatarOf(seedStr) {
 }
 
 // ---------- 协议 ----------
+// 带超时的 fetch：连接停滞（既不返回也不报错）时中断重试，而非无限挂起。
+// 仅超时可重试；快速失败与调用方 signal 取消原样上抛。
+async function fetchT(url, opts, ms) {
+  const ctl = new AbortController()
+  const follow = () => ctl.abort()
+  if (opts && opts.signal) {
+    if (opts.signal.aborted) throw new Error('已取消')
+    opts.signal.addEventListener('abort', follow)
+  }
+  const timer = setTimeout(() => {
+    const e = new Error('timeout')
+    e.name = 'TimeoutError'
+    ctl.abort(e)
+  }, ms)
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal })
+  } finally {
+    clearTimeout(timer)
+    if (opts && opts.signal) opts.signal.removeEventListener('abort', follow)
+  }
+}
 async function jget(pathname, hdrs) {
   const r = await fetch(server + pathname, { headers: hdrs || {} })
   if (!r.ok) throw new Error(`${pathname} → ${r.status}`)
@@ -139,11 +160,17 @@ async function createRoom() {
 }
 async function postChunk(room, token, body) {
   for (;;) {
-    const r = await fetch(`${server}/api/rooms/${room}/chunk`, {
-      method: 'POST',
-      headers: { 'X-Room-Token': token },
-      body,
-    })
+    let r
+    try {
+      r = await fetchT(`${server}/api/rooms/${room}/chunk`, {
+        method: 'POST',
+        headers: { 'X-Room-Token': token },
+        body,
+      }, 30_000)
+    } catch (e) {
+      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投
+      throw e
+    }
     if (r.status === 429) { await sleep(250); continue }
     if (!r.ok) throw new Error('投递分片失败 ' + r.status)
     return
@@ -151,8 +178,16 @@ async function postChunk(room, token, body) {
 }
 async function getChunkAt(origin, room, i) {
   for (;;) {
-    const r = await fetch(`${origin}/api/rooms/${room}/chunk?i=${i}`)
+    let r
+    try {
+      // 超时给足长轮询余量（服务端 25s 到期返回 408 后本就重试）
+      r = await fetchT(`${origin}/api/rooms/${room}/chunk?i=${i}`, {}, 35_000)
+    } catch (e) {
+      if (e && e.name === 'TimeoutError') continue // 连接停滞:重连再等
+      throw e
+    }
     if (r.status === 408) continue
+    if (r.status === 429) { await sleep(500); continue } // 并发长轮询上限:稍候重试
     if (r.status === 409) throw new Error('链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')
     if (r.status === 410) throw new Error('链接已被使用、过期，或发送方中断')

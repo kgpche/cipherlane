@@ -27,6 +27,18 @@ const ROOM_IDLE_MS = 15 * 60 * 1000
 const ACK_IDLE_MS = 2 * 60 * 1000
 const LONGPOLL_MS = 25 * 1000
 const ROOM_RE = new RegExp(`^[0-9A-Za-z]{${ROOM_ID_LEN}}$`)
+const LONGPOLL_PER_IP = 8   // 单 IP 并发长轮询上限（正常收发 ≤4：预取 3 + 邀请 1），防 fd 耗尽
+const longpollCount = new Map() // ip → 当前挂起长轮询数
+function longpollEnter(ip) {
+  const n = (longpollCount.get(ip) || 0) + 1
+  longpollCount.set(ip, n)
+  return n
+}
+function longpollExit(ip) {
+  const n = (longpollCount.get(ip) || 1) - 1
+  if (n <= 0) longpollCount.delete(ip)
+  else longpollCount.set(ip, n)
+}
 
 // 设备直发（定向传输）：一个局域网 IP 视为一台终端
 const DEVICE_TTL_MS = 20 * 1000        // 心跳超时即离线（客户端 5s 心跳）
@@ -223,7 +235,7 @@ function notifyOffers(ip) {
 }
 
 // GET /api/rooms/:id/chunk?i=N —— 长轮询取分片（接收方顺序拉取）
-function handlePull(room, i, res) {
+function handlePull(room, i, res, ip) {
   if (i < room.head) return sendJson(res, 410, { error: 'consumed' })
   const body = takeChunk(room, i)
   if (body) {
@@ -236,6 +248,10 @@ function handlePull(room, i, res) {
   }
   // 发送方已声明结束但仍缺分片 → 传输被中断
   if (room.senderDone && i >= room.posted) return sendJson(res, 410, { error: 'sender-gone' })
+  if (longpollEnter(ip) > LONGPOLL_PER_IP) {
+    longpollExit(ip)
+    return sendJson(res, 429, { error: 'too-many-polls', retry: 1 })
+  }
 
   const w = {
     i,
@@ -263,6 +279,7 @@ function handlePull(room, i, res) {
   }, LONGPOLL_MS)
   room.waiters.push(w)
   res.on('close', () => {
+    longpollExit(ip)
     if (w.settled) return
     w.clearTimer()
     w.settled = true
@@ -331,6 +348,10 @@ async function handleRequest(req, res) {
       dev.lastSeen = Date.now()
       const respond = () => sendJson(res, 200, { offers: pendingOffersFor(ip) })
       if (pendingOffersFor(ip).length) return respond()
+      if (longpollEnter(ip) > LONGPOLL_PER_IP) {
+        longpollExit(ip)
+        return sendJson(res, 429, { error: 'too-many-polls', retry: 1 })
+      }
       const w = {
         settled: false,
         clearTimer() { clearTimeout(this.timer) },
@@ -349,6 +370,7 @@ async function handleRequest(req, res) {
       if (!offerWaiters.has(ip)) offerWaiters.set(ip, new Set())
       offerWaiters.get(ip).add(w)
       res.on('close', () => {
+        longpollExit(ip)
         w.settled = true
         clearTimeout(w.timer)
         const set = offerWaiters.get(ip)
@@ -481,7 +503,7 @@ async function handleRequest(req, res) {
       if (sub === 'chunk' && req.method === 'GET') {
         const i = Number(u.searchParams.get('i'))
         if (!Number.isInteger(i) || i < 0) return sendJson(res, 400, { error: 'bad-index' })
-        return handlePull(room, i, res)
+        return handlePull(room, i, res, clientIp(req))
       }
 
       if (sub === 'done' && req.method === 'POST') {
@@ -601,12 +623,14 @@ async function banner() {
       const qr = qrMod && qrMod.asciiAdaptive && qrMod.asciiAdaptive(url, ratio)
       if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
     } catch { /* 二维码不可用时仅打印 URL */ }
-    // 保底：终端字体几何不可控时，写一张像素级精确的 PNG 供看图工具扫码
+    // 保底：终端字体几何不可控时，写一张像素级精确的 PNG 供看图工具扫码。
+    // 写系统临时目录 + 排他创建：固定文件名写在 cwd 有符号链接覆盖风险
     try {
       const pngData = qrMod && qrMod.png && qrMod.png(url, 10)
       if (pngData) {
-        fs.writeFileSync(path.join(process.cwd(), 'cipherlane-qr.png'), pngData)
-        console.log('  （终端扫码失败时，用看图工具打开 ./cipherlane-qr.png 扫描）')
+        const pngPath = path.join(os.tmpdir(), `cipherlane-qr-${process.pid}.png`)
+        fs.writeFileSync(pngPath, pngData, { flag: 'wx' })
+        console.log(`  （终端扫码失败时，用看图工具打开 ${pngPath} 扫描）`)
       }
     } catch { /* 写入失败则跳过 */ }
   }

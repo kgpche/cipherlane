@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -123,7 +123,7 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, ≤ 8 pending of
 
 **Known boundaries (stated honestly)**:
 
-- **Device-direct mode cannot automatically stop an active MITM by the server**: device public keys are distributed by the server, so a malicious server could substitute keys and impersonate the receiver. The mitigation is **public-key fingerprints** (TOFU): device cards and your own card show an 8-hex fingerprint, and a changed key is flagged "⚠ key changed" persistently — comparing fingerprints out loud defeats substitution, but the system will not compare them for you. For the highest assurance, use link mode
+- **Device-direct mode cannot automatically stop an active MITM by the server**: device public keys are distributed by the server, so a malicious server could substitute keys and impersonate the receiver. The mitigation is **public-key fingerprints** (TOFU): device cards and your own card show an 8-hex fingerprint, and a changed key is flagged "⚠ key changed" persistently — comparing fingerprints out loud defeats substitution, but the system will not compare them for you; the ↻ button on your card resets the identity key at any time. For the highest assurance, use link mode
 - **The page itself is served over plain HTTP**: E2EE protects against passive observers only; an active on-path attacker could in principle replace the served JavaScript (the same class of risk as opening any plain-http site). Use a VPN on untrusted networks
 - Device names and presence are visible to the server and to anyone who opens the page on the LAN — the inherent cost of device discovery
 - The server binds 127.0.0.1 + LAN (RFC1918) interfaces by default, not VPN/tun or virtual adapters; explicit `HOST=0.0.0.0` (as the deb service template does) binds everywhere
@@ -177,7 +177,7 @@ All devices must be on the **same Wi-Fi/subnet**; check that the OS firewall all
 Some embedded webviews lack `alert/confirm` and file savers — a host limitation. Use a real browser (Chrome / Edge / Safari) for serious work.
 
 **QR code looks distorted in an IDE integrated terminal?**
-IDE terminals (Electron/xterm.js) deviate from the standard 2:1 cell geometry, which can distort ASCII QR art — a rendering quirk of those environments; standard terminals (GNOME Terminal / Windows Terminal / iTerm) are fine. In an IDE terminal use the fallbacks: `cipherlane-qr.png` in the working directory (pixel-exact), or the SVG QR on the send page. `CIPHERLANE_QR_RATIO=<measured ratio>` corrects manually.
+IDE terminals (Electron/xterm.js) deviate from the standard 2:1 cell geometry, which can distort ASCII QR art — a rendering quirk of those environments; standard terminals (GNOME Terminal / Windows Terminal / iTerm) are fine. In an IDE terminal use the fallbacks: `cipherlane-qr-<pid>.png` in the system temp directory (pixel-exact; the banner prints the full path), or the SVG QR on the send page. `CIPHERLANE_QR_RATIO=<measured ratio>` corrects manually.
 
 **Receiver refreshed mid-transfer of a big file?**
 No resume support yet — just send again (roadmap item).
@@ -222,6 +222,11 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 ## Changelog
 
+**v0.2.3** (2026-10-13)
+- Hardening: per-IP concurrent long-poll cap of 8 (fd-exhaustion defense; legit traffic stays ≤4); the QR fallback PNG moved to the system temp directory with exclusive creation (the old fixed name in the working directory was a symlink-overwrite hazard); CLI chunk send/receive now retries stalled connections (same semantics as the browser)
+- Identity-key reset (↻ on your card): manually rotate the X25519 identity; devices that sent to you before will see the "key changed" warning — closing the TOFU loop
+- Tests: protocol suite at 12 groups (+ long-poll cap/release); browser suite at 7 (+ pure-JS AES fallback path — a host-mapped non-secure context receiving from a native-WebCrypto sender, byte-identical)
+
 **v0.2.2** (2026-10-13)
 - Adversarial-review fix batch: concurrent pulls of the same chunk are now first-come-first-served (runner-up gets 409; previously the sender got a 500 and the runner-up hung forever); setup-phase failures now have an escape path (previously a dead-end view with no button); per-transfer key scoping (concurrent send/receive in one tab no longer cross-contaminate); CLI short-read fix / dotfile defense (`.bashrc` lands as `bashrc`) / atomic `.part` writes
 - Unique sequence numbers on chunk GETs: closes an in-flight request-coalescing hole where the browser/proxy could hand the same one-shot chunk to two waiters
@@ -250,8 +255,9 @@ npm test    # or run individually: node test/<name>.test.mjs
 - [ ] Pure-JS AES performance work (T-tables / SIMD GHASH)
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
 - [ ] Multi-file / directory transfers
-- [ ] Resume support (replayable chunks + position negotiation)
+- [ ] Resume support (replayable chunks + position negotiation; note: plain-http non-secure contexts lack OPFS, so resume-across-refresh needs design trade-offs — connection-drop recovery comes first)
 - [x] Device public-key fingerprints + change warnings (TOFU defense against server MITM)
+- [x] Hardening batch: long-poll concurrency cap, QR fallback image moved to the temp dir, CLI request timeouts, identity-key reset, pure-JS-path browser coverage — v0.2.3
 
 ## License
 

@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -122,7 +122,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 
 **已知边界（如实说明）**：
 
-- **设备直发无法自动防服务器主动 MITM**：设备公钥由服务器分发，恶意服务器理论上可调包公钥冒充接收方。防线是**公钥指纹**（TOFU）：设备卡/名片显示 8 位指纹，公钥变化会持续标"⚠ 公钥已变化"——双方口头比对指纹可识破调包，但系统不会替你比对。极高安全需求请用链接模式
+- **设备直发无法自动防服务器主动 MITM**：设备公钥由服务器分发，恶意服务器理论上可调包公钥冒充接收方。防线是**公钥指纹**（TOFU）：设备卡/名片显示 8 位指纹，公钥变化会持续标"⚠ 公钥已变化"——双方口头比对指纹可识破调包，但系统不会替你比对；名片上的 ↻ 可随时重置身份密钥。极高安全需求请用链接模式
 - **页面本身经明文 HTTP 下发**：端到端加密只防被动嗅探；路径上的主动攻击者理论上可替换下发的 JS（与浏览器打开任何 http 站点同级的风险）。不可信网络请配合 VPN 使用
 - 设备名称与在线状态对服务器及局域网内打开页面的用户可见——这是"设备发现"的固有代价
 - 服务默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不绑 VPN/tun、虚拟网卡等非信任网段；显式 `HOST=0.0.0.0`（deb 服务模板如此）才全网卡监听
@@ -176,7 +176,7 @@ CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
 部分嵌入式 webview 的 `alert/confirm` 与文件保存器不可用，属宿主限制。正式使用建议系统浏览器（Chrome / Edge / Safari）。
 
 **ZCode / IDE 集成终端里二维码显示异常？**
-IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标准 2:1，字符艺术二维码可能变形——这属于该环境的渲染特性，标准终端（GNOME Terminal / Windows Terminal / iTerm）显示正常。集成终端里请用两条保底路径：启动目录下的 `cipherlane-qr.png`（像素精确，看图工具打开即扫），或网页发送页的 SVG 二维码。也可用 `CIPHERLANE_QR_RATIO=<实测比例>` 手动校正（太高调小、太宽调大）。
+IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标准 2:1，字符艺术二维码可能变形——这属于该环境的渲染特性，标准终端（GNOME Terminal / Windows Terminal / iTerm）显示正常。集成终端里请用两条保底路径：系统临时目录下的 `cipherlane-qr-<pid>.png`（像素精确，启动横幅会打印完整路径），或网页发送页的 SVG 二维码。也可用 `CIPHERLANE_QR_RATIO=<实测比例>` 手动校正（太高调小、太宽调大）。
 
 **发大文件接收方刷新了页面怎么办？**
 当前不支持断点续传，重新发一次即可（路线图项）。
@@ -221,6 +221,15 @@ npm test    # 或逐个: node test/<name>.test.mjs
 
 ## 更新日志
 
+**v0.2.3**（2026-10-13）
+- 加固：单 IP 并发长轮询上限 8（防 fd 耗尽，正常收发 ≤4）；QR 保底 PNG 移至
+  系统临时目录并排他创建（原固定名写在 cwd 有符号链接覆盖风险）；CLI 分片
+  收发增加连接停滞超时重连（与浏览器同款语义）
+- 身份密钥重置入口（名片 ↻）：手动轮换 X25519 身份；重置后向你要过文件的
+  设备会看到"公钥已变化"警示——TOFU 闭环
+- 测试：协议 12 组（+长轮询上限/释放）；浏览器 7 组（+纯 JS AES 降级路径——
+  host 映射伪造非安全上下文，原生 WebCrypto 发送 ↔ 纯 JS 接收逐字互通）
+
 **v0.2.2**（2026-10-13）
 - 对抗性审查修复批：并发拉取同一分片先到先得（后来者 409，原先发送方 500+后来者挂起）；
   发送建立阶段失败可退（原死锁在无按钮视图）；密钥按传输传参（同页并发收发不再互污）；
@@ -257,8 +266,9 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - [ ] 纯 JS AES 路径性能优化（T-table / SIMD 化 GHASH）
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [ ] 多文件 / 目录传输
-- [ ] 断点续传（分片可重放 + 位置协商）
+- [ ] 断点续传 / 传输中断恢复（注：明文 http 非安全上下文无 OPFS，"跨页面刷新续存"需设计权衡，先做连接中断自动恢复）
 - [x] 设备直发的公钥指纹显示与变更警示（对抗服务器主动 MITM 的 TOFU 防线）
+- [x] 加固批：长轮询并发上限、QR 保底图移至临时目录、CLI 请求超时、身份密钥重置入口、纯 JS 路径浏览器测试覆盖 —— v0.2.3
 
 ## License
 

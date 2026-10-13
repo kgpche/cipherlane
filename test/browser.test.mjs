@@ -113,6 +113,10 @@ function launchChrome() {
   const child = spawn(bin, [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--no-default-browser-check', '--mute-audio', '--window-size=1280,900',
+    '--no-proxy-server', // 宿主机系统代理会拦截非 localhost 域名(测试机有 clash 类代理),测试直连
+    // 假域名映射到本机:提供"非安全上下文"origin(非 localhost 的明文 http),
+    // 用于覆盖纯 JS AES 降级路径(127.0.0.1 是安全上下文,走不到它)
+    '--host-resolver-rules=MAP cipherlane-insecure.test 127.0.0.1',
     `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe'] })
   const wsUrl = new Promise((res, rej) => {
@@ -249,6 +253,30 @@ async function main() {
       `performance.getEntriesByType('resource').filter((e) => e.name.includes('crypto-worker.js')).length`)
     if (!(workersUsed >= 2)) throw new Error(`加密未走 Worker 池(实例数 ${workersUsed}),疑似静默回退主线程`)
     ok(`文件传输全链路:Worker 池加密(×${workersUsed}) → 5MiB 分片 → 接收方保存完成`)
+
+    // ---------- 6) 纯 JS AES 降级路径:安全上下文发送 → 非安全上下文接收 ----------
+    // 假域名(非 localhost 的明文 http)无 crypto.subtle → 浏览器与 Worker 走纯 JS AES-GCM,
+    // 与发送侧的原生 WebCrypto 产出的线上格式必须逐字节互通
+    const sidC = await newPage(c)
+    await navigate(c, sidC, `http://cipherlane-insecure.test:${PORT}/`)
+    const ctx = await evalJs(c, sidC,
+      `({ subtle: typeof crypto !== 'undefined' && !!crypto.subtle, aesgcm: typeof AESGCM })`)
+    if (ctx.subtle !== false || ctx.aesgcm !== 'object') {
+      throw new Error('预期非安全上下文(无 subtle、有纯 JS AESGCM),实际: ' + JSON.stringify(ctx))
+    }
+    await navigate(c, sidA, S + '/')
+    const secret2 = '纯 JS AES 降级路径互操作 🐢 ' + randomBytes(6).toString('hex')
+    await evalJs(c, sidA, `document.querySelector('#text').value = ${JSON.stringify(secret2)}`)
+    await evalJs(c, sidA, `document.querySelector('#send-text').click()`)
+    await waitFor(c, sidA, `document.querySelector('#link').textContent.startsWith('http')`, 15000, '降级路径链接')
+    const link2 = (await evalJs(c, sidA, textOf('#link')))
+      .replace(`127.0.0.1:${PORT}`, `cipherlane-insecure.test:${PORT}`)
+    await navigate(c, sidC, link2)
+    await waitFor(c, sidC, `!document.querySelector('#recv-text').hidden`, 20000, '降级路径接收')
+    const got2 = await evalJs(c, sidC, textOf('#recv-text'))
+    if (got2 !== secret2) throw new Error(`降级路径文本不一致:\n  期望 ${JSON.stringify(secret2)}\n  实际 ${JSON.stringify(got2)}`)
+    await waitFor(c, sidC, `document.querySelector('#recv-text-status').textContent.includes('已解密接收')`, 10000, '降级路径完成')
+    ok('纯 JS AES 降级路径:安全上下文发送 ↔ 非安全上下文接收逐字一致(跨实现互通)')
 
     // ---------- 5) 服务器中途下线:建立失败可退 ----------
     await navigate(c, sidA, S + '/') // 趁服务器还在先回到首页(之后不再导航,页面操作走内存态)
