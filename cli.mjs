@@ -47,7 +47,7 @@ function usage() {
 
 用法:
   node cli.mjs devices                       [--server http://<局域网IP>:7777]
-  node cli.mjs send <文件路径> [--to <设备IP>] [--name <名称>] [--server ...]
+  node cli.mjs send <文件/目录...> [--to <设备IP>] [--name <名称>] [--server ...]   # 多路径/目录递归
   node cli.mjs send-text <文本> [--to <设备IP>] [--name <名称>] [--server ...]
   node cli.mjs recv '<接收链接>' [-o 输出路径]
   node cli.mjs listen [--yes] [-o 保存目录] [--name <名称>] [--server ...]
@@ -249,24 +249,19 @@ async function doDevices() {
   console.log(`\n直发示例: node cli.mjs send big.zip --to ${list[0].ip}`)
 }
 
-// ---------- send（--to 定向 / 默认链接模式） ----------
-async function doSend({ type, name, size, readChunk }) {
-  const identity = genIdentity()
-  if (opts.to) await heartbeat(opts.name || os.hostname(), identity) // 供对方看到发送者名称
-
+// ---------- 房间建立 / 邀请等待（单文件与批量共用） ----------
+async function openRoom(preview, identity) {
   const { room, token } = await createRoom()
-  const dataChunks = type === 'text' ? 1 : size === 0 ? 0 : Math.ceil(size / CHUNK)
-  const count = 1 + dataChunks
   let key
   let target = null
-
+  let link = null
   if (opts.to) {
     const devices = await listDevices()
     target = devices.find((d) => d.ip === opts.to)
     if (!target) throw new Error(`设备 ${opts.to} 不在线（node cli.mjs devices 查看）`)
     if (presence && target.ip === presence.ip) throw new Error('不能发送给自己')
     key = roomKey(dh(identity.seed, fromB64u(target.pub)), identity.pub, fromB64u(target.pub), room)
-    const hint = b64u(seal(key, Buffer.from(JSON.stringify({ kind: type, name: type === 'text' ? null : name, size }))))
+    const hint = b64u(seal(key, Buffer.from(JSON.stringify(preview))))
     const r = await fetch(`${server}/api/rooms/${room}/offer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Room-Token': token },
@@ -274,7 +269,6 @@ async function doSend({ type, name, size, readChunk }) {
     })
     if (!r.ok) throw new Error('投递邀请失败 ' + r.status)
     console.log(`\n${avatarOf(target.ip)}  已向 ${(target.name || '未命名设备')} (${target.ip}) 发出邀请，等待接受…`)
-    // 等待接受 / 拒绝（邀请 5 分钟有效）
     const deadline = Date.now() + 5 * 60 * 1000
     for (;;) {
       if (Date.now() > deadline) throw new Error('对方超时未接受')
@@ -286,9 +280,8 @@ async function doSend({ type, name, size, readChunk }) {
     }
     console.log('  对方已接受，开始传输…\n')
   } else {
-    const linkKey = randomBytes(32)
-    key = linkKey
-    const link = `${server}/#${room}.${linkKey.toString('base64url')}`
+    key = randomBytes(32)
+    link = `${server}/#${room}.${key.toString('base64url')}`
     console.log('\n╔══════════════════════════════════════════╗')
     console.log('║  把下面的接收链接发给对方（浏览器打开即可）  ║')
     console.log('╚══════════════════════════════════════════╝\n')
@@ -298,20 +291,11 @@ async function doSend({ type, name, size, readChunk }) {
     const qr = QRCode.asciiAdaptive(link, ratio)
     if (qr) console.log(qr + '  ↑ 手机扫码接收\n')
   }
+  return { room, token, key, target, link }
+}
 
-  const meta = { v: 1, type, name: type === 'text' ? null : name, mime: null, size, count }
-  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta))))
-
-  for (let i = 1; i < count; i++) {
-    const pt = await readChunk(i - 1)
-    await postChunk(room, token, seal(key, pt))
-    const done = i * CHUNK
-    process.stdout.write(`\r  已发送 ${fmt(Math.min(done, size))} / ${fmt(size)}`)
-  }
-  if (count === 1) process.stdout.write(`\r  已发送 ${fmt(size)} / ${fmt(size)}`)
-  await fetch(`${server}/api/rooms/${room}/done`, { method: 'POST', headers: { 'X-Room-Token': token } })
-
-  // 等对方收完
+// 发完之后等 ack（含密钥凭证校验）
+async function awaitAck(room, key, target) {
   const deadline = Date.now() + 15 * 60 * 1000
   process.stdout.write('\n  等待对方接收…')
   for (;;) {
@@ -334,6 +318,120 @@ async function doSend({ type, name, size, readChunk }) {
   }
 }
 
+// ---------- send（--to 定向 / 默认链接模式，单文件/文本） ----------
+async function doSend({ type, name, size, readChunk }) {
+  const identity = genIdentity()
+  if (opts.to) await heartbeat(opts.name || os.hostname(), identity) // 供对方看到发送者名称
+  const dataChunks = type === 'text' ? 1 : size === 0 ? 0 : Math.ceil(size / CHUNK)
+  const count = 1 + dataChunks
+  const { room, token, key, target } = await openRoom(
+    { kind: type, name: type === 'text' ? null : name, size }, identity)
+
+  const meta = { v: 1, type, name: type === 'text' ? null : name, mime: null, size, count }
+  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta))))
+
+  for (let i = 1; i < count; i++) {
+    const pt = await readChunk(i - 1)
+    await postChunk(room, token, seal(key, pt))
+    const done = i * CHUNK
+    process.stdout.write(`\r  已发送 ${fmt(Math.min(done, size))} / ${fmt(size)}`)
+  }
+  if (count === 1) process.stdout.write(`\r  已发送 ${fmt(size)} / ${fmt(size)}`)
+  await fetch(`${server}/api/rooms/${room}/done`, { method: 'POST', headers: { 'X-Room-Token': token } })
+  await awaitAck(room, key, target)
+}
+
+// ---------- 批量发送（多文件 / 目录递归，浏览器与 CLI 互通） ----------
+const FILES_MAX = 256
+const dataChunkCount = (size) => (size === 0 ? 0 : Math.ceil(size / CHUNK))
+
+// 收集发送清单：文件直接入列；目录递归展开为相对路径（跳过点开头隐藏项）
+async function gatherFiles(paths) {
+  const files = [] // { abs, rel, size }
+  for (const p of paths) {
+    const st = await fsp.stat(p).catch(() => null)
+    if (!st) throw new Error(`路径不存在: ${p}`)
+    if (st.isDirectory()) {
+      const root = path.resolve(p)
+      const walk = async (dir) => {
+        for (const e of await fsp.readdir(dir, { withFileTypes: true })) {
+          if (e.name.startsWith('.')) continue // .git / .DS_Store 等
+          const fp = path.join(dir, e.name)
+          if (e.isDirectory()) await walk(fp)
+          else if (e.isFile()) files.push({ abs: fp, rel: path.relative(root, fp).split(path.sep).join('/'), size: (await fsp.stat(fp)).size })
+        }
+      }
+      await walk(root)
+    } else if (st.isFile()) files.push({ abs: p, rel: path.basename(p), size: st.size })
+    else throw new Error(`不支持的路径类型: ${p}`)
+  }
+  if (!files.length) throw new Error('没有可发送的文件（目录为空或只含隐藏文件）')
+  if (files.length > FILES_MAX) throw new Error(`文件数超过上限 ${FILES_MAX}（当前 ${files.length}）`)
+  return files
+}
+
+async function doSendBatch(files) {
+  const identity = genIdentity()
+  if (opts.to) await heartbeat(opts.name || os.hostname(), identity)
+  const totalSize = files.reduce((n, f) => n + f.size, 0)
+  const manifest = files.map((f) => ({ name: f.rel, size: f.size, count: dataChunkCount(f.size) }))
+  const { room, token, key, target } = await openRoom(
+    { kind: 'batch', count: manifest.length, size: totalSize }, identity)
+  const count = 1 + manifest.reduce((n, m) => n + m.count, 0)
+  const meta = { v: 1, type: 'batch', files: manifest, count, size: totalSize }
+  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta))))
+
+  let sent = 0
+  for (let f = 0; f < files.length; f++) {
+    const { abs, rel, size } = files[f]
+    const n = manifest[f].count
+    if (n > 0) {
+      const fh = await fsp.open(abs, 'r')
+      for (let i = 0; i < n; i++) {
+        const len = Math.min(CHUNK, size - i * CHUNK)
+        const buf = Buffer.allocUnsafe(len)
+        let read = 0
+        while (read < len) { // 循环读满：网络盘等场景可能短读
+          const { bytesRead } = await fh.read(buf, read, len - read, i * CHUNK + read)
+          if (!bytesRead) break
+          read += bytesRead
+        }
+        await postChunk(room, token, seal(key, read === len ? buf : buf.subarray(0, read)))
+        sent += read
+        process.stdout.write(`\r  [${f + 1}/${files.length}] ${rel.slice(0, 28).padEnd(28)} 已发送 ${fmt(sent)} / ${fmt(totalSize)}`)
+      }
+      await fh.close()
+    }
+  }
+  await fetch(`${server}/api/rooms/${room}/done`, { method: 'POST', headers: { 'X-Room-Token': token } })
+  console.log(`\n  共 ${files.length} 个文件（${fmt(totalSize)}）已全部发出`)
+  await awaitAck(room, key, target)
+}
+
+// 批量接收落盘：按 manifest 顺序拉流，逐文件写目标目录（相对路径逐段净化）
+function safeJoin(dir, rel) {
+  const parts = String(rel || '').split('/').map(safeName).filter(Boolean)
+  return parts.length ? path.join(dir, ...parts) : path.join(dir, 'received')
+}
+async function receiveBatch(origin, room, key, meta, outDir) {
+  await fsp.mkdir(outDir, { recursive: true })
+  let idx = 1 // 下一个文件的首个数据分片序号
+  for (const f of meta.files) {
+    const target = safeJoin(outDir, f.name)
+    await fsp.mkdir(path.dirname(target), { recursive: true })
+    if (!f.count) {
+      await fsp.writeFile(target, Buffer.alloc(0))
+      console.log(`\n  ✓ ${f.name}（0 B，空文件）`)
+      continue
+    }
+    const start = idx
+    idx += f.count
+    await receiveToFile(target, { size: f.size, count: f.count + 1 },
+      async (i) => unseal(key, await getChunkAt(origin, room, start + i - 1)))
+    console.log(`\n  ✓ ${f.name}（${fmt(f.size)}）`)
+  }
+}
+
 // ---------- recv（链接模式） ----------
 async function doRecv(link) {
   const u = new URL(link)
@@ -345,6 +443,13 @@ async function doRecv(link) {
   const room = m[1]
 
   const meta = JSON.parse(unseal(key, await getChunkAt(origin, room, 0)))
+  if (meta.type === 'batch') {
+    const dir = opts.out || '.'
+    await receiveBatch(origin, room, key, meta, dir)
+    await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+    console.log(`\n\n✅ 已解密并保存 ${meta.files.length} 个文件到 ${path.resolve(dir)}\n`)
+    return
+  }
   if (meta.type === 'text') {
     const pt = unseal(key, await getChunkAt(origin, room, 1))
     process.stdout.write(pt)
@@ -412,7 +517,9 @@ async function handleOffer(o, identity, ask) {
     console.log(`\n  ⚠ 来自 ${o.from.ip} 的邀请预览解密失败（可能被篡改），已拒绝`)
     return fetch(`${server}/api/offers/${o.id}/reject`, { method: 'POST', headers: { 'X-Device-Secret': presence.secret } })
   }
-  const desc = preview.kind === 'text' ? `一段文本（${fmt(preview.size || 0)}）` : `${preview.name || '未命名文件'}（${fmt(preview.size || 0)}）`
+  const desc = preview.kind === 'text' ? `一段文本（${fmt(preview.size || 0)}）`
+    : preview.kind === 'batch' ? `${preview.count} 个文件（${fmt(preview.size || 0)}）`
+    : `${preview.name || '未命名文件'}（${fmt(preview.size || 0)}）`
   console.log(`\n${avatarOf(o.from.ip || '?')}  ${(o.from.name || '未知设备')} @ ${o.from.ip} 想发给你：${desc}`)
 
   if (!opts.yes) {
@@ -431,6 +538,13 @@ async function handleOffer(o, identity, ask) {
   if (!r.ok) throw new Error('接受失败 ' + r.status)
 
   const meta = JSON.parse(unseal(key, await getChunkAt(server, o.room, 0)))
+  if (meta.type === 'batch') {
+    const dir = opts.out || '.'
+    await receiveBatch(server, o.room, key, meta, dir)
+    await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, o.room) }) }).catch(() => {})
+    console.log(`\n  ✅ 已解密保存 ${meta.files.length} 个文件到 ${path.resolve(dir)}\n`)
+    return
+  }
   if (meta.type === 'text') {
     const pt = unseal(key, await getChunkAt(server, o.room, 1))
     console.log('  ──────── 文本开始 ────────')
@@ -452,6 +566,9 @@ try {
   if (cmd === 'devices') {
     await doDevices()
   } else if (cmd === 'send' && pos[1]) {
+    const sendPaths = pos.slice(1)
+    const single = sendPaths.length === 1 ? await fsp.stat(sendPaths[0]).catch(() => null) : null
+    if (single && single.isFile()) {
     const filePath = pos[1]
     const fh = await fsp.open(filePath, 'r')
     const size = (await fh.stat()).size
@@ -472,6 +589,9 @@ try {
       },
     })
     await fh.close()
+    } else {
+      await doSendBatch(await gatherFiles(sendPaths))
+    }
   } else if (cmd === 'send-text' && pos[1] !== undefined) {
     const pt = Buffer.from(pos[1], 'utf8')
     await doSend({

@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -70,6 +70,7 @@ node cli.mjs devices --server http://192.168.1.117:7777        # list online dev
 node cli.mjs send big.zip --to 192.168.1.50 --server http://... # direct send (no link needed)
 node cli.mjs listen --yes -o ~/downloads --server http://...    # resident receiver (can be direct-sent to)
 node cli.mjs send big.zip --server http://...                   # link mode: prints a receive link
+node cli.mjs send a.zip dir/ --server http://...                 # batch: multiple paths + recursive directories
 node cli.mjs recv 'http://.../#ROOM.KEY' [-o output path]       # link-mode receive
 ```
 
@@ -182,6 +183,9 @@ IDE terminals (Electron/xterm.js) deviate from the standard 2:1 cell geometry, w
 **Receiver refreshed mid-transfer of a big file?**
 No resume support yet — just send again (roadmap item).
 
+**The browser asks to "download multiple files" when receiving a batch?**
+Memory mode triggers downloads one by one and the browser asks once for permission — allow it. Chromium browsers instead show a directory picker before receiving and stream straight into it, no prompt.
+
 **How fast is the pure-JS path?**
 Encryption runs in a ×4 worker pool; a single worker does ~10–20 MB/s, scaling with cores. localhost/https uses native WebCrypto and is faster. X25519 is milliseconds, imperceptible.
 
@@ -203,7 +207,7 @@ cipherlane/
 │   ├── x25519.js       # pure-JS X25519 (device-direct key agreement)
 │   ├── avatar.js       # geometric avatars (Material-flat, deterministic from IP)
 │   └── style.css
-└── test/               # seven suites: aesgcm / sha256 / x25519 / qrcode / avatar / protocol / browser
+└── test/               # eight suites: aesgcm / sha256 / x25519 / qrcode / avatar / protocol / cli / browser
 ```
 
 ## Tests
@@ -218,9 +222,16 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **qrcode**: RS algebra self-checks, finder/timing/format structure assertions
 - **avatar**: determinism, neighbor-IP distinctness, palette & luminance constraints
 - **protocol**: spawns a real server; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/bind surface/link mode end to end
+- **cli**: real-subprocess end-to-end — single file / recursive directory batch (nested · CJK names · empty files · hidden entries skipped) / mixed paths / text, byte-level comparison
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.3.0** (2026-10-13)
+- Multi-file / directory transfers: chunk 0 becomes an encrypted manifest (type:'batch'); each file's chunks stream sequentially in one room — zero server changes
+- Browser: multi-select + "pick a folder" (directory tree flattened to relative paths); receivers on Chromium stream into a directory picker, others fall back to memory mode with sequential downloads; multi-file drops and pastes become batches
+- CLI: `send` takes multiple paths and recurses directories (hidden dot-entries skipped, 256-file cap); `recv`/`listen` recreate the directory tree (per-segment path sanitization against traversal)
+- New eighth suite cli.test: real-subprocess end-to-end (single/batch/mixed/text, byte-level + ack-proof loop); browser suite up to 8 groups (+ multi-file batch)
 
 **v0.2.3** (2026-10-13)
 - Hardening: per-IP concurrent long-poll cap of 8 (fd-exhaustion defense; legit traffic stays ≤4); the QR fallback PNG moved to the system temp directory with exclusive creation (the old fixed name in the working directory was a symlink-overwrite hazard); CLI chunk send/receive now retries stalled connections (same semantics as the browser)
@@ -254,7 +265,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 - [ ] Pure-JS AES performance work (T-tables / SIMD GHASH)
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
-- [ ] Multi-file / directory transfers
+- [x] Multi-file / directory transfers (manifest + sequential chunks in one room; folder picker / recursive CLI; browser ↔ CLI interop) — v0.3.0
 - [ ] Resume support (replayable chunks + position negotiation; note: plain-http non-secure contexts lack OPFS, so resume-across-refresh needs design trade-offs — connection-drop recovery comes first)
 - [x] Device public-key fingerprints + change warnings (TOFU defense against server MITM)
 - [x] Hardening batch: long-poll concurrency cap, QR fallback image moved to the temp dir, CLI request timeouts, identity-key reset, pure-JS-path browser coverage — v0.2.3

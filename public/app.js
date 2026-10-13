@@ -418,7 +418,9 @@ async function previewOffer(o, card) {
     const p = card.querySelector('.o-preview')
     p.textContent = info.kind === 'text'
       ? '📝 一段文本 · ' + fmtBytes(info.size || 0)
-      : '📄 ' + (info.name || '未命名文件') + ' · ' + fmtBytes(info.size || 0)
+      : info.kind === 'batch'
+        ? '🗂 ' + (info.count || '?') + ' 个文件 · ' + fmtBytes(info.size || 0)
+        : '📄 ' + (info.name || '未命名文件') + ' · ' + fmtBytes(info.size || 0)
   } catch {
     card.querySelector('.o-preview').hidden = true
     const err = card.querySelector('.o-error')
@@ -506,8 +508,11 @@ document.addEventListener('click', function askOnce() {
 // ---------- 发送 ----------
 const sendState = { stopPoll: null } // stopPoll：取消发送时停状态轮询
 
+const FILES_MAX = 256
+const dataChunkCount = (n) => (n === 0 ? 0 : Math.ceil(n / CHUNK))
+
 async function startSend(kind, payload, target) {
-  // kind: 'file' | 'text'；payload: File | string；target: 设备对象（null = 链接模式）
+  // kind: 'file' | 'text' | 'batch'；payload: File | string | [{file, rel}]；target: 设备对象（null = 链接模式）
   // 已选设备但此刻拿不到（刚掉线）→ 明确报错，绝不静默降级成链接模式
   if (!target && selectedIp) {
     alert('所选设备已离线，请重新选择（本次未发送）')
@@ -516,17 +521,29 @@ async function startSend(kind, payload, target) {
     refreshDevices()
     return
   }
+  if (kind === 'batch' && payload.length > FILES_MAX) {
+    alert(`文件数超过上限 ${FILES_MAX}（当前 ${payload.length}），请分批发送`)
+    return
+  }
   showView('send')
   const isText = kind === 'text'
-  const size = isText ? enc.encode(payload).length : payload.size
-  const name = isText ? null : payload.name
-  const mime = isText ? null : payload.type || 'application/octet-stream'
-  const dataChunks = isText ? 1 : Math.ceil(size / CHUNK)
+  const isBatch = kind === 'batch'
+  const size = isBatch ? payload.reduce((n, x) => n + x.file.size, 0)
+    : isText ? enc.encode(payload).length : payload.size
+  const name = isBatch ? null : isText ? null : payload.name
+  const mime = isBatch ? null : isText ? null : payload.type || 'application/octet-stream'
+  const manifest = isBatch
+    ? payload.map((x) => ({ name: x.rel, size: x.file.size, count: dataChunkCount(x.file.size) }))
+    : null
+  const dataChunks = isBatch ? manifest.reduce((n, m) => n + m.count, 0)
+    : isText ? 1 : Math.ceil(size / CHUNK)
   const count = 1 + dataChunks // 0 号是加密元信息
 
   $('#send-title').textContent = target
     ? `📤 发送给 ${target.name || '未命名设备'}`
-    : isText ? '📤 发送文本（链接模式）' : '📤 发送文件（链接模式）'
+    : isText ? '📤 发送文本（链接模式）'
+    : isBatch ? `📤 发送 ${manifest.length} 个文件（链接模式）`
+    : '📤 发送文件（链接模式）'
   $('#send-target').hidden = !target
   if (target) {
     $('#send-target').innerHTML = `${avatarSvg(target.ip, 30)} <b class="st-name"></b> <span class="dim st-ip"></span>`
@@ -557,7 +574,7 @@ async function startSend(kind, payload, target) {
       const theirPub = fromB64(target.pub)
       const shared = X25519.dh(identity.sk, theirPub)
       key = X25519.sessionKey(shared, identity.pk, theirPub, room)
-      const hintInfo = { kind, name: isText ? null : name, size }
+      const hintInfo = isBatch ? { kind, count: manifest.length, size } : { kind, name: isText ? null : name, size }
       const hint = toB64(await sealWith(key, enc.encode(JSON.stringify(hintInfo))))
       await api(`/api/rooms/${room}/offer`, {
         method: 'POST',
@@ -660,12 +677,30 @@ async function startSend(kind, payload, target) {
 
   try {
     // 0 号分片：加密元信息（文件名也加密）
-    const meta = { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
+    const meta = isBatch
+      ? { v: 1, type: 'batch', files: manifest, count, size }
+      : { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
     await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta))), ctl.signal)
 
     // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
     const speed = makeSpeed()
-    if (isText) {
+    if (isBatch) {
+      let sent = 0
+      for (let f = 0; f < payload.length; f++) {
+        const { file, rel } = payload[f]
+        const n = manifest[f].count
+        for (let i = 0; i < n; i++) {
+          const pt = new Uint8Array(await file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size)).arrayBuffer())
+          await postChunk(room, token, await sealRPC(key, pt), ctl.signal)
+          sent += pt.length
+          setBar('bar-sent', size ? sent / size : 1)
+          const sp = speed(sent)
+          $('#sent-meta').textContent =
+            `[${f + 1}/${payload.length}] ${rel} · ${fmtBytes(sent)} / ${fmtBytes(size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
+        }
+      }
+      if (size === 0) setBar('bar-sent', 1)
+    } else if (isText) {
       await postChunk(room, token, await sealRPC(key, enc.encode(payload)), ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
@@ -730,6 +765,7 @@ async function receiveInto(room, key, fromInfo) {
   }
 
   if (meta.type === 'text') return receiveText(room, key, ctl)
+  if (meta.type === 'batch') return receiveBatch(room, key, meta, ctl)
   return receiveFile(room, key, meta, ctl)
 }
 
@@ -763,6 +799,108 @@ async function receiveText(room, key, ctl) {
 }
 
 // 文件：文件卡为主角；接受时的手势还在有效期内，自动拉起保存选择器
+// 路径分段净化(批量接收的相对路径逐段过滤,防穿越/点文件)
+function safeSeg(seg) {
+  const t = String(seg).replace(/[^\w.\-\u4e00-\u9fa5 ]+/g, '_').replace(/^[.\s]+/, '')
+  return t || '_'
+}
+
+// 批量接收:manifest 顺序拉流,逐文件写入目录(Chromium 流式)/内存模式逐个下载
+async function receiveBatch(room, key, meta, ctl) {
+  $('#recv-title').textContent = '📥 接收批量文件'
+  $('#recv-file-layout').hidden = false
+  $('#recv-filecard').hidden = false
+  $('#fc-name').textContent = `${meta.files.length} 个文件`
+  $('#fc-size').textContent = fmtBytes(meta.size || 0)
+  $('#fc-bar-wrap').hidden = true
+  $('#recv-meta').textContent = ''
+  $('#recv-actions').hidden = true
+
+  const start = () => doReceiveBatch(room, key, meta, ctl.signal).then((r) => {
+    if (r === 'picker-dismissed') {
+      $('#recv-actions').hidden = false
+      setStatus('recv-file-status', '🟢 已就绪，点击接收并保存', 'ok')
+    }
+  }).catch((e) => {
+    if (!ctl.signal.aborted) setStatus('recv-file-status', '❌ ' + e.message, 'err')
+  })
+  $('#start-recv').onclick = start
+  start()
+}
+
+async function doReceiveBatch(room, key, meta, signal) {
+  let hasGesture = false
+  try {
+    hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive && navigator.userActivation.isActive())
+  } catch { /* 部分嵌入式 webview 的 userActivation 实现不完整 */ }
+  // 目录选择器:有新鲜手势的 Chromium 流式落盘;否则内存模式完成后逐个下载
+  let dir = null
+  if ('showDirectoryPicker' in window && hasGesture) {
+    try {
+      dir = await window.showDirectoryPicker({ mode: 'readwrite' })
+    } catch (e) {
+      if (e && e.name === 'AbortError') return 'picker-dismissed'
+      dir = null // 手势过期等 → 内存模式兜底
+    }
+  }
+  if (!dir && (meta.size || 0) > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式目录保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
+
+  setStatus('recv-file-status', '📡 接收中…', 'warn')
+  $('#fc-bar-wrap').hidden = false
+  const speed = makeSpeed()
+  const memParts = [] // 无目录句柄时的逐文件 Blob
+  let got = 0
+  let idx = 1 // 下一个文件的首个数据分片序号
+  for (let f = 0; f < meta.files.length; f++) {
+    const info = meta.files[f]
+    $('#fc-name').textContent = `[${f + 1}/${meta.files.length}] ${info.name}`
+    $('#fc-size').textContent = `${fmtBytes(got)} / ${fmtBytes(meta.size || 0)}`
+    const parts = String(info.name || '').split('/').map(safeSeg).filter(Boolean)
+    const fname = parts.pop() || 'received'
+    let ws = null
+    let parts8 = null
+    if (dir) {
+      let d = dir
+      for (const seg of parts) d = await d.getDirectoryHandle(seg, { create: true })
+      const fh = await d.getFileHandle(fname, { create: true })
+      ws = await fh.createWritable()
+    } else parts8 = []
+    const n = info.count || 0
+    for (let i = 0; i < n; i++) {
+      const pt = await unsealRPC(key, await getChunk(room, idx + i, signal)) // GCM 验签失败直接抛错
+      got += pt.length
+      if (ws) await ws.write(pt)
+      else parts8.push(pt)
+      setBar('bar-recv', meta.size ? got / meta.size : 1)
+      const sp = speed(got)
+      $('#fc-size').textContent = `${fmtBytes(got)} / ${fmtBytes(meta.size || 0)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
+    }
+    idx += n
+    if (ws) await ws.close()
+    else memParts.push({ name: fname, blob: new Blob(parts8) })
+  }
+  if (!dir) {
+    // 内存模式:顺序触发下载(浏览器会请求"下载多个文件"授权,点允许即可)
+    const urls = []
+    for (const it of memParts) {
+      const a = document.createElement('a')
+      const u = URL.createObjectURL(it.blob)
+      urls.push(u)
+      a.href = u
+      a.download = it.name
+      a.click()
+      await sleep(250)
+    }
+    setTimeout(() => { for (const u of urls) URL.revokeObjectURL(u) }, 60_000)
+  }
+  setBar('bar-recv', 1)
+  $('#fc-name').textContent = `${meta.files.length} 个文件`
+  setStatus('recv-file-status',
+    `✅ 已接收 ${meta.files.length} 个文件（${fmtBytes(meta.size || 0)}）` + (dir ? '，已写入所选目录' : '，已触发浏览器下载'),
+    'ok')
+  await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+}
+
 async function receiveFile(room, key, meta, ctl) {
   $('#recv-title').textContent = '📥 接收文件'
   $('#recv-file-layout').hidden = false
@@ -880,18 +1018,27 @@ async function startReceive() {
 
 // ---------- 入口 ----------
 $('#pick').onclick = (e) => { e.stopPropagation(); $('#file').click() }
+$('#pick-dir').onclick = (e) => { e.stopPropagation(); $('#file-dir').click() }
 $('#drop').onclick = () => $('#file').click()
+const toBatch = (list) => [...list].map((f) => ({ file: f, rel: f.webkitRelativePath || f.name }))
 $('#file').onchange = () => {
-  const f = $('#file').files[0]
-  if (f) startSend('file', f, selectedDevice())
+  const fs = [...$('#file').files]
+  if (fs.length === 1) startSend('file', fs[0], selectedDevice())
+  else if (fs.length > 1) startSend('batch', toBatch(fs), selectedDevice())
   $('#file').value = ''
+}
+$('#file-dir').onchange = () => {
+  const fs = [...$('#file-dir').files]
+  if (fs.length) startSend('batch', toBatch(fs), selectedDevice())
+  $('#file-dir').value = ''
 }
 const drop = $('#drop')
 for (const ev of ['dragover', 'dragenter']) drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over') })
 for (const ev of ['dragleave', 'drop']) drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over') })
 drop.addEventListener('drop', (e) => {
-  const f = e.dataTransfer.files[0]
-  if (f) startSend('file', f, selectedDevice())
+  const fs = [...e.dataTransfer.files]
+  if (fs.length === 1) startSend('file', fs[0], selectedDevice())
+  else if (fs.length > 1) startSend('batch', toBatch(fs), selectedDevice())
 })
 $('#send-text').onclick = () => {
   const t = $('#text').value
@@ -908,7 +1055,9 @@ document.addEventListener('paste', (e) => {
   const files = e.clipboardData && e.clipboardData.files
   if (files && files.length) {
     e.preventDefault()
-    startSend('file', files[0], selectedDevice())
+    const fs = [...files]
+    if (fs.length === 1) startSend('file', fs[0], selectedDevice())
+    else startSend('batch', toBatch(fs), selectedDevice())
     return
   }
   const text = e.clipboardData && e.clipboardData.getData('text/plain')

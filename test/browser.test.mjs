@@ -278,6 +278,27 @@ async function main() {
     await waitFor(c, sidC, `document.querySelector('#recv-text-status').textContent.includes('已解密接收')`, 10000, '降级路径完成')
     ok('纯 JS AES 降级路径:安全上下文发送 ↔ 非安全上下文接收逐字一致(跨实现互通)')
 
+    // ---------- 7) 多文件批量:多选 → 链接 → 批量接收(内存模式逐个下载) ----------
+    {
+      const bf1 = path.join(os.tmpdir(), 'e2e-batch-a-' + Date.now() + '.bin')
+      const bf2 = path.join(os.tmpdir(), 'e2e-batch-b-' + Date.now() + '.txt')
+      fs.writeFileSync(bf1, randomBytes(700000)) // 不足一片
+      fs.writeFileSync(bf2, randomBytes(1000))
+      await navigate(c, sidA, S + '/')
+      await c.send('DOM.enable', {}, sidA)
+      const { root } = await c.send('DOM.getDocument', {}, sidA)
+      const { nodeId } = await c.send('DOM.querySelector', { nodeId: root.nodeId, selector: '#file' }, sidA)
+      await c.send('DOM.setFileInputFiles', { files: [bf1, bf2], nodeId }, sidA) // 多选
+      await evalJs(c, sidA, `document.querySelector('#file').onchange()`)
+      await waitFor(c, sidA, `document.querySelector('#link').textContent.startsWith('http')`, 15000, '批量链接')
+      const batchLink = await evalJs(c, sidA, textOf('#link'))
+      await navigate(c, sidB, batchLink)
+      await waitFor(c, sidB, `document.querySelector('#fc-name').textContent === '2 个文件'`, 30000, '批量文件卡')
+      await waitFor(c, sidB, `document.querySelector('#recv-file-status').textContent.includes('已接收 2 个文件')`, 30000, '批量完成')
+      fs.rmSync(bf1, { force: true }); fs.rmSync(bf2, { force: true })
+      ok('多文件批量:双文件选择 → 链接 → 接收完成(内存模式)')
+    }
+
     // ---------- 5) 服务器中途下线:建立失败可退 ----------
     await navigate(c, sidA, S + '/') // 趁服务器还在先回到首页(之后不再导航,页面操作走内存态)
     server.kill('SIGINT')

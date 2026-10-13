@@ -42,8 +42,9 @@
 
     <div id="drop" class="drop">
       <div class="drop-icon">📦</div>
-      <p>把文件拖到这里，或 <button id="pick" class="btn">选择文件</button></p>
-      <input id="file" type="file" hidden>
+      <p>把文件拖到这里，或 <button id="pick" class="btn">选择文件</button> <button id="pick-dir" class="btn">选择文件夹</button></p>
+      <input id="file" type="file" hidden multiple>
+      <input id="file-dir" type="file" webkitdirectory hidden>
     </div>
 
     <div class="text-box">

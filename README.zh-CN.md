@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.2.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-7%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -69,6 +69,7 @@ node cli.mjs devices --server http://192.168.1.117:7777        # 查看在线设
 node cli.mjs send big.zip --to 192.168.1.50 --server http://... # 定向直发（无需传链接）
 node cli.mjs listen --yes -o ~/downloads --server http://...    # 常驻接收端（可被直发）
 node cli.mjs send big.zip --server http://...                   # 链接模式：打印接收链接
+node cli.mjs send a.zip dir/ --server http://...                 # 批量：多路径与目录递归（浏览器互通）
 node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模式接收
 ```
 
@@ -181,6 +182,9 @@ IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标�
 **发大文件接收方刷新了页面怎么办？**
 当前不支持断点续传，重新发一次即可（路线图项）。
 
+**批量接收时浏览器提示"下载多个文件"？**
+内存模式下逐个触发下载，浏览器会请求一次"允许下载多个文件"，点允许即可；Chromium 系在接收前弹目录选择器直接流式写入，无此提示。
+
 **纯 JS 降级路径速度如何？**
 加密在 Worker 池（×4）并行执行；单 worker 约 10–20 MB/s，多核线性提升。localhost / https 下走原生 WebCrypto 更快。X25519 为毫秒级，无感。
 
@@ -202,7 +206,7 @@ cipherlane/
 │   ├── x25519.js       # 纯 JS X25519（设备直发密钥协商）
 │   ├── avatar.js       # 设备几何头像（Material 扁平风，由 IP 确定性生成）
 │   └── style.css
-└── test/               # 七套：aesgcm / sha256 / x25519 / qrcode / avatar / protocol / browser
+└── test/               # 八套：aesgcm / sha256 / x25519 / qrcode / avatar / protocol / cli / browser
 ```
 
 ## 测试
@@ -217,9 +221,20 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **qrcode**：RS 代数自检、定位图形/时序/格式信息结构断言
 - **avatar**：确定性、相邻 IP 差异、色板与明度约束
 - **protocol**：起真实 server，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/绑定面/链接模式全链路
+- **cli**：真实子进程端到端——单文件/目录递归批量（嵌套·中文·空文件·隐藏项跳过）/多路径混合/文本，字节级比对
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.3.0**（2026-10-13）
+- 多文件 / 目录传输：0 号分片改为加密 manifest（type:'batch'），各文件分片
+  单房间顺序拼接，服务端零改动
+- 浏览器：文件多选 + "选择文件夹"（目录树拍平为相对路径）；接收端 Chromium
+  目录选择器流式落盘，其他浏览器内存模式逐个下载；拖放/粘贴多文件即批量
+- CLI：`send` 支持多路径与目录递归（跳过点开头隐藏项，上限 256 个文件）；
+  `recv`/`listen` 批量落盘自动建目录树（相对路径逐段净化防穿越）
+- 新增第八套测试 cli.test：真实子进程端到端（单文件/目录批量/多路径/文本，
+  字节级比对 + ack 凭证闭环）；浏览器测试增至 8 组（+多文件批量）
 
 **v0.2.3**（2026-10-13）
 - 加固：单 IP 并发长轮询上限 8（防 fd 耗尽，正常收发 ≤4）；QR 保底 PNG 移至
@@ -265,7 +280,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
 
 - [ ] 纯 JS AES 路径性能优化（T-table / SIMD 化 GHASH）
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
-- [ ] 多文件 / 目录传输
+- [x] 多文件 / 目录传输（manifest 单房间顺序流，文件夹选择/目录递归，浏览器 ↔ CLI 互通）—— v0.3.0
 - [ ] 断点续传 / 传输中断恢复（注：明文 http 非安全上下文无 OPFS，"跨页面刷新续存"需设计权衡，先做连接中断自动恢复）
 - [x] 设备直发的公钥指纹显示与变更警示（对抗服务器主动 MITM 的 TOFU 防线）
 - [x] 加固批：长轮询并发上限、QR 保底图移至临时目录、CLI 请求超时、身份密钥重置入口、纯 JS 路径浏览器测试覆盖 —— v0.2.3
