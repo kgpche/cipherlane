@@ -120,7 +120,7 @@ const ok = (name) => { passed++; console.log(`  ✓ ${name}`) }
   assert.ok(svg.startsWith('<svg') && svg.includes('viewBox="0 0 45 45"'), 'V5 = 37+8 静区 = 45')
   assert.ok(svg.includes('<circle') && svg.includes('stroke'), '样式化：圆点模块 + 定位眼描边')
   const ascii = QRCode.ascii('hi')
-  assert.ok(ascii.includes('█') && ascii.split('\n').length >= 13, '终端码含半块字符（25 行并 13 行）')
+  assert.ok(ascii.includes('█') && ascii.split('\n').length >= 29, '终端码全块双宽（每模块行一行）')
   assert.strictEqual(QRCode.svg('a'.repeat(109)), null)
   ok('svg（含 4 模块静区）与终端 ascii 输出正常，超长返回 null')
 }

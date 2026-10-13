@@ -293,24 +293,22 @@
       `<g fill="${dark}">${dots}</g>${eyes}${alignEye}</svg>`
   }
 
-  // ascii(text) → 终端二维码：ANSI 显式白底黑码（深色/浅色终端主题下都保持
-  // 正确极性与静区，可被扫码器识别）；半块字符纵向 2:1 压缩。超长返回 null
+  // ascii(text) → 终端二维码：ANSI 白底黑码 + 全块双倍宽渲染。
+  // 每模块 = 横向 2 字符 × 纵向 1 行（终端行高≈2×字宽 → 模块近方形），
+  // 不依赖半块字形的精确性，各字体/行高下均稳定可扫。超长返回 null
   function ascii(text) {
     const qr = encode(text)
     if (!qr) return null
-    const q = 4 // 静区（扫码器要求 ≥4，终端场景给足）
+    const q = 4 // 静区（扫码器要求 ≥4）
     const n = qr.size + q * 2
     const at = (r, c) => r >= q && c >= q && r < q + qr.size && c < q + qr.size && qr.modules[(r - q) * qr.size + (c - q)] === 1
     const BG = '\x1b[48;5;231m' // 白底
     const FG = '\x1b[38;5;16m'  // 黑码
     let out = ''
-    for (let r = 0; r < n; r += 2) {
-      let line = BG + FG + ' '
-      for (let c = 0; c < n; c++) {
-        const top = at(r, c), bot = at(r + 1, c)
-        line += top && bot ? '█' : top ? '▀' : bot ? '▄' : ' '
-      }
-      out += line + ' \x1b[0m\n'
+    for (let r = 0; r < n; r++) {
+      let line = BG + FG + '  '
+      for (let c = 0; c < n; c++) line += at(r, c) ? '██' : '  '
+      out += line + '  \x1b[0m\n'
     }
     return out
   }
