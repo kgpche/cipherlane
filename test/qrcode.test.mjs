@@ -223,4 +223,27 @@ const ok = (name) => { passed++; console.log(`  ✓ ${name}`) }
   ok(`独立解码往返 ${samples.length} 组全部一致（含中文/emoji/各版本边界），RS 均可校验`)
 }
 
+// 8) png 输出：签名/IHDR/解压回读/确定性
+{
+  const zlib = require('node:zlib')
+  const png1 = QRCode.png('http://192.168.137.91:7788/', 10)
+  const png2 = QRCode.png('http://192.168.137.91:7788/', 10)
+  assert.ok(png1.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), 'PNG 签名')
+  const w = png1.readUInt32BE(16)
+  assert.strictEqual(w, (25 + 8) * 10, 'V2 + 静区 × scale')
+  assert.strictEqual(png1[24], 1, 'bit depth 1')
+  assert.strictEqual(png1[25], 0, 'colorType 0 = 灰度')
+  let idat = []
+  for (let pos = 8; pos < png1.length; ) {
+    const len = png1.readUInt32BE(pos)
+    const type = png1.toString('ascii', pos + 4, pos + 8)
+    if (type === 'IDAT') idat.push(png1.subarray(pos + 8, pos + 8 + len))
+    pos += 12 + len
+  }
+  const raw = zlib.inflateSync(Buffer.concat(idat))
+  assert.strictEqual(raw.length, w * (1 + Math.ceil(w / 8)), '行数 × (filter+行字节)')
+  assert.ok(png1.equals(png2), '同输入恒定')
+  ok('png 输出：签名/尺寸/1-bit 灰度/可解压回读/确定性')
+}
+
 console.log(`\nqrcode: 全部 ${passed} 组通过`)

@@ -313,7 +313,72 @@
     return out
   }
 
-  const api = { encode, svg, ascii, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
+  // png(text, scale) → PNG Buffer（1-bit 灰度，像素级精确，仅 Node：惰性 require zlib）
+  // 用途：终端字体几何不可控时的保底扫码路径（图片查看器打开即扫）
+  function png(text, scale = 8) {
+    const qr = encode(text)
+    if (!qr) return null
+    const zlib = require('node:zlib')
+    const q = 4
+    const n = qr.size + 2 * q
+    const W = n * scale
+    const rowBytes = Math.ceil(W / 8)
+    const rows = []
+    for (let y = 0; y < W; y++) {
+      const r = Math.floor(y / scale) - q
+      const row = Buffer.alloc(1 + rowBytes) // filter 0
+      for (let bx = 0; bx < rowBytes; bx++) {
+        let b = 0
+        for (let bit = 0; bit < 8; bit++) {
+          const x = bx * 8 + bit
+          let dark = false
+          if (x < W) {
+            const c = Math.floor(x / scale) - q
+            dark = r >= 0 && c >= 0 && r < qr.size && c < qr.size && qr.modules[r * qr.size + c] === 1
+          }
+          b = (b << 1) | (dark ? 0 : 1) // 灰度 1-bit：0=黑，1=白
+        }
+        row[1 + bx] = b
+      }
+      rows.push(row)
+    }
+    const idat = zlib.deflateSync(Buffer.concat(rows), { level: 9 })
+    let CRC_T = null
+    const crc32 = (buf) => {
+      if (!CRC_T) {
+        CRC_T = new Uint32Array(256)
+        for (let k = 0; k < 256; k++) {
+          let c = k
+          for (let i = 0; i < 8; i++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+          CRC_T[k] = c
+        }
+      }
+      let c = 0xffffffff
+      for (const b of buf) c = CRC_T[(c ^ b) & 255] ^ (c >>> 8)
+      return (c ^ 0xffffffff) >>> 0
+    }
+    const chunk = (type, data) => {
+      const out = Buffer.alloc(12 + data.length)
+      out.writeUInt32BE(data.length, 0)
+      out.write(type, 4, 'ascii')
+      data.copy(out, 8)
+      out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length)
+      return out
+    }
+    const ihdr = Buffer.alloc(13)
+    ihdr.writeUInt32BE(W, 0)
+    ihdr.writeUInt32BE(W, 4)
+    ihdr[8] = 1 // bit depth
+    ihdr[9] = 0 // 灰度
+    return Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      chunk('IHDR', ihdr),
+      chunk('IDAT', idat),
+      chunk('IEND', Buffer.alloc(0)),
+    ])
+  }
+
+  const api = { encode, svg, ascii, png, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   else global.QRCode = api
 })(typeof self !== 'undefined' ? self : globalThis)

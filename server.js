@@ -546,22 +546,30 @@ server.listen(PORT, HOST, () => {
   const lanIp = ips.find((ip) => ip !== '127.0.0.1')
   if (lanIp) {
     const url = `http://${lanIp}:${PORT}/`
-    let ascii = null
+    let qrMod = null
     try {
-      ascii = require('./public/qrcode.js').ascii
+      qrMod = require('./public/qrcode.js')
     } catch {
       // SEA 单文件模式：qrcode.js 已内嵌为资源，按 CommonJS 方式求值加载
       try {
         const mod = { exports: {} }
         const src = Buffer.from(sea.getAsset('public/qrcode.js')).toString('utf8')
         new Function('module', 'exports', src)(mod, mod.exports)
-        ascii = mod.exports.ascii
+        qrMod = mod.exports
       } catch {}
     }
     try {
-      const qr = ascii && ascii(url)
+      const qr = qrMod && qrMod.ascii && qrMod.ascii(url)
       if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
     } catch { /* 二维码不可用时仅打印 URL */ }
+    // 保底：终端字体几何不可控时，写一张像素级精确的 PNG 供看图工具扫码
+    try {
+      const pngData = qrMod && qrMod.png && qrMod.png(url, 10)
+      if (pngData) {
+        fs.writeFileSync(path.join(process.cwd(), 'cipherlane-qr.png'), pngData)
+        console.log('  （终端扫码失败时，用看图工具打开 ./cipherlane-qr.png 扫描）')
+      }
+    } catch { /* 写入失败则跳过 */ }
   }
   console.log('\n等待传输…（Ctrl+C 退出）')
 })
