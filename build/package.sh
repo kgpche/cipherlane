@@ -110,7 +110,7 @@ Version: $VER
 Section: net
 Priority: optional
 Architecture: amd64
-Maintainer: joker <joker@local>
+Maintainer: kgpche <341253778+kgpche@users.noreply.github.com>
 Description: cipherlane · 密道 —— 局域网端到端加密传输
  自包含单文件服务（内嵌 Node 运行时与全部前端资源），安装即用、无需 Node。
  安装后执行: sudo systemctl enable --now cipherlane
@@ -163,4 +163,6 @@ tar czf "$DIST/cipherlane_${VER}_macos_universal.tar.gz" -C "$BUILD/macos-root" 
 
 echo
 echo "✓ 打包完成："
+# 发布校验和：随 Release 一起公布，供下载方验证完整性
+( cd "$DIST" && sha256sum cipherlane_* > SHA256SUMS_"${VER}".txt )
 ls -la "$DIST"

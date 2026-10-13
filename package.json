@@ -1,11 +1,18 @@
 {
   "name": "cipherlane",
   "version": "0.2.2",
-  "private": true,
   "description": "密道 · cipherlane —— 局域网端到端加密传输：设备直发（X25519）或链接收发，HTTP 明文环境下内容依然加密",
   "keywords": ["lan", "file-transfer", "e2e-encryption", "x25519", "aes-gcm", "airdrop", "p2p"],
-  "author": "joker",
+  "author": "kgpche",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kgpche/cipherlane.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kgpche/cipherlane/issues"
+  },
+  "homepage": "https://github.com/kgpche/cipherlane#readme",
   "scripts": {
     "start": "node server.js",
     "test": "node test/aesgcm.test.mjs && node test/sha256.test.mjs && node test/x25519.test.mjs && node test/qrcode.test.mjs && node test/avatar.test.mjs && node test/protocol.test.mjs && node test/browser.test.mjs"
