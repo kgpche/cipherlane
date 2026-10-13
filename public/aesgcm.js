@@ -35,6 +35,23 @@
     M3[i] = xtime(i) ^ i
   }
 
+  // ============ T-table:AES 轮函数整列查表（S 盒 + MixColumns 合一） ============
+  // 每轮 16 次 32 位查表 + 异或,替代逐字节 S 盒/移位/M2·M3,实测快 2~3 倍。
+  // 注:T-table 存在 cache 计时侧信道(需同机攻击者持续探测);本项目威胁模型
+  // 是网络攻击者(嗅探/MITM),明文 http 降级路径上此取舍可接受。
+  const TE0 = new Uint32Array(256)
+  const TE1 = new Uint32Array(256)
+  const TE2 = new Uint32Array(256)
+  const TE3 = new Uint32Array(256)
+  for (let x = 0; x < 256; x++) {
+    const b = SBOX[x]
+    const w = ((M2[b] << 24) | (b << 16) | (b << 8) | M3[b]) >>> 0 // 列贡献 [02,01,01,03]
+    TE0[x] = w
+    TE1[x] = ((w >>> 8) | (w << 24)) >>> 0                          // [03,02,01,01]
+    TE2[x] = ((w >>> 16) | (w << 16)) >>> 0                         // [01,03,02,01]
+    TE3[x] = ((w >>> 24) | (w << 8)) >>> 0                          // [01,01,03,02]
+  }
+
   // ============ AES-256 密钥扩展（Nk=8, Nr=14, 15 个轮密钥） ============
   function expandKey256(key) {
     if (!(key instanceof Uint8Array) || key.length !== 32) throw new Error('key 必须是 32 字节')
@@ -98,6 +115,58 @@
     t = s[6]; s[6] = s[14]; s[14] = t
     t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t
     for (let i = 0; i < 16; i++) out16[i] = s[i] ^ rk[224 + i]
+  }
+
+  // T-table 版块加密：rk32 为 60 个大端轮密钥字。与 encryptBlock 输出逐字节一致
+  function encryptBlockT(rk32, in16, out16) {
+    let s0 = (((in16[0] << 24) | (in16[1] << 16) | (in16[2] << 8) | in16[3]) ^ rk32[0]) | 0
+    let s1 = (((in16[4] << 24) | (in16[5] << 16) | (in16[6] << 8) | in16[7]) ^ rk32[1]) | 0
+    let s2 = (((in16[8] << 24) | (in16[9] << 16) | (in16[10] << 8) | in16[11]) ^ rk32[2]) | 0
+    let s3 = (((in16[12] << 24) | (in16[13] << 16) | (in16[14] << 8) | in16[15]) ^ rk32[3]) | 0
+    let t0, t1, t2, t3
+    for (let r = 4; r < 56; r += 4) { // 轮 1~13（AddRoundKey(0) 已并入初值）
+      t0 = (TE0[s0 >>> 24] ^ TE1[(s1 >>> 16) & 255] ^ TE2[(s2 >>> 8) & 255] ^ TE3[s3 & 255] ^ rk32[r]) | 0
+      t1 = (TE0[s1 >>> 24] ^ TE1[(s2 >>> 16) & 255] ^ TE2[(s3 >>> 8) & 255] ^ TE3[s0 & 255] ^ rk32[r + 1]) | 0
+      t2 = (TE0[s2 >>> 24] ^ TE1[(s3 >>> 16) & 255] ^ TE2[(s0 >>> 8) & 255] ^ TE3[s1 & 255] ^ rk32[r + 2]) | 0
+      t3 = (TE0[s3 >>> 24] ^ TE1[(s0 >>> 16) & 255] ^ TE2[(s1 >>> 8) & 255] ^ TE3[s2 & 255] ^ rk32[r + 3]) | 0
+      s0 = t0; s1 = t1; s2 = t2; s3 = t3
+    }
+    // 末轮：ShiftRows 取字节 + S 盒 + AddRoundKey（无 MixColumns）
+    out16[0] = (SBOX[s0 >>> 24] ^ (rk32[56] >>> 24)) & 255
+    out16[1] = (SBOX[(s1 >>> 16) & 255] ^ ((rk32[56] >>> 16) & 255)) & 255
+    out16[2] = (SBOX[(s2 >>> 8) & 255] ^ ((rk32[56] >>> 8) & 255)) & 255
+    out16[3] = (SBOX[s3 & 255] ^ (rk32[56] & 255)) & 255
+    out16[4] = (SBOX[s1 >>> 24] ^ (rk32[57] >>> 24)) & 255
+    out16[5] = (SBOX[(s2 >>> 16) & 255] ^ ((rk32[57] >>> 16) & 255)) & 255
+    out16[6] = (SBOX[(s3 >>> 8) & 255] ^ ((rk32[57] >>> 8) & 255)) & 255
+    out16[7] = (SBOX[s0 & 255] ^ (rk32[57] & 255)) & 255
+    out16[8] = (SBOX[s2 >>> 24] ^ (rk32[58] >>> 24)) & 255
+    out16[9] = (SBOX[(s3 >>> 16) & 255] ^ ((rk32[58] >>> 16) & 255)) & 255
+    out16[10] = (SBOX[(s0 >>> 8) & 255] ^ ((rk32[58] >>> 8) & 255)) & 255
+    out16[11] = (SBOX[s1 & 255] ^ (rk32[58] & 255)) & 255
+    out16[12] = (SBOX[s3 >>> 24] ^ (rk32[59] >>> 24)) & 255
+    out16[13] = (SBOX[(s0 >>> 16) & 255] ^ ((rk32[59] >>> 16) & 255)) & 255
+    out16[14] = (SBOX[(s1 >>> 8) & 255] ^ ((rk32[59] >>> 8) & 255)) & 255
+    out16[15] = (SBOX[s2 & 255] ^ (rk32[59] & 255)) & 255
+    return out16
+  }
+
+  // ============ 密钥缓存：rk32 / H / 8-bit GHASH 表（同密钥流式分片只算一次） ============
+  let _kc = { key: null, rk32: null, tables: null }
+  function keyCache(key) {
+    if (_kc.key && _kc.key.length === key.length) {
+      let same = true
+      for (let i = 0; i < key.length; i++) if (_kc.key[i] !== key[i]) { same = false; break }
+      if (same) return _kc
+    }
+    const rk = expandKey256(key)
+    const rk32 = new Uint32Array(60)
+    for (let i = 0; i < 60; i++)
+      rk32[i] = (((rk[4 * i] << 24) | (rk[4 * i + 1] << 16) | (rk[4 * i + 2] << 8) | rk[4 * i + 3]) >>> 0) | 0
+    const H = new Uint8Array(16)
+    encryptBlockT(rk32, ZEROS16, H)
+    _kc = { key: key.slice(), rk32, tables: buildTables8(H) }
+    return _kc
   }
 
   // ============ GF(2^128) 乘法（SP 800-38D，R=0xE1…） ============
@@ -167,6 +236,46 @@
     out.set(Z)
   }
 
+  // 8-bit 窗口表（热路径用）：16 字节位 × 256 值 × 16B = 64KB/密钥，
+  // 每块 16 次查表（4-bit 版为 32 次），构建一次经 keyCache 复用
+  function buildTables8(H) {
+    const tables = []
+    let cur = Uint8Array.from(H)
+    for (let pos = 0; pos < 16; pos++) {
+      const t = new Uint8Array(256 * 16)
+      // 位权与 4-bit 版一致：MSB(x^0 权)在前，逐位 ×x
+      let v = cur
+      for (let bit = 128; bit >= 1; bit >>>= 1) {
+        t.set(v, 16 * bit)
+        v = mulX(v)
+      }
+      for (let n = 3; n < 256; n++) { // 增量合成：n = 最高位 | 余量
+        if ((n & (n - 1)) === 0) continue
+        const lo = n & -n
+        const rest = n ^ lo
+        const a = 16 * rest, b = 16 * lo
+        for (let k = 0; k < 16; k++) t[16 * n + k] = t[a + k] ^ t[b + k]
+      }
+      tables.push(t)
+      for (let i = 0; i < 8; i++) cur = mulX(cur)
+    }
+    return tables
+  }
+  const _z8 = new Uint8Array(16) // gfMulT8 累加暂存(避免每块分配)
+  function gfMulT8(X, tables, out) {
+    const Z = _z8
+    Z.fill(0)
+    for (let pos = 0; pos < 16; pos++) {
+      const b = X[pos]
+      if (b) {
+        const t = tables[pos]
+        const off = 16 * b
+        for (let k = 0; k < 16; k++) Z[k] ^= t[off + k]
+      }
+    }
+    out.set(Z)
+  }
+
   // ============ GCM ============
   const ZEROS16 = new Uint8Array(16)
   const _j0 = new Uint8Array(16)
@@ -184,21 +293,21 @@
     }
   }
 
-  // CTR 加/解密（对称）
-  function ctrXor(rk, iv, data) {
+  // CTR 加/解密（对称）——T-table 热路径
+  function ctrXor(rk32, iv, data) {
     _j0.set(iv); _j0[12] = 0; _j0[13] = 0; _j0[14] = 0; _j0[15] = 1
     _ctr.set(_j0)
     const out = new Uint8Array(data.length)
     for (let off = 0; off < data.length; off += 16) {
       inc32(_ctr)
-      encryptBlock(rk, _ctr, _ks)
+      encryptBlockT(rk32, _ctr, _ks)
       const n = Math.min(16, data.length - off)
       for (let k = 0; k < n; k++) out[off + k] = data[off + k] ^ _ks[k]
     }
     return out
   }
 
-  // GHASH(H, C)（无 AAD；长度块按比特数）
+  // GHASH(H, C)（无 AAD；长度块按比特数）——8-bit 窗口表
   function ghash(ct, tables) {
     _y.fill(0)
     const blocks = Math.ceil(ct.length / 16)
@@ -208,7 +317,7 @@
       _x.fill(0)
       _x.set(ct.subarray(off, off + len))
       for (let k = 0; k < 16; k++) _y[k] ^= _x[k]
-      gfMulT(_y, tables, _y)
+      gfMulT8(_y, tables, _y)
     }
     // 长度块：[0^64 | bitlen(C)]，bitlen < 2^53 安全
     _x.fill(0)
@@ -218,15 +327,14 @@
       v = Math.floor(v / 256)
     }
     for (let k = 0; k < 16; k++) _y[k] ^= _x[k]
-    gfMulT(_y, tables, _y)
+    gfMulT8(_y, tables, _y)
     return Uint8Array.from(_y)
   }
 
-  function gcmTag(rk, iv, ct) {
+  function gcmTag(rk32, tables, iv, ct) {
     _j0.set(iv); _j0[12] = 0; _j0[13] = 0; _j0[14] = 0; _j0[15] = 1
-    encryptBlock(rk, _j0, _mask)   // E(K, J0)：标签掩码
-    encryptBlock(rk, ZEROS16, _H)  // H = E(K, 0^128)
-    const S = ghash(ct, buildTables(_H))
+    encryptBlockT(rk32, _j0, _mask) // E(K, J0)：标签掩码
+    const S = ghash(ct, tables)
     const tag = new Uint8Array(16)
     for (let k = 0; k < 16; k++) tag[k] = _mask[k] ^ S[k]
     return tag
@@ -244,20 +352,20 @@
   // encrypt(key, iv, pt) → { ct, tag }（与 node aes-256-gcm 逐字节一致）
   function encrypt(key, iv, pt) {
     if (!(iv instanceof Uint8Array) || iv.length !== 12) throw new Error('iv 必须是 12 字节')
-    const rk = expandKey256(key)
-    const ct = ctrXor(rk, iv, pt)
-    const tag = gcmTag(rk, iv, ct)
+    const { rk32, tables } = keyCache(key)
+    const ct = ctrXor(rk32, iv, pt)
+    const tag = gcmTag(rk32, tables, iv, ct)
     return { ct, tag }
   }
 
   // decrypt(key, iv, ct, tag) → pt；验签失败抛错
   function decrypt(key, iv, ct, tag) {
-    const rk = expandKey256(key)
-    const calc = gcmTag(rk, iv, ct)
+    const { rk32, tables } = keyCache(key)
+    const calc = gcmTag(rk32, tables, iv, ct)
     let diff = 0
     for (let k = 0; k < 16; k++) diff |= calc[k] ^ tag[k]
     if (diff !== 0) throw new Error('GCM 验证失败：密钥错误或数据被篡改')
-    return ctrXor(rk, iv, ct)
+    return ctrXor(rk32, iv, ct)
   }
 
   // seal(key, pt, iv?) → iv || ct || tag
@@ -280,7 +388,7 @@
     return decrypt(key, iv, ct, tag)
   }
 
-  const api = { seal, open, encrypt, decrypt, expandKey256, encryptBlock, _test: { SBOX, gfMulRef, mulX, buildTables, gfMulT } }
+  const api = { seal, open, encrypt, decrypt, expandKey256, encryptBlock, encryptBlockT, keyCache, _test: { SBOX, gfMulRef, mulX, buildTables, gfMulT, buildTables8, gfMulT8, TE0 } }
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   else global.AESGCM = api
 })(typeof self !== 'undefined' ? self : globalThis)

@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -187,7 +187,7 @@ No resume support yet — just send again (roadmap item).
 Memory mode triggers downloads one by one and the browser asks once for permission — allow it. Chromium browsers instead show a directory picker before receiving and stream straight into it, no prompt.
 
 **How fast is the pure-JS path?**
-Encryption runs in a ×4 worker pool; a single worker does ~10–20 MB/s, scaling with cores. localhost/https uses native WebCrypto and is faster. X25519 is milliseconds, imperceptible.
+Encryption runs in a ×4 worker pool; a single worker does ~22 MB/s (after T-table optimization), so 4 cores reach 80–90 MB/s — near gigabit line rate. localhost/https uses native WebCrypto and is faster. X25519 is milliseconds, imperceptible.
 
 ## Project Layout
 
@@ -227,6 +227,11 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 ## Changelog
 
+**v0.3.1** (2026-10-13)
+- Pure-JS AES-256-GCM performance: AES core rewritten with T-tables (SubBytes + MixColumns fused into table lookups; single worker 9.3 → 22 MB/s, ×4 pool ≈ 80–90 MB/s, near gigabit line rate); GHASH moved from 4-bit to 8-bit windowed tables; streaming chunks with the same key reuse a key cache (rk32/H/tables built once)
+- Byte-exactness unchanged: all existing node:crypto comparisons pass; new 100-round cross-check of the 8-bit tables against the reference multiply; the browser fallback-path scenario keeps verifying interop for real
+- Trade-off note: T-tables have cache-timing side channels (require a co-located attacker continuously probing); this project's threat model is network attackers, acceptable on the plain-http fallback path
+
 **v0.3.0** (2026-10-13)
 - Multi-file / directory transfers: chunk 0 becomes an encrypted manifest (type:'batch'); each file's chunks stream sequentially in one room — zero server changes
 - Browser: multi-select + "pick a folder" (directory tree flattened to relative paths); receivers on Chromium stream into a directory picker, others fall back to memory mode with sequential downloads; multi-file drops and pastes become batches
@@ -263,7 +268,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 ## Roadmap
 
-- [ ] Pure-JS AES performance work (T-tables / SIMD GHASH)
+- [x] Pure-JS AES performance work (AES T-tables + 8-bit windowed GHASH + per-key caching; single worker 9.3 → 22 MB/s) — v0.3.1
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
 - [x] Multi-file / directory transfers (manifest + sequential chunks in one room; folder picker / recursive CLI; browser ↔ CLI interop) — v0.3.0
 - [ ] Resume support (replayable chunks + position negotiation; note: plain-http non-secure contexts lack OPFS, so resume-across-refresh needs design trade-offs — connection-drop recovery comes first)

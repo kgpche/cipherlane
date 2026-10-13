@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -186,7 +186,7 @@ IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标�
 内存模式下逐个触发下载，浏览器会请求一次"允许下载多个文件"，点允许即可；Chromium 系在接收前弹目录选择器直接流式写入，无此提示。
 
 **纯 JS 降级路径速度如何？**
-加密在 Worker 池（×4）并行执行；单 worker 约 10–20 MB/s，多核线性提升。localhost / https 下走原生 WebCrypto 更快。X25519 为毫秒级，无感。
+加密在 Worker 池（×4）并行执行；单 worker 约 22 MB/s（T-table 优化后），4 核约 80–90 MB/s，接近千兆线速。localhost / https 下走原生 WebCrypto 更快。X25519 为毫秒级，无感。
 
 ## 目录结构
 
@@ -225,6 +225,15 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.3.1**（2026-10-13）
+- 纯 JS AES-256-GCM 性能：AES 核心 T-table 化（S 盒 + MixColumns 合一查表，
+  单 worker 9.3 → 22 MB/s，×4 池约 80–90 MB/s，接近千兆线速）；
+  GHASH 4-bit → 8-bit 窗口表；同密钥流式分片复用密钥缓存（rk32/H/表一次构建）
+- 字节级不变：与 node:crypto 逐字节一致的既有验证全数通过；新增 8-bit 表
+  ×参考实现 100 组交叉验证；浏览器降级路径场景继续真跑互通
+- 取舍说明：T-table 存在 cache 计时侧信道（需同机攻击者持续探测）；本项目
+  威胁模型为网络攻击者，明文 http 降级路径上可接受
 
 **v0.3.0**（2026-10-13）
 - 多文件 / 目录传输：0 号分片改为加密 manifest（type:'batch'），各文件分片
@@ -278,7 +287,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
 
 ## 路线图
 
-- [ ] 纯 JS AES 路径性能优化（T-table / SIMD 化 GHASH）
+- [x] 纯 JS AES 路径性能优化（AES T-table + 8-bit 窗口 GHASH + 同密钥缓存，单 worker 9.3→22 MB/s）—— v0.3.1
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [x] 多文件 / 目录传输（manifest 单房间顺序流，文件夹选择/目录递归，浏览器 ↔ CLI 互通）—— v0.3.0
 - [ ] 断点续传 / 传输中断恢复（注：明文 http 非安全上下文无 OPFS，"跨页面刷新续存"需设计权衡，先做连接中断自动恢复）

@@ -15,17 +15,19 @@ const ok = (name) => { passed++; console.log(`  ✓ ${name}`) }
   ok('S-box 与 FIPS-197 标准一致')
 }
 
-// 2) GHASH 快速表与参考实现一致
+// 2) GHASH 快速表与参考实现一致（4-bit 参考版 + 8-bit 热路径版）
 {
-  const { gfMulRef, buildTables, gfMulT } = AESGCM._test
+  const { gfMulRef, buildTables, gfMulT, buildTables8, gfMulT8 } = AESGCM._test
   for (let i = 0; i < 100; i++) {
     const X = randomBytes(16)
     const H = randomBytes(16)
     const out = new Uint8Array(16)
     gfMulT(X, buildTables(H), out)
     assert(Buffer.from(out).equals(Buffer.from(gfMulRef(X, H))))
+    gfMulT8(X, buildTables8(H), out)
+    assert(Buffer.from(out).equals(Buffer.from(gfMulRef(X, H))))
   }
-  ok('GHASH 4-bit 表 × 参考实现 100 组随机交叉验证')
+  ok('GHASH 4-bit / 8-bit 表 × 参考实现各 100 组随机交叉验证')
 }
 
 // 3) 与 node 原生 aes-256-gcm 逐字节一致（各种长度，含边界）
