@@ -137,7 +137,7 @@ async function newPage(c) {
   const { sessionId } = await c.send('Target.attachToTarget', { targetId, flatten: true })
   await c.send('Page.enable', {}, sessionId)
   await c.send('Runtime.enable', {}, sessionId)
-  return sessionId
+  return { sid: sessionId, tid: targetId }
 }
 
 async function navigate(c, sid, url) {
@@ -170,8 +170,10 @@ async function main() {
     await c.ready
 
     // 两个独立页面 = 收发双方（同一浏览器 profile,共享 localStorage 的设备 secret,不互踩）
-    const sidA = await newPage(c)
-    const sidB = await newPage(c)
+    const pgA = await newPage(c)
+    const pgB = await newPage(c)
+    const sidA = pgA.sid
+    let sidB = pgB.sid
     await navigate(c, sidA, S + '/')
     await navigate(c, sidB, S + '/')
 
@@ -212,7 +214,9 @@ async function main() {
     await evalJs(c, sidA, `selectedIp = null; deviceCache = deviceCache.filter((d) => d.ip !== '10.99.0.5'); renderDevices()`)
     ok('定向到离线设备:报"建立密道失败" + "返回首页"可退(回归覆盖)')
 
-    // ---------- 3) 同序号并发拉取:先到先得,后来者明确报错(回归:曾 500+永久挂起) ----------
+    // ---------- 3) 同序号并发拉取:X-Resume 只读回放,双双拿到同一份(回归:曾 500+永久挂起) ----------
+    // 浏览器端 getChunk 常带 X-Resume → 房间为可续传模式,同序号并发=多播;
+    // 经典模式的先到先得 409 由 protocol 第 9 组在服务端锁定。
     const concurrent = await evalJs(c, sidA, `
       (async () => {
         const r = await fetch('/api/rooms', { method: 'POST' })
@@ -222,14 +226,12 @@ async function main() {
         setTimeout(() => fetch('/api/rooms/' + room + '/chunk', {
           method: 'POST', headers: { 'X-Room-Token': token }, body: new Uint8Array([1, 2, 3]),
         }), 500)
-        const res = await Promise.allSettled([p1, p2])
-        return res.map((x) => (x.status === 'fulfilled' ? 'ok' : x.reason.message))
-          .sort().join(' | ')
+        const [a, b] = await Promise.all([p1, p2])
+        const same = a.length === b.length && a.every((x, i) => x === b[i])
+        return same ? 'same' : 'diff(' + a.length + '/' + b.length + ')'
       })()`)
-    if (!concurrent.includes('ok') || !concurrent.includes('另一个接收方')) {
-      throw new Error('并发拉取结果异常: ' + concurrent)
-    }
-    ok('同序号并发拉取:一者成功、一者收到"正被另一个接收方使用"(回归覆盖)')
+    if (concurrent !== 'same') throw new Error('只读回放应返回同一份: ' + concurrent)
+    ok('同序号并发拉取:X-Resume 只读回放返回同一份数据(回归覆盖)')
 
     // ---------- 4) 文件传输全链路:真实 Worker 加密 ----------
     const fileName = 'e2e-' + Date.now() + '.bin'
@@ -257,7 +259,7 @@ async function main() {
     // ---------- 6) 纯 JS AES 降级路径:安全上下文发送 → 非安全上下文接收 ----------
     // 假域名(非 localhost 的明文 http)无 crypto.subtle → 浏览器与 Worker 走纯 JS AES-GCM,
     // 与发送侧的原生 WebCrypto 产出的线上格式必须逐字节互通
-    const sidC = await newPage(c)
+    const sidC = (await newPage(c)).sid
     await navigate(c, sidC, `http://cipherlane-insecure.test:${PORT}/`)
     const ctx = await evalJs(c, sidC,
       `({ subtle: typeof crypto !== 'undefined' && !!crypto.subtle, aesgcm: typeof AESGCM })`)
@@ -297,6 +299,48 @@ async function main() {
       await waitFor(c, sidB, `document.querySelector('#recv-file-status').textContent.includes('已接收 2 个文件')`, 30000, '批量完成')
       fs.rmSync(bf1, { force: true }); fs.rmSync(bf2, { force: true })
       ok('多文件批量:双文件选择 → 链接 → 接收完成(内存模式)')
+
+    // ---------- 9) 断点续传:接收中途重导航(模拟刷新) → IDB 记录 → 按钮续传完成 ----------
+    {
+      const rf = path.join(os.tmpdir(), 'e2e-resume-' + Date.now() + '.bin')
+      fs.writeFileSync(rf, randomBytes(16 * 1024 * 1024))
+      await navigate(c, sidA, S + '/')
+      await c.send('DOM.enable', {}, sidA)
+      const { root } = await c.send('DOM.getDocument', {}, sidA)
+      const { nodeId } = await c.send('DOM.querySelector', { nodeId: root.nodeId, selector: '#file' }, sidA)
+      await c.send('DOM.setFileInputFiles', { files: [rf], nodeId }, sidA)
+      await evalJs(c, sidA, `document.querySelector('#file').onchange()`)
+      await waitFor(c, sidA, `document.querySelector('#link').textContent.startsWith('http')`, 15000, '续传链接')
+      const rlink = await evalJs(c, sidA, textOf('#link'))
+      const room = rlink.split('#')[1].split('.')[0]
+      await navigate(c, sidB, rlink)
+      // 显式轮询(waitFor 对 async 表达式恒真,不适用)
+      {
+        let d = 0
+        for (let i = 0; i < 200 && d < 2; i++) {
+          d = await evalJs(c, sidB, `(async () => (await resumeDB.get('${room}'))?.done || 0)()`)
+          if (d < 2) await sleep(150)
+        }
+        if (d < 2) throw new Error('IDB 进度未达 2 片(实际 ' + d + ')')
+      }
+      // “刷新/崩溃”:先冻结页面(JS 停摆,零竞态窗口)再关闭重开
+      await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidB).catch(() => {})
+      await c.send('Target.closeTarget', { targetId: pgB.tid }).catch(() => {})
+      const pgB2 = await newPage(c)
+      sidB = pgB2.sid
+      await navigate(c, sidB, rlink)
+      await waitFor(c, sidB, `document.querySelector('#start-recv').textContent.includes('继续接收')`, 15000, '续传按钮')
+      const doneAtKill = await evalJs(c, sidB, `(async () => (await resumeDB.get('${room}'))?.done || 0)()`)
+      await evalJs(c, sidB, `document.querySelector('#start-recv').click()`)
+      await waitFor(c, sidB, `document.querySelector('#recv-file-status').textContent.includes('已保存')`, 60000, '续传完成')
+      // 重进后的新文档不应重拉已持久化的分片
+      // i=0 是重进页面的元信息重读(设计内),排除后首片数据应从断点之后开始
+      const minI = await evalJs(c, sidB,
+        `Math.min(...performance.getEntriesByType('resource').map((e) => /chunk\\?i=(\\d+)/.exec(e.name)).filter(Boolean).map((m) => +m[1]).filter((i) => i > 0))`)
+      if (!(minI > doneAtKill)) throw new Error(`续传应从第 ${doneAtKill + 1} 片开始,实际首拉 i=${minI}`)
+      fs.rmSync(rf, { force: true })
+      ok(`断点续传:中途重导航 → IDB 记录 → 从第 ${minI} 片续传完成`)
+    }
     }
 
     // ---------- 5) 服务器中途下线:建立失败可退 ----------

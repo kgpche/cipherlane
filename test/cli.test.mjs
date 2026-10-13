@@ -145,6 +145,38 @@ async function main() {
       ok('文本链路:send-text → recv')
     }
 
+    // ---------- 5) 断点续传:中途 SIGKILL 接收进程 → 重跑同一链接续传完成 ----------
+    {
+      const src = path.join(TMP, 'resume.bin')
+      const data = randomBytes(12 * 1024 * 1024 + 4321) // 13 片
+      fs.writeFileSync(src, data)
+      const send = runCli(['send', src])
+      const link = await waitLink(send)
+      const out = path.join(TMP, 'resume-out.bin')
+      const part = out + '.part'
+      // 第一次接收:落盘 ≥3 片后击杀
+      const first = runCli(['recv', link, '-o', out])
+      let killed = false
+      for (let i = 0; i < 300; i++) {
+        const st = await fsp.stat(part).catch(() => null)
+        if (st && st.size >= 3 * 1024 * 1024) { first.child.kill('SIGKILL'); killed = true; break }
+        await sleep(50)
+      }
+      assert(killed, '未能在传输中途击杀接收进程(阈值未达到)')
+      await sleep(300)
+      const stPart = await fsp.stat(part).catch(() => null)
+      assert(stPart && stPart.size >= 3 * 1024 * 1024 && stPart.size < data.length, '中断后应有部分进度且未完成')
+      // 重跑同一链接:从断点续传并完成
+      const second = await runCli(['recv', link, '-o', out]).done
+      assert.strictEqual(second.code, 0, second.out)
+      assert(/续传/.test(second.out), '应提示检测到断点: ' + second.out.slice(-300))
+      assert(Buffer.compare(data, fs.readFileSync(out)) === 0, '续传结果字节不一致')
+      assert(!(await fsp.stat(part).catch(() => null)), '.part 完成后应已改名')
+      const s = await send.done
+      assert.strictEqual(s.code, 0, s.out)
+      ok('断点续传:SIGKILL 中断 → .part 保留 → 重跑续传完成,字节一致')
+    }
+
     console.log(`\ncli: 全部 ${passed} 组通过`)
   } finally {
     server.kill('SIGINT')

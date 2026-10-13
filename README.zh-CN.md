@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -129,7 +129,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 - 服务默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不绑 VPN/tun、虚拟网卡等非信任网段；显式 `HOST=0.0.0.0`（deb 服务模板如此）才全网卡监听
 - 接收不支持断点续传：分片顺序一次性消费，刷新页面需发送方重发
 - 恶意丢弃流量属于 DoS，可检测（传输卡住/报错）但无法防止
-- 房间号在 HTTP 请求中明文过线：流量可被完整嗅探的网络（开放 WiFi 等）上，攻击者可抢先拉取分片（拿到密文、无法解密，但接收方会收不到）；保密性不受影响，可用性受影响
+- 房间号在 HTTP 请求中明文过线：可完整嗅探的网络上攻击者可拉取分片（拿到密文、无法解密）——可续传模式下分片只读，抢拉不再饿死接收方；但伪造进度上报可释放缓存造成断流（可用性攻击，与既往同级的已知边界）。保密性不受影响
 - 同一 IP 多个**不同浏览器**同时在线时，设备条目以后注册者为准（同浏览器多标签已通过共享 secret 解决）
 
 **技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 node:crypto 原生逐字节一致（有测试）。
@@ -180,7 +180,7 @@ CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
 IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标准 2:1，字符艺术二维码可能变形——这属于该环境的渲染特性，标准终端（GNOME Terminal / Windows Terminal / iTerm）显示正常。集成终端里请用两条保底路径：系统临时目录下的 `cipherlane-qr-<pid>.png`（像素精确，启动横幅会打印完整路径），或网页发送页的 SVG 二维码。也可用 `CIPHERLANE_QR_RATIO=<实测比例>` 手动校正（太高调小、太宽调大）。
 
 **发大文件接收方刷新了页面怎么办？**
-当前不支持断点续传，重新发一次即可（路线图项）。
+链接模式已支持断点续传：重新打开同一接收链接（CLI 重跑同一命令、输出路径不变），自动从断点继续。设备直发与浏览器批量接收暂不支持，需重发。
 
 **批量接收时浏览器提示"下载多个文件"？**
 内存模式下逐个触发下载，浏览器会请求一次"允许下载多个文件"，点允许即可；Chromium 系在接收前弹目录选择器直接流式写入，无此提示。
@@ -225,6 +225,21 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.4.0**（2026-10-13）
+- 断点续传（链接模式，服务端零持久化，隐私模型不变）：
+  分片从"取走即焚"改为"可重放"——接收方 `X-Resume` 进入可续传模式后 GET 只读，
+  新端点 `POST /progress` 按接收方落盘进度释放缓存；背压窗口语义与内存上界不变
+- CLI：`.part` 即断点（大小对齐分片边界），中途被杀重跑同一命令自动续传；
+  换链接/密钥不符时首片 GCM 验签失败自动从头；滞后一片提交进度，杜绝
+  "上报领先磁盘"的击杀竞态
+- 浏览器：IndexedDB 断点记录（明文 http 也可用）；Chromium 文件句柄可持久化，
+  刷新后凭"继续接收并保存"按钮手势重新授权续写；内存模式分片落 IDB（磁盘支撑）
+- 兼容性双向成立：旧客户端不带 `X-Resume` → 服务器走原"取走即焚"路径；
+  新客户端对旧服务器 → progress 404 自动退化为不可续传
+- 意外收益：可续传房间分片只读，恶意抢拉不再能饿死接收方
+- 测试：协议 13 组（+可续传语义）；CLI 5 组（+SIGKILL 中断续传字节级一致）；
+  浏览器 9 组（+重导航续传，断言不重拉已完成分片）
 
 **v0.3.1**（2026-10-13）
 - 纯 JS AES-256-GCM 性能：AES 核心 T-table 化（S 盒 + MixColumns 合一查表，
@@ -290,7 +305,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - [x] 纯 JS AES 路径性能优化（AES T-table + 8-bit 窗口 GHASH + 同密钥缓存，单 worker 9.3→22 MB/s）—— v0.3.1
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [x] 多文件 / 目录传输（manifest 单房间顺序流，文件夹选择/目录递归，浏览器 ↔ CLI 互通）—— v0.3.0
-- [ ] 断点续传 / 传输中断恢复（注：明文 http 非安全上下文无 OPFS，"跨页面刷新续存"需设计权衡，先做连接中断自动恢复）
+- [x] 断点续传（链接模式）：服务器分片可重放 + 接收方位置上报释放缓存；CLI 以 `.part` 大小定位断点，浏览器以 IndexedDB 记录断点（FSA 句柄可持久化）。设备直发（会话密钥不落盘）与浏览器批量接收暂不支持 —— v0.4.0
 - [x] 设备直发的公钥指纹显示与变更警示（对抗服务器主动 MITM 的 TOFU 防线）
 - [x] 加固批：长轮询并发上限、QR 保底图移至临时目录、CLI 请求超时、身份密钥重置入口、纯 JS 路径浏览器测试覆盖 —— v0.2.3
 

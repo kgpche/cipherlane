@@ -154,6 +154,8 @@ function createRoom() {
     senderDone: false,
     acked: false,
     waiters: [],      // 长轮询等待者
+    resumable: false, // 接收方以 X-Resume 首次拉取后进入可续传模式（GET 只读 + progress 释放）
+    through: 0,       // 可续传模式下接收方已安全落盘的分片数（0..count，含 0 号元信息）
   }
   rooms.set(id, room)
   console.log(`[room] + ${id}`)
@@ -176,6 +178,18 @@ function takeChunk(room, i) {
 function notifyChunk(room, i) {
   // 无等待者：分片留在缓冲区，供接收方稍后 GET（先发后收的链接模式依赖此语义）
   if (!room.waiters.some((w) => w.i === i)) return
+  if (room.resumable) {
+    // 可续传模式：分片只读，同序号的所有等待者都能拿到同一份
+    const c = room.buffer.get(i)
+    if (!c) return
+    room.waiters = room.waiters.filter((w) => {
+      if (w.i !== i) return true
+      w.clearTimer()
+      w.ok(c)
+      return false
+    })
+    return
+  }
   const c = takeChunk(room, i)
   if (!c) return
   let first = true
@@ -186,6 +200,24 @@ function notifyChunk(room, i) {
     else w.fail(409, 'conflict') // 同序号并发等待：先到先得，后来者明确失败而非挂起
     return false
   })
+}
+
+// 接收方上报进度：释放 through 以下已确认落盘的分片（可续传模式）
+function advanceThrough(room, through) {
+  if (!Number.isInteger(through) || through < 0 || through > room.posted) return false
+  if (through <= room.through) return true // 单调，重复/滞后上报幂等
+  for (const [i, c] of room.buffer) {
+    // 0 号元信息分片不释放：续传的接收方重进房间时还要读 manifest
+    if (i >= 1 && i < through) {
+      room.buffer.delete(i)
+      room.bytes -= c.length
+      globalBuffered -= c.length
+    }
+  }
+  room.through = through
+  if (room.through > room.pulled) room.pulled = room.through
+  room.lastActive = Date.now()
+  return true
 }
 
 function destroyRoom(room) {
@@ -235,7 +267,27 @@ function notifyOffers(ip) {
 }
 
 // GET /api/rooms/:id/chunk?i=N —— 长轮询取分片（接收方顺序拉取）
-function handlePull(room, i, res, ip) {
+// X-Resume: 1 → 可续传模式：GET 只读（同分片可反复拉），由 POST /progress 释放
+function handlePull(room, i, res, ip, resume) {
+  if (resume) room.resumable = true
+  if (room.resumable) {
+    const c = room.buffer.get(i)
+    if (c) {
+      room.receiverSeen = true
+      room.lastActive = Date.now()
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'X-Chunk-Index': String(i),
+        'Cache-Control': 'no-store',
+      })
+      return res.end(c)
+    }
+    // 已被 progress 释放的数据分片（0 号元信息永不释放，供续传者重读 manifest）
+    if (i >= 1 && i < room.through) return sendJson(res, 410, { error: 'behind', through: room.through })
+    if (room.senderDone && i >= room.posted) return sendJson(res, 410, { error: 'sender-gone' })
+    // 未投递：挂长轮询（只读模式可多个等待者共享同一分片）
+    return parkWaiter(room, i, res, ip, c)
+  }
   if (i < room.head) return sendJson(res, 410, { error: 'consumed' })
   const body = takeChunk(room, i)
   if (body) {
@@ -248,11 +300,16 @@ function handlePull(room, i, res, ip) {
   }
   // 发送方已声明结束但仍缺分片 → 传输被中断
   if (room.senderDone && i >= room.posted) return sendJson(res, 410, { error: 'sender-gone' })
+  return parkWaiter(room, i, res, ip, null)
+}
+
+// 长轮询挂起（经典模式：分片到达即取走；可续传模式：只读回放）
+function parkWaiter(room, i, res, ip, _snapshot) {
   if (longpollEnter(ip) > LONGPOLL_PER_IP) {
     longpollExit(ip)
     return sendJson(res, 429, { error: 'too-many-polls', retry: 1 })
   }
-
+  const readonly = room.resumable
   const w = {
     i,
     settled: false,
@@ -267,6 +324,7 @@ function handlePull(room, i, res, ip) {
       })
       res.end(body)
     },
+    readonly,
     fail(code, msg) {
       if (this.settled) return
       this.settled = true
@@ -412,7 +470,7 @@ async function handleRequest(req, res) {
     }
 
     // /api/rooms/:id/...
-    const m = p.match(/^\/api\/rooms\/([0-9A-Za-z]{10})(?:\/(state|chunk|done|ack|offer))?\/?$/)
+    const m = p.match(/^\/api\/rooms\/([0-9A-Za-z]{10})(?:\/(state|chunk|done|ack|offer|progress))?\/?$/)
     if (m) {
       const room = rooms.get(m[1])
       const sub = m[2] || ''
@@ -435,6 +493,8 @@ async function handleRequest(req, res) {
           senderDone: room.senderDone,
           acked: room.acked,
           ackProof: room.ackProof || null, // 接收方密钥凭证：服务器无法验证，仅供发送方本地核对
+          resumable: room.resumable,
+          through: room.through, // 可续传模式下接收方已确认落盘的分片数
           offer: room.offer ? room.offer.state : null,
         })
       }
@@ -484,8 +544,10 @@ async function handleRequest(req, res) {
         }
         if (!body.length) return sendJson(res, 400, { error: 'empty-chunk' })
         // 背压：发送方领先太多时让其稍后重试
+        // 背压：经典模式按滞留分片数；可续传模式按 未确认分片数(posted - through)
+        const outstanding = room.resumable ? room.posted - room.through : room.buffer.size
         if (
-          room.buffer.size >= ROOM_CHUNKS_BUF ||
+          outstanding >= ROOM_CHUNKS_BUF ||
           room.bytes + body.length > ROOM_BYTES_MAX ||
           globalBuffered + body.length > GLOBAL_BYTES_MAX
         ) {
@@ -503,7 +565,7 @@ async function handleRequest(req, res) {
       if (sub === 'chunk' && req.method === 'GET') {
         const i = Number(u.searchParams.get('i'))
         if (!Number.isInteger(i) || i < 0) return sendJson(res, 400, { error: 'bad-index' })
-        return handlePull(room, i, res, clientIp(req))
+        return handlePull(room, i, res, clientIp(req), req.headers['x-resume'] === '1')
       }
 
       if (sub === 'done' && req.method === 'POST') {
@@ -512,6 +574,24 @@ async function handleRequest(req, res) {
         room.senderDone = true
         room.lastActive = Date.now()
         return sendJson(res, 200, { ok: true })
+      }
+
+      // POST /api/rooms/:id/progress —— 可续传模式：接收方上报已安全落盘的分片数，
+      // 服务器据此释放之前的缓存。上报本身不要求凭证：伪造进度不会解密任何内容，
+      // 其危害等价于既有的分片抢拉（可用性攻击，见 README 安全模型）。
+      if (sub === 'progress' && req.method === 'POST') {
+        const body = await readBody(req, 1024).catch(() => null)
+        let through = null
+        if (body) {
+          try {
+            const j = JSON.parse(body.toString('utf8') || '{}')
+            if (Number.isInteger(j.through)) through = j.through
+          } catch { /* 忽略坏包 */ }
+        }
+        if (through === null) return sendJson(res, 400, { error: 'bad-through' })
+        if (!room.resumable) return sendJson(res, 409, { error: 'not-resumable' })
+        if (!advanceThrough(room, through)) return sendJson(res, 400, { error: 'bad-through' })
+        return sendJson(res, 200, { ok: true, through: room.through })
       }
 
       // POST /api/rooms/:id/ack —— 接收方确认收讫。ack 本身无法向服务器证明身份

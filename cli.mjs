@@ -176,12 +176,14 @@ async function postChunk(room, token, body) {
     return
   }
 }
-async function getChunkAt(origin, room, i) {
+async function getChunkAt(origin, room, i, resume) {
   for (;;) {
     let r
     try {
       // 超时给足长轮询余量（服务端 25s 到期返回 408 后本就重试）
-      r = await fetchT(`${origin}/api/rooms/${room}/chunk?i=${i}`, {}, 35_000)
+      // X-Resume: 1 → 房间进入可续传模式（GET 只读，供中断后重拉）；旧服务器忽略此头
+      r = await fetchT(`${origin}/api/rooms/${room}/chunk?i=${i}`,
+        resume ? { headers: { 'X-Resume': '1' } } : {}, 35_000)
     } catch (e) {
       if (e && e.name === 'TimeoutError') continue // 连接停滞:重连再等
       throw e
@@ -197,24 +199,50 @@ async function getChunkAt(origin, room, i) {
 }
 const getState = (room) => jget(`/api/rooms/${room}/state`)
 
-// ---------- 接收文件落盘（.part 临时名 + 成功后改名；失败清理，不留半截文件冒充完整文件） ----------
-async function receiveToFile(target, meta, pull) {
+// progress 上报(可续传模式):每落盘一片提交,服务器据此释放缓存。
+// 旧服务器 404/经典房间 409 → 静默降级为不可续传
+function makeProgress(origin, room) {
+  let ok = true
+  return async (through) => {
+    if (!ok) return
+    try {
+      const r = await fetchT(`${origin}/api/rooms/${room}/progress`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ through }),
+      }, 10_000)
+      if (r.status === 404 || r.status === 409) ok = false
+    } catch { /* 上报失败无害:服务器多留一会儿缓存 */ }
+  }
+}
+
+// ---------- 接收文件落盘 ----------
+// .part 临时名 + 成功后改名；opts.startFrom > 1 时为续传（追加写，从该数据分片继续）。
+// 中断保留 .part：重跑同一命令按大小对齐到分片边界续传；错误若是 GCM 验签失败
+// （密钥不符/对错了链接），由调用方删除重来——无需任何 sidecar 元数据。
+async function receiveToFile(target, meta, pull, opts = {}) {
   const part = target + '.part'
-  const ws = fs.createWriteStream(part)
+  const startFrom = opts.startFrom || 1
+  const ws = fs.createWriteStream(part, startFrom > 1 ? { flags: 'a' } : {})
   const t0 = Date.now()
-  let got = 0
+  let got = opts.initialGot || 0
   try {
-    for (let i = 1; i < meta.count; i++) {
+    for (let i = startFrom; i < meta.count; i++) {
       const pt = await pull(i)
       got += pt.length
-      ws.write(pt)
-      const sp = got / Math.max(0.001, (Date.now() - t0) / 1000)
+      // 进度上报必须在写入回调之后:write 是异步缓冲的,提前上报会在进程被杀后
+      // 出现 server.through 领先磁盘实况 → 重跑拉到已释放的分片(410 behind)
+      await new Promise((r, j) => ws.write(pt, (e) => { if (e) j(e); else r() }))
+      if (opts.onChunk) opts.onChunk(i, got)
+      const sp = (got - (opts.initialGot || 0)) / Math.max(0.001, (Date.now() - t0) / 1000)
       process.stdout.write(`\r  已接收 ${fmt(got)} / ${fmt(meta.size)} · ${fmt(sp)}/s`)
     }
     await new Promise((r) => ws.end(r))
   } catch (e) {
     ws.destroy()
-    await fsp.unlink(part).catch(() => {})
+    if (!/GCM|auth/i.test(e.message)) {
+      // 传输性中断:保留 .part 供续传
+      console.log(`\n  ⏸ 传输中断,进度已保留: ${part}\n  重跑同一命令即可从断点继续（链接与输出路径不变）`)
+    }
     throw e
   }
   await fsp.rename(part, target)
@@ -415,6 +443,8 @@ function safeJoin(dir, rel) {
 }
 async function receiveBatch(origin, room, key, meta, outDir) {
   await fsp.mkdir(outDir, { recursive: true })
+  const progress = makeProgress(origin, room)
+  await progress(1)
   let idx = 1 // 下一个文件的首个数据分片序号
   for (const f of meta.files) {
     const target = safeJoin(outDir, f.name)
@@ -426,8 +456,7 @@ async function receiveBatch(origin, room, key, meta, outDir) {
     }
     const start = idx
     idx += f.count
-    await receiveToFile(target, { size: f.size, count: f.count + 1 },
-      async (i) => unseal(key, await getChunkAt(origin, room, start + i - 1)))
+    await receiveResumable(origin, room, key, { ...f, count: f.count + 1 }, target, start)
     console.log(`\n  ✓ ${f.name}（${fmt(f.size)}）`)
   }
 }
@@ -442,7 +471,8 @@ async function doRecv(link) {
   const origin = u.origin
   const room = m[1]
 
-  const meta = JSON.parse(unseal(key, await getChunkAt(origin, room, 0)))
+  // X-Resume 让房间进入可续传模式（旧服务器忽略该头，自动退化为不可续传）
+  const meta = JSON.parse(unseal(key, await getChunkAt(origin, room, 0, true)))
   if (meta.type === 'batch') {
     const dir = opts.out || '.'
     await receiveBatch(origin, room, key, meta, dir)
@@ -457,9 +487,48 @@ async function doRecv(link) {
     return
   }
   const target = opts.out || safeName(meta.name)
-  await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(origin, room, i)))
+  await receiveResumable(origin, room, key, meta, target, 1)
   await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
   console.log(`\n\n✅ 已解密并保存到 ${target}（${fmt(meta.size)}）\n`)
+}
+
+// 单文件接收:.part 存在则对齐分片边界续传;首片 GCM 验签失败 = .part 与本次
+// 传输不符（换了链接/密钥）→ 删除重来。start = 该文件数据分片的全局起始序号。
+async function receiveResumable(origin, room, key, meta, target, start) {
+  const progress = makeProgress(origin, room)
+  if (start === 1) await progress(1) // 元信息已解析
+  const run = (startFrom, initialGot) => receiveToFile(target, meta,
+    async (i) => unseal(key, await getChunkAt(origin, room, start + i - 1, true)),
+    // 滞后一片提交：write 回调(已入内核)后才声明"前一片安全"，留出一整片余量——
+    // 否则击杀瞬间磁盘 stat 可能落后内核刷盘,重跑会拉到已释放的分片(410 behind)
+    { startFrom, initialGot, onChunk: (i) => progress(start + i - 1) })
+  const part = target + '.part'
+  const st = await fsp.stat(part).catch(() => null)
+  const fullCommit = () => progress(start + meta.count - 1) // 本文件全部落盘(ws.end 已等待)
+  try {
+    if (st) {
+      const lt = Math.min(Math.floor(st.size / CHUNK), meta.count - 1) // 已完整落盘的数据分片数
+      if (lt > 0) {
+        await fsp.truncate(part, lt * CHUNK)
+        console.log(`  ↻ 检测到未完成的接收，从第 ${lt + 1}/${meta.count - 1} 片续传`)
+        await run(lt + 1, lt * CHUNK)
+      } else await run(1, 0)
+    } else await run(1, 0)
+    await fullCommit()
+  } catch (e) {
+    if (/GCM|auth/i.test(e.message)) {
+      await fsp.unlink(part).catch(() => {})
+      console.log('  ⚠ 已有 .part 与本次传输不符（验签失败），重新完整接收')
+      await run(1, 0)
+      await fullCommit()
+    } else if (/已被使用/.test(e.message)) {
+      // 服务器缓存已回收(等价于不可续传)：从头接收兜底
+      await fsp.unlink(part).catch(() => {})
+      console.log('  ⚠ 断点已被服务器回收，从头完整接收')
+      await run(1, 0)
+      await fullCommit()
+    } else throw e
+  }
 }
 
 // ---------- listen（常驻接收端，可被直发） ----------

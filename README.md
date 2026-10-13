@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.3.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -130,7 +130,7 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, ≤ 8 pending of
 - The server binds 127.0.0.1 + LAN (RFC1918) interfaces by default, not VPN/tun or virtual adapters; explicit `HOST=0.0.0.0` (as the deb service template does) binds everywhere
 - No resume support: chunks are consumed one-shot; if the receiver refreshes, the sender must resend
 - Malicious packet dropping is DoS — detectable (stalled transfer / errors) but not preventable
-- Room ids travel in plaintext HTTP requests: on fully sniffable networks (open Wi-Fi), an attacker can race the receiver for chunks (getting ciphertext they cannot decrypt, starving the receiver); confidentiality is unaffected, availability is
+- Room ids travel in plaintext HTTP requests: on fully sniffable networks an attacker can pull chunks (ciphertext they cannot decrypt) — in resumable rooms chunks are read-only, so stealing no longer starves the receiver; forging progress reports can still cut a transfer (availability-level, same class as before). Confidentiality is unaffected
 - Multiple **different browsers** on one IP: the device entry belongs to the last one to register (same-browser tabs share the secret and coexist)
 
 **How encryption works over plain http**: browsers only expose `crypto.subtle` in secure contexts. This project ships pure-JS implementations and degrades automatically: AES-256-GCM (`public/aesgcm.js`), SHA-256 (`public/sha256.js`), X25519 (`public/x25519.js`, BigInt + RFC 7748 Montgomery ladder). On localhost/https, AES uses native WebCrypto. The pure-JS output is byte-identical to node:crypto (verified by tests).
@@ -181,7 +181,7 @@ Some embedded webviews lack `alert/confirm` and file savers — a host limitatio
 IDE terminals (Electron/xterm.js) deviate from the standard 2:1 cell geometry, which can distort ASCII QR art — a rendering quirk of those environments; standard terminals (GNOME Terminal / Windows Terminal / iTerm) are fine. In an IDE terminal use the fallbacks: `cipherlane-qr-<pid>.png` in the system temp directory (pixel-exact; the banner prints the full path), or the SVG QR on the send page. `CIPHERLANE_QR_RATIO=<measured ratio>` corrects manually.
 
 **Receiver refreshed mid-transfer of a big file?**
-No resume support yet — just send again (roadmap item).
+Link mode now resumes: reopen the same receive link (CLI: re-run the same command with the same output path) and it continues from the breakpoint. Device-direct and browser batch receive are not resumable yet — resend.
 
 **The browser asks to "download multiple files" when receiving a batch?**
 Memory mode triggers downloads one by one and the browser asks once for permission — allow it. Chromium browsers instead show a directory picker before receiving and stream straight into it, no prompt.
@@ -227,6 +227,14 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 ## Changelog
 
+**v0.4.0** (2026-10-13)
+- Resume support (link mode; server stays zero-persistence, privacy model unchanged): chunks switch from consume-on-read to replayable — with `X-Resume` the room's GETs become read-only, and a new `POST /progress` endpoint frees buffers per the receiver's persisted position; backpressure window and memory bounds unchanged
+- CLI: the `.part` file is the checkpoint (size aligned to chunk boundaries); re-running the same command after a kill resumes automatically; a mismatched link fails the first chunk's GCM check and restarts cleanly; progress is committed one chunk behind, eliminating the kill-race where reports outrun the disk
+- Browser: IndexedDB checkpoint records (work on plain http too); Chromium file handles persist, re-authorized via the "continue receiving" button's gesture after reload; memory-mode parts land in IDB (disk-backed)
+- Compatibility both ways: old clients omit `X-Resume` and get the original consume-on-read path; new clients against old servers silently degrade when progress 404s
+- Bonus: resumable rooms are read-only, so chunk stealing no longer starves the receiver
+- Tests: protocol 13 groups (+resumable semantics); CLI 5 groups (+SIGKILL-interrupt resume, byte-identical); browser 9 groups (+reload resume, asserts no re-fetch of completed chunks)
+
 **v0.3.1** (2026-10-13)
 - Pure-JS AES-256-GCM performance: AES core rewritten with T-tables (SubBytes + MixColumns fused into table lookups; single worker 9.3 → 22 MB/s, ×4 pool ≈ 80–90 MB/s, near gigabit line rate); GHASH moved from 4-bit to 8-bit windowed tables; streaming chunks with the same key reuse a key cache (rk32/H/tables built once)
 - Byte-exactness unchanged: all existing node:crypto comparisons pass; new 100-round cross-check of the 8-bit tables against the reference multiply; the browser fallback-path scenario keeps verifying interop for real
@@ -271,7 +279,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 - [x] Pure-JS AES performance work (AES T-tables + 8-bit windowed GHASH + per-key caching; single worker 9.3 → 22 MB/s) — v0.3.1
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
 - [x] Multi-file / directory transfers (manifest + sequential chunks in one room; folder picker / recursive CLI; browser ↔ CLI interop) — v0.3.0
-- [ ] Resume support (replayable chunks + position negotiation; note: plain-http non-secure contexts lack OPFS, so resume-across-refresh needs design trade-offs — connection-drop recovery comes first)
+- [x] Resume support (link mode): replayable chunks + receiver position reports free server memory; CLI resumes from the `.part` file, browsers from an IndexedDB record (FSA handles persistable). Device-direct (session keys never touch disk) and browser batch receive are not resumable yet — v0.4.0
 - [x] Device public-key fingerprints + change warnings (TOFU defense against server MITM)
 - [x] Hardening batch: long-poll concurrency cap, QR fallback image moved to the temp dir, CLI request timeouts, identity-key reset, pure-JS-path browser coverage — v0.2.3
 

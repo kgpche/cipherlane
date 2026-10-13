@@ -357,6 +357,44 @@ async function main() {
       ok('长轮询并发上限：第 9 个 429 / 断开释放后可再挂')
     }
 
+    // ---------- 13) 可续传模式：X-Resume 只读回放 / progress 释放与单调 / 经典兼容 ----------
+    {
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      const pr = r.json
+      const k = randomBytes(32)
+      const post = (body) => jfetch(`/api/rooms/${pr.room}/chunk`,
+        { method: 'POST', headers: { 'X-Room-Token': pr.token }, body })
+      await post(seal(k, Buffer.from('meta')))
+      await post(seal(k, Buffer.from('c1')))
+      await post(seal(k, Buffer.from('c2')))
+      // X-Resume：同一分片可反复拉（只读回放，供刷新后的接收方重来）
+      const g1 = await fetch(`${S}/api/rooms/${pr.room}/chunk?i=1`, { headers: { 'X-Resume': '1' } })
+      const g1b = await fetch(`${S}/api/rooms/${pr.room}/chunk?i=1`, { headers: { 'X-Resume': '1' } })
+      assert.strictEqual(g1.status, 200)
+      assert.strictEqual(g1b.status, 200)
+      assert(Buffer.from(await g1.arrayBuffer()).equals(Buffer.from(await g1b.arrayBuffer())), '只读回放应返回同一份')
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/state`)).json.resumable, true)
+      // progress：释放 through 以下 → 已释放分片再拉 410 behind；单调不回退；越界拒绝
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/progress`,
+        { method: 'POST', body: JSON.stringify({ through: 2 }) })).status, 200)
+      const g1c = await fetch(`${S}/api/rooms/${pr.room}/chunk?i=1`, { headers: { 'X-Resume': '1' } })
+      assert.strictEqual(g1c.status, 410, '已确认落盘的分片应被释放')
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/progress`,
+        { method: 'POST', body: JSON.stringify({ through: 1 }) })).status, 200, '滞后上报幂等')
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/state`)).json.through, 2, '进度单调不回退')
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/progress`,
+        { method: 'POST', body: JSON.stringify({ through: 999 }) })).status, 400, '越界拒绝')
+      // 经典兼容：不带头的房间保持"取走即焚"
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      const cr = r.json
+      await jfetch(`/api/rooms/${cr.room}/chunk`,
+        { method: 'POST', headers: { 'X-Room-Token': cr.token }, body: seal(randomBytes(32), Buffer.from('x')) })
+      const c1 = await fetch(`${S}/api/rooms/${cr.room}/chunk?i=0`)
+      const c2 = await fetch(`${S}/api/rooms/${cr.room}/chunk?i=0`)
+      assert(c1.status === 200 && c2.status === 410, `经典模式应取走即焚(${c1.status}/${c2.status})`)
+      ok('可续传模式：只读回放 / progress 释放·单调·越界 / 经典模式不受影响')
+    }
+
     console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')

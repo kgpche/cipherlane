@@ -236,7 +236,8 @@ async function getChunk(room, i, signal) {
     let r
     try {
       // 超时给足长轮询余量（服务端 25s 到期返回 408 后客户端本就重试）
-      r = await fetchT(`/api/rooms/${room}/chunk?i=${i}&n=${chunkReqSeq++}`, { signal, cache: 'no-store' }, 35_000)
+      // X-Resume 让房间进入可续传模式(只读回放,供刷新后重拉);旧服务器忽略此头
+      r = await fetchT(`/api/rooms/${room}/chunk?i=${i}&n=${chunkReqSeq++}`, { signal, cache: 'no-store', headers: { 'X-Resume': '1' } }, 35_000)
     } catch (e) {
       if (signal && signal.aborted) throw new Error('已取消')
       if (e && e.name === 'TimeoutError') continue // 连接停滞:重连再等
@@ -251,6 +252,46 @@ async function getChunk(room, i, signal) {
     return new Uint8Array(await r.arrayBuffer())
   }
 }
+
+// ---------- 断点续传记录（IndexedDB,零依赖;明文 http 下同样可用） ----------
+// 链接模式接收方的进度:done = 已持久化的最后数据分片序号(0 = 尚无);
+// FSA 模式存目录内文件句柄(可结构化克隆),内存模式逐片存 Blob。
+const resumeDB = (() => {
+  const open = () => new Promise((res, rej) => {
+    const rq = indexedDB.open('cipherlane-resume', 1)
+    rq.onupgradeneeded = () => rq.result.createObjectStore('transfers')
+    rq.onsuccess = () => res(rq.result)
+    rq.onerror = () => rej(rq.error)
+  })
+  const tx = async (mode, fn) => {
+    try {
+      const db = await open()
+      return await new Promise((res, rej) => {
+        const t = db.transaction('transfers', mode)
+        const r = fn(t.objectStore('transfers'))
+        t.oncomplete = () => { res(r && r.result); db.close() }
+        t.onerror = () => { rej(t.error); db.close() }
+      })
+    } catch { return undefined } // IDB 不可用(隐私模式等)→ 静默退化为不可续传
+  }
+  return {
+    get: (room) => tx('readonly', (st) => st.get(room)),
+    set: (room, rec) => tx('readwrite', (st) => st.put(rec, room)),
+    del: (room) => tx('readwrite', (st) => st.delete(room)),
+  }
+})()
+
+// progress 上报(可续传模式):滞后一片提交(同 CLI 语义);旧服务器 404 → 静默禁用
+const progressPost = (() => {
+  const dead = new Set()
+  return (room, through) => {
+    if (dead.has(room)) return
+    fetch(`/api/rooms/${room}/progress`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ through }),
+    }).then((r) => { if (r.status === 404 || r.status === 409) dead.add(room) }).catch(() => {})
+  }
+})()
 
 // ---------- 视图 ----------
 function showView(name) {
@@ -733,7 +774,7 @@ async function startSend(kind, payload, target) {
 // ---------- 接收（文本 / 文件 两套独立布局） ----------
 
 // 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
-async function receiveInto(room, key, fromInfo) {
+async function receiveInto(room, key, fromInfo, fromLink = false) {
   showView('recv')
   $('#recv-text-layout').hidden = true
   $('#recv-file-layout').hidden = true
@@ -766,7 +807,9 @@ async function receiveInto(room, key, fromInfo) {
 
   if (meta.type === 'text') return receiveText(room, key, ctl)
   if (meta.type === 'batch') return receiveBatch(room, key, meta, ctl)
-  return receiveFile(room, key, meta, ctl)
+  // 断点续传仅链接模式(设备直发的会话密钥不落盘);fromLink 由入口传入
+  const rec = fromLink ? await resumeDB.get(room) : null
+  return receiveFile(room, key, meta, ctl, rec)
 }
 
 // 文本：解密即呈现，无进度条无保存动作
@@ -901,7 +944,7 @@ async function doReceiveBatch(room, key, meta, signal) {
   await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
 }
 
-async function receiveFile(room, key, meta, ctl) {
+async function receiveFile(room, key, meta, ctl, rec) {
   $('#recv-title').textContent = '📥 接收文件'
   $('#recv-file-layout').hidden = false
   $('#recv-filecard').hidden = !meta.size
@@ -910,6 +953,21 @@ async function receiveFile(room, key, meta, ctl) {
   $('#fc-bar-wrap').hidden = true
   $('#recv-meta').textContent = ''
   $('#recv-actions').hidden = true
+  // 断点续传(链接模式):记录存在且与本次 meta 匹配 → 询问后续传
+  if (rec && rec.meta && rec.meta.size === meta.size && rec.meta.count === meta.count && rec.done > 0) {
+    setStatus('recv-file-status',
+      `↻ 检测到未完成的接收（${fmtBytes(rec.done * CHUNK)} / ${fmtBytes(meta.size)}），继续？`, 'warn')
+    $('#recv-actions').hidden = false
+    $('#start-recv').textContent = '继续接收并保存'
+    $('#start-recv').onclick = () => {
+      $('#recv-actions').hidden = true
+      doReceiveFile(room, key, meta, ctl.signal, rec).catch((e) => {
+        if (!ctl.signal.aborted) setStatus('recv-file-status', '❌ ' + e.message, 'err')
+      })
+    }
+    return
+  }
+  if (rec) await resumeDB.del(room) // 记录与本次传输不符:清掉重来
 
   if (!meta.size && meta.count === 1) {
     saveEmpty(meta.name)
@@ -919,6 +977,7 @@ async function receiveFile(room, key, meta, ctl) {
   }
 
   setStatus('recv-file-status', '🟡 准备接收…', 'warn')
+  $('#start-recv').textContent = '接收并保存'
   const start = () => doReceiveFile(room, key, meta, ctl.signal).then((r) => {
     if (r === 'picker-dismissed') {
       $('#recv-actions').hidden = false
@@ -931,7 +990,7 @@ async function receiveFile(room, key, meta, ctl) {
   start() // 自动开始：手势新鲜时直接弹保存选择器；被关闭/失败则显示手动按钮
 }
 
-async function doReceiveFile(room, key, meta, signal) {
+async function doReceiveFile(room, key, meta, signal, rec) {
   // 仅在有激活手势时才自动拉起保存选择器（接受邀请的点击）；
   // 无手势（链接模式直接打开/手势过期/嵌入式 webview）直接走内存模式自动下载，
   // 避免个别环境（如 Electron webview）无手势时选择器 Promise 永久挂起
@@ -939,50 +998,94 @@ async function doReceiveFile(room, key, meta, signal) {
   try {
     hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive && navigator.userActivation.isActive())
   } catch { /* 部分嵌入式 webview 的 userActivation 实现不完整 */ }
-  const useFSA = 'showSaveFilePicker' in window && hasGesture
+
+  // ---- 断点续传状态(链接模式):rec.done = 已持久化的最后数据分片序号 ----
+  let done = rec && rec.done > 0 ? Math.min(rec.done, meta.count - 1) : 0
   let sink = null
-  if (useFSA) {
+  let handle = null
+
+  if (rec && rec.mode === 'fs' && rec.handle) {
+    // FSA 续传:句柄存于 IDB,凭"继续接收并保存"按钮的手势重新授权
     try {
-      const handle = await window.showSaveFilePicker({ suggestedName: meta.name || 'received' })
-      sink = { mode: 'fs', ws: await handle.createWritable() }
+      const perm = await rec.handle.queryPermission({ mode: 'readwrite' })
+      if (perm !== 'granted' && !(await rec.handle.requestPermission({ mode: 'readwrite' })))
+        throw new Error('目录/文件授权被拒绝')
+      handle = rec.handle
+      // keepExistingData + 绝对定位写入:分片边界之后的字节直接被覆盖,天然截齐
+      sink = { mode: 'fs', ws: await handle.createWritable({ keepExistingData: true }) }
     } catch (e) {
-      if (e && e.name === 'AbortError') return 'picker-dismissed' // 用户关闭了选择器 → 显示手动按钮
-      // 手势过期等其他异常 → 内存模式兜底（完成后自动下载）
+      if (e && e.name === 'AbortError') return 'picker-dismissed'
+      sink = null // 授权失败 → 内存模式兜底(原进度作废,从头)
     }
-  }
-  if (!sink) {
-    if (meta.size > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
-    sink = { mode: 'mem', parts: [] }
+  } else if (rec && rec.mode === 'mem' && Array.isArray(rec.parts)) {
+    // 内存模式续传:分片 Blob 存于 IDB(明文 http 也可用,磁盘支撑)
+    sink = { mode: 'mem', parts: rec.parts.slice() }
+    done = Math.min(done, sink.parts.length)
+    sink.parts.length = done
   }
 
-  setStatus('recv-file-status', '📡 接收中…', 'warn')
+  if (!sink) {
+    const useFSA = 'showSaveFilePicker' in window && hasGesture
+    if (useFSA) {
+      try {
+        handle = await window.showSaveFilePicker({ suggestedName: meta.name || 'received' })
+        sink = { mode: 'fs', ws: await handle.createWritable() }
+      } catch (e) {
+        if (e && e.name === 'AbortError') return 'picker-dismissed' // 用户关闭了选择器 → 显示手动按钮
+        // 手势过期等其他异常 → 内存模式兜底（完成后自动下载）
+      }
+    }
+    if (!sink) {
+      if (meta.size > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
+      sink = { mode: 'mem', parts: [] }
+      done = 0
+    }
+  }
+  const saveRec = () => resumeDB.set(room, {
+    room, mode: sink.mode, done, meta: { size: meta.size, count: meta.count, name: meta.name },
+    handle: sink.mode === 'fs' ? handle : undefined,
+    parts: sink.mode === 'mem' ? sink.parts : undefined,
+  })
+  if (sink.mode === 'fs' && handle) await saveRec() // 句柄先存,刷新后可续
+  progressPost(room, done) // 元信息 + 已续传部分对齐服务端进度
+
+  setStatus('recv-file-status', done ? `↻ 继续接收（已 ${fmtBytes(done * CHUNK)}）…` : '📡 接收中…', 'warn')
   $('#fc-bar-wrap').hidden = false
   const speed = makeSpeed()
-  let got = 0
+  let got = done * CHUNK
+  let pos = got // FSA 绝对定位
   // 拉取流水线：深度 3 的并行预取，掩盖无线网往返（服务端本就支持按序号乱序拉取；
   // 串行"拉一片等一片"时空转一个 RTT，是 WiFi 实际吞吐的主要瓶颈）
   const DEPTH = 3
-  let nextI = 1
+  let nextI = done + 1
   const inflight = []
   const pump = () => {
     while (inflight.length < DEPTH && nextI < meta.count) {
-      const p = getChunk(room, nextI++, signal)
+      const i = nextI++
+      const p = getChunk(room, i, signal)
       p.catch(() => {}) // 未消费的预取在中断/失败时不成为 unhandledrejection
-      inflight.push(p)
+      inflight.push({ i, p })
     }
   }
   pump()
   while (inflight.length) {
-    const packed = await inflight.shift()
+    const { i, p } = inflight.shift()
     pump()
+    const packed = await p
+    const j = i // 本片的绝对序号(供进度上报)
     const pt = await unsealRPC(key, packed) // GCM 验签失败会直接抛错
     got += pt.length
-    if (sink.mode === 'fs') await sink.ws.write(pt)
+    if (sink.mode === 'fs') await sink.ws.write({ type: 'write', position: pos, data: pt })
     else sink.parts.push(pt)
+    pos += pt.length
     setBar('bar-recv', got / (meta.size || 1))
     const sp = speed(got)
     $('#recv-meta').textContent =
       `已接收 ${fmtBytes(got)} / ${fmtBytes(meta.size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
+    // 滞后一片提交(同 CLI):写完 j 片才声明 j 之前的都安全,留整片余量
+    progressPost(room, j - 1 > done ? j - 1 : done)
+    done = j
+    if (sink.mode === 'mem') await saveRec() // FSA 模式句柄已存,无需逐片更新
   }
 
   if (sink.mode === 'fs') {
@@ -995,6 +1098,8 @@ async function doReceiveFile(room, key, meta, signal) {
     a.click()
     setTimeout(() => URL.revokeObjectURL(a.href), 60_000)
   }
+  progressPost(room, meta.count) // 全量落盘
+  await resumeDB.del(room)
   setBar('bar-recv', 1)
   setStatus('recv-file-status', `✅ 已保存 ${meta.name || 'received'}（${fmtBytes(meta.size)}）`, 'ok')
   await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
@@ -1013,7 +1118,7 @@ async function startReceive() {
   const frag = location.hash.slice(1)
   const m = /^([0-9A-Za-z]{10})\.([A-Za-z0-9_-]{43})$/.exec(frag)
   if (!m) { showView('landing'); return }
-  receiveInto(m[1], fromB64(m[2]), null)
+  receiveInto(m[1], fromB64(m[2]), null, true)
 }
 
 // ---------- 入口 ----------
