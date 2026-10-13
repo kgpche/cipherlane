@@ -170,6 +170,9 @@ CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
 **在 ZCode / Electron 等嵌入式浏览器里弹窗不生效？**
 部分嵌入式 webview 的 `alert/confirm` 与文件保存器不可用，属宿主限制。正式使用建议系统浏览器（Chrome / Edge / Safari）。
 
+**ZCode / IDE 集成终端里二维码显示异常？**
+IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标准 2:1，字符艺术二维码可能变形——这属于该环境的渲染特性，标准终端（GNOME Terminal / Windows Terminal / iTerm）显示正常。集成终端里请用两条保底路径：启动目录下的 `cipherlane-qr.png`（像素精确，看图工具打开即扫），或网页发送页的 SVG 二维码。也可用 `CIPHERLANE_QR_RATIO=<实测比例>` 手动校正（太高调小、太宽调大）。
+
 **发大文件接收方刷新了页面怎么办？**
 当前不支持断点续传，重新发一次即可（路线图项）。
 
