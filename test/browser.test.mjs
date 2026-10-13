@@ -224,7 +224,12 @@ async function main() {
     await navigate(c, sidB, fileLink)
     await waitFor(c, sidB, `document.querySelector('#fc-name').textContent === '${fileName}'`, 30000, '接收文件卡')
     await waitFor(c, sidB, `document.querySelector('#recv-file-status').textContent.includes('已保存')`, 60000, '文件接收完成')
-    ok('文件传输全链路:Worker 加密 → 5MiB 分片 → 接收方保存完成')
+    // 结构断言:加密确实走了 Worker 池而非静默回退主线程(回退路径数据同样正确,须单独验证)
+    // new Worker('/crypto-worker.js') 每次在 resource timing 留一条记录;低核机器池=2,故断言 ≥2
+    const workersUsed = await evalJs(c, sidA,
+      `performance.getEntriesByType('resource').filter((e) => e.name.includes('crypto-worker.js')).length`)
+    if (!(workersUsed >= 2)) throw new Error(`加密未走 Worker 池(实例数 ${workersUsed}),疑似静默回退主线程`)
+    ok(`文件传输全链路:Worker 池加密(×${workersUsed}) → 5MiB 分片 → 接收方保存完成`)
 
     // ---------- 5) 服务器中途下线:建立失败可退 ----------
     await navigate(c, sidA, S + '/') // 趁服务器还在先回到首页(之后不再导航,页面操作走内存态)

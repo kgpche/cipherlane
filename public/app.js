@@ -101,36 +101,47 @@ async function unsealWith(rawKey, packed) {
   }
   return AESGCM.open(rawKey, packed)
 }
-// ---------- 加密 RPC：分片加解密走 Worker（不卡进度条），Worker 不可用/崩溃回退主线程 ----------
+// ---------- 加密 RPC：分片加解密走 Worker 池（不卡进度条、多核并行），不可用/崩溃回退主线程 ----------
 const cryptoRPC = (() => {
-  let worker = null // null=未初始化 false=不可用
+  let pool = null // null=未初始化；[]=不可用（回退主线程）
   const pending = new Map()
   let seq = 0
+  let next = 0
   function ensure() {
-    if (worker !== null) return worker
+    if (pool !== null) return pool
     try {
-      const w = new Worker('/crypto-worker.js')
-      w.onmessage = (e) => {
+      // 纯 JS AES 路径（明文 http 非安全上下文）单 worker 仅 ~8MB/s，多核池线性提速
+      const n = Math.max(1, Math.min(4, navigator.hardwareConcurrency || 2))
+      const ws = []
+      const onmessage = (e) => {
         const p = pending.get(e.data.id)
         if (!p) return
         pending.delete(e.data.id)
         if (e.data.ok) p.resolve(new Uint8Array(e.data.data))
         else p.reject(new Error(e.data.error || 'crypto worker error'))
       }
-      w.onerror = () => {
-        worker = false
-        try { w.terminate() } catch {}
-        for (const p of pending.values()) p.reject(new Error('crypto worker 异常'))
-        pending.clear()
+      for (let k = 0; k < n; k++) {
+        const w = new Worker('/crypto-worker.js')
+        w.onmessage = onmessage
+        w.onerror = () => {
+          // 任一 worker 异常即整池退役（脚本加载失败等通常全员失败），回退主线程
+          for (const x of ws) { try { x.terminate() } catch {} }
+          pool = []
+          for (const p of pending.values()) p.reject(new Error('crypto worker 异常'))
+          pending.clear()
+        }
+        ws.push(w)
       }
-      worker = w
-    } catch { worker = false }
-    return worker
+      pool = ws
+    } catch { pool = [] }
+    return pool
   }
   async function call(op, key, data) {
-    const w = ensure()
+    const ws = ensure()
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
-    if (!w) return op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes)
+    const fallback = () => (op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes))
+    if (!ws.length) return fallback()
+    const w = ws[next++ % ws.length] // 轮转分发：各分片相互独立，无需保序
     try {
       return await new Promise((resolve, reject) => {
         const id = ++seq
@@ -139,7 +150,7 @@ const cryptoRPC = (() => {
         w.postMessage({ id, op, key, data: bytes })
       })
     } catch (e) {
-      if (worker === false) return op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes)
+      if (pool !== null && pool.length === 0) return fallback() // 池已退役（onerror 已重置 pool）
       throw e
     }
   }
@@ -739,8 +750,22 @@ async function doReceiveFile(room, key, meta, signal) {
   $('#fc-bar-wrap').hidden = false
   const speed = makeSpeed()
   let got = 0
-  for (let i = 1; i < meta.count; i++) {
-    const packed = await getChunk(room, i, signal)
+  // 拉取流水线：深度 3 的并行预取，掩盖无线网往返（服务端本就支持按序号乱序拉取；
+  // 串行"拉一片等一片"时空转一个 RTT，是 WiFi 实际吞吐的主要瓶颈）
+  const DEPTH = 3
+  let nextI = 1
+  const inflight = []
+  const pump = () => {
+    while (inflight.length < DEPTH && nextI < meta.count) {
+      const p = getChunk(room, nextI++, signal)
+      p.catch(() => {}) // 未消费的预取在中断/失败时不成为 unhandledrejection
+      inflight.push(p)
+    }
+  }
+  pump()
+  while (inflight.length) {
+    const packed = await inflight.shift()
+    pump()
     const pt = await unsealRPC(key, packed) // GCM 验签失败会直接抛错
     got += pt.length
     if (sink.mode === 'fs') await sink.ws.write(pt)
