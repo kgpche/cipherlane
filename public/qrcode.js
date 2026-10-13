@@ -308,7 +308,7 @@
       if (h < 1) continue
       if (Math.abs((2 * w) / ratio - h) <= 0.12) { wC = w; hH = h; break }
     }
-    const S = qr.size, q = 4 // 静区
+    const S = qr.size, q = 2 // 静区（紧凑；白底即静区）
     const cols = (S + 2 * q) * wC
     const halfRows = (S + 2 * q) * hH
     const modAt = (hr, cc) => {
@@ -419,7 +419,11 @@
       }
       const on = (d) => {
         const m = /\x1b\[6;(\d+);(\d+)t/.exec(d.toString('latin1'))
-        if (m) finish(Math.min(2.6, Math.max(0.9, Number(m[1]) / Number(m[2]))))
+        if (m) {
+          const r = Number(m[1]) / Number(m[2])
+          // 部分终端的 16t 返回字形框（不含行距），比例异常低时不可信 → 回落默认
+          finish(r >= 1.35 && r <= 2.45 ? r : 2)
+        }
       }
       const timer = setTimeout(() => finish(2), 120)
       try {
@@ -431,7 +435,20 @@
     })
   }
 
-  const api = { encode, svg, ascii, asciiAdaptive, png, measureCellRatio, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
+  // probeCell() → Promise<string>：CSI 16t 原始应答文本（诊断终端上报的单元格尺寸）
+  function probeCell() {
+    return new Promise((resolve) => {
+      const isNode = typeof process !== 'undefined' && process.versions && process.versions.node
+      if (!isNode || !process.stdout.isTTY || !process.stdin.isTTY) return resolve('(非 TTY)')
+      let done = false
+      const finish = (s) => { if (done) return; done = true; clearTimeout(t); process.stdin.removeListener('data', on); try { process.stdin.setRawMode(false) } catch {}; process.stdin.pause(); resolve(s) }
+      const on = (d) => { const s = d.toString('latin1'); if (/\x1b\[6;/.test(s)) finish(s.replace(/\x1b/g, 'ESC')) }
+      const t = setTimeout(() => finish('(无应答：终端不支持 CSI 16t)'), 150)
+      try { process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data', on); process.stdout.write('\x1b[16t') } catch { finish('(错误)') }
+    })
+  }
+
+  const api = { encode, svg, ascii, asciiAdaptive, png, measureCellRatio, probeCell, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   else global.QRCode = api
 })(typeof self !== 'undefined' ? self : globalThis)

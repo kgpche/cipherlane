@@ -569,8 +569,11 @@ server.listen(PORT, HOST, async () => {
       } catch {}
     }
     try {
-      // 实测终端字符单元格高宽比（CSI 16t），按比例渲染近正方形模块
-      const ratio = qrMod && qrMod.measureCellRatio ? await qrMod.measureCellRatio() : 2
+      // 终端字符单元格高宽比：环境变量 CIPHERLANE_QR_RATIO 手动指定 > CSI 16t 实测 > 默认 2.0
+      const envRatio = Number(process.env.CIPHERLANE_QR_RATIO)
+      const ratio = envRatio >= 0.9 && envRatio <= 3
+        ? envRatio
+        : qrMod && qrMod.measureCellRatio ? await qrMod.measureCellRatio() : 2
       const qr = qrMod && qrMod.asciiAdaptive && qrMod.asciiAdaptive(url, ratio)
       if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
     } catch { /* 二维码不可用时仅打印 URL */ }
