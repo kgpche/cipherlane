@@ -518,6 +518,16 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.on('clientError', (_err, socket) => socket.destroy())
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\n✗ 端口 ${PORT} 已被占用——可能有一个旧的密道实例还在运行。\n`)
+    console.error(`  · 到旧实例所在终端按 Ctrl+C 停止，或执行：fuser -k ${PORT}/tcp`)
+    console.error(`  · 或换端口启动：PORT=7788 node server.js\n`)
+  } else {
+    console.error('\n✗ 服务器错误：', err)
+  }
+  process.exit(1)
+})
 
 // ---------- 过期清扫 ----------
 setInterval(() => {
