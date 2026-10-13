@@ -178,6 +178,23 @@ function ackProofOf(key, room) {
 }
 
 // ---------- API ----------
+// 带超时的 fetch：连接"停滞"（既不返回也不报错）时中断重连，而非无限挂起。
+// 只对超时重试；快速失败（拒连等）与用户取消原样上抛。
+async function fetchT(url, opts, ms) {
+  const ctl = new AbortController()
+  const follow = () => ctl.abort()
+  if (opts.signal) {
+    if (opts.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+    opts.signal.addEventListener('abort', follow)
+  }
+  const timer = setTimeout(() => ctl.abort(new DOMException('timeout', 'TimeoutError')), ms)
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal })
+  } finally {
+    clearTimeout(timer)
+    if (opts.signal) opts.signal.removeEventListener('abort', follow)
+  }
+}
 async function api(path, opts) {
   const r = await fetch(path, opts)
   if (!r.ok) {
@@ -189,12 +206,19 @@ async function api(path, opts) {
 }
 async function postChunk(room, token, bytes, signal) {
   for (;;) {
-    const r = await fetch(`/api/rooms/${room}/chunk`, {
-      method: 'POST',
-      headers: { 'X-Room-Token': token },
-      body: bytes,
-      signal,
-    })
+    let r
+    try {
+      r = await fetchT(`/api/rooms/${room}/chunk`, {
+        method: 'POST',
+        headers: { 'X-Room-Token': token },
+        body: bytes,
+        signal,
+      }, 30_000)
+    } catch (e) {
+      if (signal && signal.aborted) throw new Error('已取消')
+      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投
+      throw e
+    }
     if (r.status === 429) {
       await sleep(250) // 背压：接收方还没跟上
       continue
@@ -209,7 +233,15 @@ async function getChunk(room, i, signal) {
     // 分片一次性消费：URL 带唯一序号 + cache:'no-store'，确保并发同序号请求
     // 各自独立到达服务器（否则浏览器/代理可能合并 in-flight 请求，把同一份
     // 响应发给两个等待者，绕过服务端的先到先得语义）
-    const r = await fetch(`/api/rooms/${room}/chunk?i=${i}&n=${chunkReqSeq++}`, { signal, cache: 'no-store' })
+    let r
+    try {
+      // 超时给足长轮询余量（服务端 25s 到期返回 408 后客户端本就重试）
+      r = await fetchT(`/api/rooms/${room}/chunk?i=${i}&n=${chunkReqSeq++}`, { signal, cache: 'no-store' }, 35_000)
+    } catch (e) {
+      if (signal && signal.aborted) throw new Error('已取消')
+      if (e && e.name === 'TimeoutError') continue // 连接停滞:重连再等
+      throw e
+    }
     if (r.status === 408) continue // 长轮询到期，立刻重试继续等
     if (r.status === 409) throw new Error('此链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')

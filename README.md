@@ -8,7 +8,7 @@
 
 选设备直发（X25519 密钥协商）或链接收发，HTTP 明文环境下内容依然全程加密。
 
-![version](https://img.shields.io/badge/version-0.2.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![version](https://img.shields.io/badge/version-0.2.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -209,6 +209,18 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **protocol**：起真实 server，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/链接模式全链路
 
 ## 更新日志
+
+**v0.2.2**（2026-10-13）
+- 对抗性审查修复批：并发拉取同一分片先到先得（后来者 409，原先发送方 500+后来者挂起）；
+  发送建立阶段失败可退（原死锁在无按钮视图）；密钥按传输传参（同页并发收发不再互污）；
+  CLI 短读读满 / 点文件防御（`.bashrc` 落盘为 `bashrc`）/ `.part` 原子落盘
+- 分片 GET 加唯一序号：堵住浏览器/代理对并发同序号请求的 in-flight 合并
+  （曾可能把一次性分片发给两个等待者）
+- 性能：加密 Worker 池 ×4（纯 JS AES 路径吞吐随核数线性提升）+ 接收端 3 路预取流水线
+- 安全：ack 携带密钥凭证（无密钥者伪造的 ack 发送方可辨）；设备公钥指纹 + 变更警示（TOFU）
+- 工程：零依赖浏览器冒烟测试 ×6（CDP 驱动 Chrome，前端自此有自动化测试）；
+  GitHub Actions CI（Node 18/20/22）；打包脚本入库并加供应链校验（SHASUMS256）；
+  deb 包 systemd 最小权限化；连接停滞超时重试、listen 掉线告警
 
 **v0.2.1**（2026-10-12）
 - 二维码：纯 JS QR 编码器（V1-5 字节模式 ECC-L，结构测试含 RS 代数自检）；

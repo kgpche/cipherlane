@@ -325,7 +325,16 @@ async function doListen() {
   const identity = genIdentity()
   const name = opts.name || os.hostname()
   await heartbeat(name, identity)
-  setInterval(() => heartbeat(name, identity).catch(() => {}), 5000)
+  let hbFailing = false
+  setInterval(() => {
+    heartbeat(name, identity)
+      .then(() => { hbFailing = false })
+      .catch((e) => {
+        if (hbFailing) return // 只在状态翻转时提示,避免每 5s 刷屏
+        hbFailing = true
+        console.error(`  ⚠ 心跳失败：${e.message}（持续重试,恢复后自动重新上线）`)
+      })
+  }, 5000)
   console.log(`${avatarOf(presence.ip)}  本机已上线：${name} @ ${presence.ip}（服务器 ${server}）`)
   console.log('  等待直发请求…（Ctrl+C 退出）\n')
 
