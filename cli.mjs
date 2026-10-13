@@ -11,7 +11,7 @@
 // 设备直发（--to / listen）的房间密钥由 X25519 派生：SHA-256(shared ‖ pubA ‖ pubB ‖ roomId)，
 // 与 public/x25519.js 的纯 JS 路径逐字节一致（见 test/x25519.test.mjs）。
 
-import { randomBytes, createCipheriv, createDecipheriv, createPublicKey, createPrivateKey, diffieHellman } from 'node:crypto'
+import { randomBytes, createCipheriv, createDecipheriv, createHash, createPublicKey, createPrivateKey, diffieHellman } from 'node:crypto'
 import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -110,6 +110,13 @@ function dh(seed, theirPubRaw) {
 // 房间密钥派生（两侧参数顺序：发送方公钥, 接收方公钥）
 const roomKey = (shared, senderPub, receiverPub, room) =>
   X25519.sessionKey(new Uint8Array(shared), senderPub, receiverPub, room)
+
+// ack 密钥凭证：SHA256(key ‖ 标签 ‖ 房间号)。与 public/app.js 的纯 JS 构造逐字节一致，
+// 发送方本地比对即可分辨伪造 ack（协议测试有交叉验证）
+const ackProofOf = (key, room) =>
+  createHash('sha256')
+    .update(Buffer.concat([Buffer.from(key), Buffer.from('cipherlane/ack/v1|' + room)]))
+    .digest('hex')
 
 // ---------- 头像（与浏览器同款 fnv1a 种子，终端版几何字符） ----------
 function avatarOf(seedStr) {
@@ -276,7 +283,11 @@ async function doSend({ type, name, size, readChunk }) {
     try {
       const st = await getState(room)
       if (st.acked) {
-        console.log(`\n\n✅ ${target ? (target.name || target.ip) : '对方'}已完整接收\n`)
+        const verified = st.ackProof && st.ackProof === ackProofOf(key, room)
+        const who = target ? (target.name || target.ip) : '对方'
+        console.log(verified
+          ? `\n\n✅ ${who}已完整接收（凭证校验通过）`
+          : `\n\n⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造\n`)
         return
       }
     } catch {
@@ -300,12 +311,12 @@ async function doRecv(link) {
   if (meta.type === 'text') {
     const pt = unseal(key, await getChunkAt(origin, room, 1))
     process.stdout.write(pt)
-    await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+    await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
     return
   }
   const target = opts.out || safeName(meta.name)
   await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(origin, room, i)))
-  await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+  await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
   console.log(`\n\n✅ 已解密并保存到 ${target}（${fmt(meta.size)}）\n`)
 }
 
@@ -380,13 +391,13 @@ async function handleOffer(o, identity, ask) {
     process.stdout.write(pt)
     if (!pt.toString().endsWith('\n')) console.log()
     console.log('  ──────── 文本结束 ────────')
-    await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST' }).catch(() => {})
+    await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, o.room) }) }).catch(() => {})
     return
   }
 
   const target = path.join(opts.out || '.', safeName(meta.name))
   await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(server, o.room, i)))
-  await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST' }).catch(() => {})
+  await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, o.room) }) }).catch(() => {})
   console.log(`\n  ✅ 已解密保存到 ${target}（${fmt(meta.size)}）\n`)
 }
 

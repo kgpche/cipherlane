@@ -411,6 +411,7 @@ const server = http.createServer(async (req, res) => {
           receiverSeen: room.receiverSeen,
           senderDone: room.senderDone,
           acked: room.acked,
+          ackProof: room.ackProof || null, // 接收方密钥凭证：服务器无法验证，仅供发送方本地核对
           offer: room.offer ? room.offer.state : null,
         })
       }
@@ -490,9 +491,20 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true })
       }
 
+      // POST /api/rooms/:id/ack —— 接收方确认收讫。ack 本身无法向服务器证明身份
+      // （零知识模型下服务器不持有密钥），但可附上密钥凭证 proof = SHA256(key‖label‖room)，
+      // 由发送方在 state 里取回后本地核对——无密钥者伪造的 ack 发送方一眼可辨。
       if (sub === 'ack' && req.method === 'POST') {
-        await readBody(req, 1024).catch(() => {})
+        const body = await readBody(req, 1024).catch(() => null)
+        let proof = null
+        if (body) {
+          try {
+            const j = JSON.parse(body.toString('utf8') || '{}')
+            if (typeof j.proof === 'string' && /^[0-9a-f]{64}$/.test(j.proof)) proof = j.proof
+          } catch { /* 无凭证 ack 兼容旧客户端 */ }
+        }
         room.acked = true
+        room.ackProof = proof
         room.lastActive = Date.now()
         return sendJson(res, 200, { ok: true })
       }

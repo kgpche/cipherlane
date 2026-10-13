@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
 const X25519 = require('../public/x25519.js')
+const SHA256 = require('../public/sha256.js')
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 
@@ -289,6 +290,34 @@ async function main() {
     assert.strictEqual(g3.status, 410)
     await jfetch(`/api/rooms/${cr.room}`, { method: 'DELETE', headers: { 'X-Room-Token': cr.token } })
     ok('并发拉取同一分片：先到 200 / 后来者 409 / 再来者 410 / 发送方 200')
+
+    // ---------- 9) ack 密钥凭证：双侧构造一致、state 透出、无凭证/非法凭证为 null ----------
+    {
+      const akey = randomBytes(32)
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      const ar = r.json
+      // 浏览器(纯 JS sha256.js)与 CLI(node:crypto)的 proof 构造必须逐字节一致
+      const label = Buffer.from('cipherlane/ack/v1|' + ar.room)
+      const proofNode = createHash('sha256').update(Buffer.concat([akey, label])).digest('hex')
+      const proofJs = Buffer.from(SHA256.hash(new Uint8Array(Buffer.concat([akey, label])))).toString('hex')
+      assert.strictEqual(proofNode, proofJs, '双侧 proof 构造不一致')
+      await jfetch(`/api/rooms/${ar.room}/ack`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proof: proofNode }),
+      })
+      assert.strictEqual((await jfetch(`/api/rooms/${ar.room}/state`)).json.ackProof, proofNode)
+      // 无凭证 ack（旧客户端兼容）与非法凭证 → 不透出
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      await jfetch(`/api/rooms/${r.json.room}/ack`, { method: 'POST' })
+      assert.strictEqual((await jfetch(`/api/rooms/${r.json.room}/state`)).json.ackProof, null)
+      r = await jfetch('/api/rooms', { method: 'POST' })
+      await jfetch(`/api/rooms/${r.json.room}/ack`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proof: 'zzz-not-hex' }),
+      })
+      assert.strictEqual((await jfetch(`/api/rooms/${r.json.room}/state`)).json.ackProof, null)
+      ok('ack 密钥凭证：双侧构造一致 / state 透出 / 无凭证与非法凭证为 null')
+    }
 
     console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {

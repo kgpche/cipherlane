@@ -160,6 +160,12 @@ async function main() {
     await navigate(c, sidA, S + '/')
     await navigate(c, sidB, S + '/')
 
+    // 公钥指纹：心跳拿到 IP 后,本机名片显示 8 位十六进制指纹(TOFU 人工比对锚点)
+    await waitFor(c, sidA,
+      `document.querySelector('#me-fp') && /^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim())`,
+      10000, '本机指纹显示')
+    ok('公钥指纹显示:本机名片 8 位十六进制')
+
     // ---------- 1) 链接模式文本全链路 ----------
     const secret = '浏览器 E2E 冒烟 ✅ 中文与 emoji 🚀 ' + randomBytes(8).toString('hex')
     await evalJs(c, sidA, `document.querySelector('#text').value = ${JSON.stringify(secret)}`)
@@ -171,7 +177,9 @@ async function main() {
     const got = await evalJs(c, sidB, textOf('#recv-text'))
     if (got !== secret) throw new Error(`文本不一致:\n  期望 ${JSON.stringify(secret)}\n  实际 ${JSON.stringify(got)}`)
     await waitFor(c, sidB, `document.querySelector('#recv-text-status').textContent.includes('已解密接收')`, 10000, '接收完成状态')
-    ok('链接模式文本全链路:发送 → #fragment 密钥链接 → 接收方逐字一致')
+    // ack 凭证闭环:接收方带 proof ack → 发送方轮询本地校验通过
+    await waitFor(c, sidA, `document.querySelector('#send-status').textContent.includes('凭证校验通过')`, 10000, '发送方凭证校验')
+    ok('链接模式文本全链路:发送 → 链接 → 逐字一致 → ack 凭证校验通过')
 
     // ---------- 2) 定向发送到离线设备:建立失败必须有退路(回归:曾死锁) ----------
     await navigate(c, sidA, S + '/')

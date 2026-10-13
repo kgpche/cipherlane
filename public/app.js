@@ -81,6 +81,17 @@ async function copyText(t) {
 // ---------- 几何头像（avatar.js，单色相 Bauhaus 构图） ----------
 const avatarSvg = (seed, size) => Avatar.svg(seed, size)
 
+// ---------- 公钥指纹（TOFU：首次使用即信任，此后变化即警示） ----------
+// SHA256 前 4 字节十六进制，供双方人工口头比对；指纹不匹配 = 有人调包了公钥
+function fpOf(pubB64) {
+  const h = SHA256.hash(fromB64(pubB64)).subarray(0, 4)
+  return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+const knownPubs = {
+  load() { try { return JSON.parse(store.get('cipherlane-pubs') || '{}') } catch { return {} } },
+  save(m) { store.set('cipherlane-pubs', JSON.stringify(m)) },
+}
+
 // ---------- 加密层（AES-GCM，双路径） ----------
 // 密钥按次传输经参数传递（不做全局状态：同页并发收发会互相污染对方的密钥）
 async function sealWith(rawKey, pt) {
@@ -158,6 +169,13 @@ const cryptoRPC = (() => {
 })()
 const sealRPC = (key, pt) => cryptoRPC('seal', key, pt)
 const unsealRPC = (key, packed) => cryptoRPC('unseal', key, packed)
+
+// ack 密钥凭证：SHA256(key ‖ 标签 ‖ 房间号)。无密钥者算不出、服务器只转存不验证，
+// 发送方取回后本地比对即可分辨伪造 ack（与 cli.mjs 的 node:crypto 构造逐字节一致）
+function ackProofOf(key, room) {
+  const bytes = concat(key, enc.encode('cipherlane/ack/v1|' + room))
+  return Array.from(SHA256.hash(bytes), (b) => b.toString(16).padStart(2, '0')).join('')
+}
 
 // ---------- API ----------
 async function api(path, opts) {
@@ -283,18 +301,27 @@ function renderDevices() {
   if (selectedIp && !others.some((d) => d.ip === selectedIp)) selectedIp = null
   const empty = $('#devices-empty')
   empty.hidden = others.length > 0
+  // 公钥变更检测（TOFU）：首见公钥记档；之后不一致则持续警示且不覆盖记录
+  const known = knownPubs.load()
+  let dirty = false
   for (const d of others) {
+    const changed = known[d.ip] && known[d.ip] !== d.pub
+    if (!changed && known[d.ip] !== d.pub) { known[d.ip] = d.pub; dirty = true }
     const card = document.createElement('button')
-    card.className = 'device' + (d.ip === selectedIp ? ' selected' : '')
-    card.innerHTML = `${avatarSvg(d.ip, 40)}<span class="d-name"></span><span class="d-ip"></span>`
+    card.className = 'device' + (d.ip === selectedIp ? ' selected' : '') + (changed ? ' fp-changed' : '')
+    card.innerHTML = `${avatarSvg(d.ip, 40)}<span class="d-name"></span><span class="d-ip"></span><span class="d-fp${changed ? ' warn' : ' dim'}"></span>`
     card.querySelector('.d-name').textContent = d.name || '未命名设备'
     card.querySelector('.d-ip').textContent = d.ip
+    const fpEl = card.querySelector('.d-fp')
+    fpEl.textContent = (changed ? '⚠ 公钥已变化 ' : '') + '#' + fpOf(d.pub)
+    fpEl.title = '公钥指纹（与对方页面显示的比对，防调包）'
     card.onclick = () => {
       selectedIp = selectedIp === d.ip ? null : d.ip
       renderDevices()
     }
     box.appendChild(card)
   }
+  if (dirty) knownPubs.save(known)
   updateModeHint()
 }
 
@@ -325,7 +352,7 @@ function renderIncoming() {
     card.className = 'offer'
     card.innerHTML = `${avatarSvg(o.from.ip || '?', 40)}
       <div class="o-body">
-        <div class="o-title"><b class="o-name"></b><span class="o-ip"></span></div>
+        <div class="o-title"><b class="o-name"></b><span class="o-ip"></span><span class="o-fp dim"></span></div>
         <div class="o-preview dim"></div>
         <div class="o-error err" hidden></div>
       </div>
@@ -335,6 +362,9 @@ function renderIncoming() {
       </div>`
     card.querySelector('.o-name').textContent = o.from.name || '未知设备'
     card.querySelector('.o-ip').textContent = ' @ ' + (o.from.ip || '?')
+    const oFp = card.querySelector('.o-fp')
+    oFp.textContent = '#' + fpOf(o.pub)
+    oFp.title = '发送方公钥指纹'
     card.querySelector('.o-preview').textContent = '正在解密预览…'
     const acceptBtn = card.querySelector('.o-accept')
     acceptBtn.disabled = true // 预览解密成功后才可接受
@@ -382,7 +412,7 @@ async function acceptOffer(o) {
     alert('接受失败：' + e.message)
     return
   }
-  const from = o.from || null
+  const from = o.from ? { ...o.from, fp: fpOf(o.pub) } : null
   receiveInto(o.room, o._key, from)
 }
 
@@ -559,7 +589,13 @@ async function startSend(kind, payload, target) {
         const r = await fetch(`/api/rooms/${room}/state`)
         if (r.status === 404) return finish(false, '❌ 传输已中断（房间过期或被回收）')
         const st = await r.json()
-        if (st.acked) return finish(true, target ? `✅ ${target.name || '对方'}已完整接收` : '✅ 对方已完整接收')
+        if (st.acked) {
+          const verified = st.ackProof && st.ackProof === ackProofOf(key, room)
+          const who = target ? target.name || '对方' : '对方'
+          return finish(true, verified
+            ? `✅ ${who}已完整接收（凭证校验通过）`
+            : `⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造，建议与对方口头确认`)
+        }
         if (st.receiverSeen && !st.acked)
           setStatus('send-status', '📡 传输中…', 'warn')
         const gotBytes = Math.max(0, Math.min(st.pulled - 1, dataChunks)) * CHUNK
@@ -635,9 +671,11 @@ async function receiveInto(room, key, fromInfo) {
   $('#recv-file-layout').hidden = true
   $('#recv-from').hidden = !fromInfo
   if (fromInfo) {
-    $('#recv-from').innerHTML = `来自 ${avatarSvg(fromInfo.ip || '?', 34)} <b class="rf-name"></b> <span class="dim rf-ip"></span>`
+    $('#recv-from').innerHTML = `来自 ${avatarSvg(fromInfo.ip || '?', 34)} <b class="rf-name"></b> <span class="dim rf-ip"></span>` + (fromInfo.fp ? ` <span class="dim rf-fp"></span>` : '')
     $('#recv-from').querySelector('.rf-name').textContent = fromInfo.name || '未知设备'
     $('#recv-from').querySelector('.rf-ip').textContent = '@ ' + (fromInfo.ip || '?')
+    const rfFp = $('#recv-from').querySelector('.rf-fp')
+    if (rfFp) { rfFp.textContent = '#' + fromInfo.fp; rfFp.title = '发送方公钥指纹' }
   }
 
   const ctl = new AbortController()
@@ -685,7 +723,7 @@ async function receiveText(room, key, ctl) {
       setTimeout(() => (copyBtn.textContent = '复制文本'), 1500)
     }
     setStatus('recv-text-status', '✅ 已解密接收', 'ok')
-    await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+    await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
   } catch (e) {
     if (!ctl.signal.aborted) setStatus('recv-text-status', '❌ ' + e.message, 'err')
   }
@@ -705,7 +743,7 @@ async function receiveFile(room, key, meta, ctl) {
   if (!meta.size && meta.count === 1) {
     saveEmpty(meta.name)
     setStatus('recv-file-status', '✅ 空文件已保存', 'ok')
-    await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+    await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
     return
   }
 
@@ -788,7 +826,7 @@ async function doReceiveFile(room, key, meta, signal) {
   }
   setBar('bar-recv', 1)
   setStatus('recv-file-status', `✅ 已保存 ${meta.name || 'received'}（${fmtBytes(meta.size)}）`, 'ok')
-  await fetch(`/api/rooms/${room}/ack`, { method: 'POST' }).catch(() => {})
+  await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
 }
 
 function saveEmpty(name) {
@@ -891,6 +929,8 @@ $('#me-avatar').innerHTML = Avatar.placeholder(36) // 中性占位，拿到真�
   if (my.ip) {
     $('#me-avatar').innerHTML = avatarSvg(my.ip, 36)
     $('#me-ip').textContent = my.ip
+    $('#me-fp').textContent = '#' + fpOf(toB64(identity.pk))
+    $('#me-fp').title = '本机公钥指纹（对方设备卡上显示的应与此一致）'
   }
 })()
 pollOffers()

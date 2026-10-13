@@ -280,3 +280,14 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 .hint code { color: var(--accent2); }
 
 footer { text-align: center; color: var(--dim); font-size: 0.78rem; padding: 18px; }
+
+/* 公钥指纹（TOFU 人工比对）：等宽小字，变更警示用 danger 色 */
+.fp, .d-fp, .o-fp, .rf-fp {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+}
+.device .d-fp { margin-left: auto; }
+.device .d-fp.warn, .device.fp-changed { color: var(--danger); }
+.device.fp-changed { border-color: var(--danger); }
+.o-title .o-fp { margin-left: 6px; }
