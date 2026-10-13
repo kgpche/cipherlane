@@ -235,7 +235,9 @@
   // ============ 对外 API ============
   function randomIV() {
     const iv = new Uint8Array(12)
-    globalThis.crypto.getRandomValues(iv)
+    if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(iv)
+    else if (typeof require === 'function') iv.set(require('node:crypto').randomBytes(12)) // Node 18 无全局 webcrypto
+    else throw new Error('无可用随机源')
     return iv
   }
 
