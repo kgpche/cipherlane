@@ -174,9 +174,13 @@ async function postChunk(room, token, bytes, signal) {
     return (await r.json()).index
   }
 }
+let chunkReqSeq = 0
 async function getChunk(room, i, signal) {
   for (;;) {
-    const r = await fetch(`/api/rooms/${room}/chunk?i=${i}`, { signal })
+    // 分片一次性消费：URL 带唯一序号 + cache:'no-store'，确保并发同序号请求
+    // 各自独立到达服务器（否则浏览器/代理可能合并 in-flight 请求，把同一份
+    // 响应发给两个等待者，绕过服务端的先到先得语义）
+    const r = await fetch(`/api/rooms/${room}/chunk?i=${i}&n=${chunkReqSeq++}`, { signal, cache: 'no-store' })
     if (r.status === 408) continue // 长轮询到期，立刻重试继续等
     if (r.status === 409) throw new Error('此链接正被另一个接收方使用')
     if (r.status === 404) throw new Error('链接无效或已过期')
