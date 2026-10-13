@@ -258,7 +258,9 @@ async function doSend({ type, name, size, readChunk }) {
     console.log('║  把下面的接收链接发给对方（浏览器打开即可）  ║')
     console.log('╚══════════════════════════════════════════╝\n')
     console.log('  ' + link + '\n')
-    const qr = QRCode.ascii(link) // 手机扫码直达；链接超长（>106B）返回 null 跳过
+    // 实测终端字符单元格比例（CSI 16t），按比例渲染近正方形模块；超长（>106B）返回 null 跳过
+    const ratio = await QRCode.measureCellRatio()
+    const qr = QRCode.asciiAdaptive(link, ratio)
     if (qr) console.log(qr + '  ↑ 手机扫码接收\n')
   }
 

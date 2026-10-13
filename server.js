@@ -532,7 +532,7 @@ setInterval(() => {
 }, 30 * 1000)
 
 // ---------- 启动 ----------
-server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, async () => {
   const ips = ['127.0.0.1']
   for (const list of Object.values(os.networkInterfaces())) {
     for (const ni of list || []) {
@@ -559,7 +559,9 @@ server.listen(PORT, HOST, () => {
       } catch {}
     }
     try {
-      const qr = qrMod && qrMod.ascii && qrMod.ascii(url)
+      // 实测终端字符单元格高宽比（CSI 16t），按比例渲染近正方形模块
+      const ratio = qrMod && qrMod.measureCellRatio ? await qrMod.measureCellRatio() : 2
+      const qr = qrMod && qrMod.asciiAdaptive && qrMod.asciiAdaptive(url, ratio)
       if (qr) console.log('\n' + qr + '  ↑ 手机扫码打开 ' + url)
     } catch { /* 二维码不可用时仅打印 URL */ }
     // 保底：终端字体几何不可控时，写一张像素级精确的 PNG 供看图工具扫码

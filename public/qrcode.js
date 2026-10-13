@@ -293,24 +293,47 @@
       `<g fill="${dark}">${dots}</g>${eyes}${alignEye}</svg>`
   }
 
-  // ascii(text) → 终端二维码：ANSI 白底黑码 + 全块双倍宽渲染。
-  // 每模块 = 横向 2 字符 × 纵向 1 行（终端行高≈2×字宽 → 模块近方形），
-  // 不依赖半块字形的精确性，各字体/行高下均稳定可扫。超长返回 null
-  function ascii(text) {
+  // asciiAdaptive(text, ratio) → 按终端字符单元格高宽比自适应的终端二维码。
+  // ratio = 单元格高/宽（CSI 16t 实测；假设 2.0 为多数终端标准）。
+  // 模块 = w_c 字符宽 × h_h 半行高，选取 (w_c, h_h) 使模块最接近正方形：
+  //   w_c × 字宽 ≈ (h_h/2) × 行高 ⇒ h_h ≈ 2·w_c/ratio
+  // ANSI 白底黑码保证极性与静区；半块字符获得半行粒度。超长返回 null
+  function asciiAdaptive(text, ratio = 2) {
     const qr = encode(text)
     if (!qr) return null
-    const q = 4 // 静区（扫码器要求 ≥4）
-    const n = qr.size + q * 2
-    const at = (r, c) => r >= q && c >= q && r < q + qr.size && c < q + qr.size && qr.modules[(r - q) * qr.size + (c - q)] === 1
+    ratio = Math.min(2.6, Math.max(0.9, ratio))
+    let wC = 2, hH = Math.round((2 * 2) / ratio)
+    for (let w = 2; w <= 8; w++) {
+      const h = Math.round((2 * w) / ratio)
+      if (h < 1) continue
+      if (Math.abs((2 * w) / ratio - h) <= 0.12) { wC = w; hH = h; break }
+    }
+    const S = qr.size, q = 4 // 静区
+    const cols = (S + 2 * q) * wC
+    const halfRows = (S + 2 * q) * hH
+    const modAt = (hr, cc) => {
+      const r = Math.floor((hr + 0.5) / hH) - q
+      const c = Math.floor((cc + 0.5) / wC) - q
+      return r >= 0 && c >= 0 && r < S && c < S && qr.modules[r * S + c] === 1
+    }
     const BG = '\x1b[48;5;231m' // 白底
     const FG = '\x1b[38;5;16m'  // 黑码
     let out = ''
-    for (let r = 0; r < n; r++) {
-      let line = BG + FG + '  '
-      for (let c = 0; c < n; c++) line += at(r, c) ? '██' : '  '
-      out += line + '  \x1b[0m\n'
+    for (let hr = 0; hr < halfRows; hr += 2) {
+      let line = BG + FG + ' '.repeat(wC)
+      for (let cc = 0; cc < cols; cc++) {
+        const top = modAt(hr, cc)
+        const bot = hr + 1 < halfRows ? modAt(hr + 1, cc) : false
+        line += top && bot ? '█' : top ? '▀' : bot ? '▄' : ' '
+      }
+      out += line + ' '.repeat(wC) + '\x1b[0m\n'
     }
     return out
+  }
+
+  // ascii(text) → 终端二维码（假设字符高宽比 2:1 的标准终端）
+  function ascii(text) {
+    return asciiAdaptive(text, 2)
   }
 
   // png(text, scale) → PNG Buffer（1-bit 灰度，像素级精确，仅 Node：惰性 require zlib）
@@ -378,7 +401,37 @@
     ])
   }
 
-  const api = { encode, svg, ascii, png, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
+  // measureCellRatio() → Promise<number>（仅 Node TTY）：CSI 16t 实测终端字符单元格
+  // 高宽比（像素），无响应/不支持时回落 2.0（多数终端标准）。120ms 超时。
+  function measureCellRatio() {
+    return new Promise((resolve) => {
+      const isNode = typeof process !== 'undefined' && process.versions && process.versions.node
+      if (!isNode || !process.stdout.isTTY || !process.stdin.isTTY) return resolve(2)
+      let done = false
+      const finish = (r) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        process.stdin.removeListener('data', on)
+        try { process.stdin.setRawMode(false) } catch {}
+        process.stdin.pause()
+        resolve(r)
+      }
+      const on = (d) => {
+        const m = /\x1b\[6;(\d+);(\d+)t/.exec(d.toString('latin1'))
+        if (m) finish(Math.min(2.6, Math.max(0.9, Number(m[1]) / Number(m[2]))))
+      }
+      const timer = setTimeout(() => finish(2), 120)
+      try {
+        process.stdin.setRawMode(true)
+        process.stdin.resume()
+        process.stdin.on('data', on)
+        process.stdout.write('\x1b[16t')
+      } catch { finish(2) }
+    })
+  }
+
+  const api = { encode, svg, ascii, asciiAdaptive, png, measureCellRatio, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   else global.QRCode = api
 })(typeof self !== 'undefined' ? self : globalThis)
