@@ -367,24 +367,39 @@ async function refreshDevices() {
   } catch {}
 }
 
+let deviceFilter = '' // 设备搜索:名称 / IP 子串,空 = 全部
+
 function renderDevices() {
+  const wrap = $('#devices-wrap')
   const box = $('#devices')
+  const scrollLeft = box.scrollLeft // 心跳刷新/选中重渲染不打断横滑位置
   box.innerHTML = ''
   // 按名称本地化排序(zh 拼序,中英混排稳定):首见顺序无规律,设备多了找不到了
   const collator = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' })
-  const others = deviceCache
-    .filter((d) => d.ip !== my.ip)
-    .sort((a, b) => collator.compare(a.name || '', b.name || '') || (a.ip < b.ip ? -1 : 1))
-  $('#devices-count').textContent = others.length ? `· ${others.length} 台在线` : ''
-  if (selectedIp && !others.some((d) => d.ip === selectedIp)) selectedIp = null
+  const all = deviceCache.filter((d) => d.ip !== my.ip)
+  const kw = deviceFilter.trim().toLowerCase()
+  const others = (kw
+    ? all.filter((d) => (d.name || '').toLowerCase().includes(kw) || d.ip.includes(kw))
+    : all
+  ).sort((a, b) => collator.compare(a.name || '', b.name || '') || (a.ip < b.ip ? -1 : 1))
+  // 搜索框只在设备多时出现(>6 台),少设备时它是噪音
+  $('#device-search').hidden = all.length <= 6
+  $('#devices-count').textContent = others.length
+    ? kw ? `· ${others.length}/${all.length} 台` : `· ${others.length} 台在线`
+    : ''
+  if (selectedIp && !all.some((d) => d.ip === selectedIp)) selectedIp = null
   const empty = $('#devices-empty')
-  empty.hidden = others.length > 0
-  // 公钥变更检测（TOFU）：首见公钥记档；之后不一致则持续警示且不覆盖记录
+  empty.hidden = all.length > 0 && others.length > 0
+  if (all.length > 0 && others.length === 0) empty.textContent = `没有匹配「${deviceFilter.trim()}」的设备`
+  else empty.textContent = '同一局域网的设备打开本页后会出现在这里；点击选中即可直发，无需传递链接。'
+  // 公钥变更检测（TOFU）：首见公钥记档（对全部设备，含被过滤的）；之后不一致则持续警示且不覆盖记录
   const known = knownPubs.load()
   let dirty = false
+  for (const d of all) {
+    if (!known[d.ip] || known[d.ip] === d.pub) { if (known[d.ip] !== d.pub) { known[d.ip] = d.pub; dirty = true } }
+  }
   for (const d of others) {
     const changed = known[d.ip] && known[d.ip] !== d.pub
-    if (!changed && known[d.ip] !== d.pub) { known[d.ip] = d.pub; dirty = true }
     const card = document.createElement('button')
     card.className = 'device' + (d.ip === selectedIp ? ' selected' : '') + (changed ? ' fp-changed' : '')
     card.innerHTML = `${avatarSvg(d.ip, 36)}<span class="d-name"></span><span class="d-sub${changed ? ' warn' : ''}"></span>`
@@ -410,8 +425,30 @@ function renderDevices() {
     box.appendChild(card)
   }
   if (dirty) knownPubs.save(known)
+  box.scrollLeft = scrollLeft
+  requestAnimationFrame(() => wrap.classList.toggle('scrollable', box.scrollWidth > box.clientWidth + 8))
   updateModeHint()
 }
+
+// 设备搜索:输入即过滤;回车选中(唯一/首个)匹配
+{
+  const input = $('#device-search')
+  input.oninput = () => { deviceFilter = input.value; renderDevices() }
+  input.onkeydown = (e) => {
+    if (e.key !== 'Enter') return
+    const kw = deviceFilter.trim().toLowerCase()
+    const hit = deviceCache.find((d) => d.ip !== my.ip && kw && (
+      (d.name || '').toLowerCase().includes(kw) || d.ip.includes(kw)))
+    if (hit) { selectedIp = hit.ip; renderDevices(); input.blur() }
+  }
+}
+// 桌面滚轮在该行上转横向滚动(触摸设备天然横滑,无需处理)
+$('#devices').addEventListener('wheel', (e) => {
+  const box = e.currentTarget
+  if (box.scrollWidth <= box.clientWidth) return
+  e.preventDefault()
+  box.scrollLeft += e.deltaY + e.deltaX
+}, { passive: false })
 
 function selectedDevice() {
   return deviceCache.find((d) => d.ip === selectedIp && d.ip !== my.ip) || null

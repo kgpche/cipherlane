@@ -101,25 +101,56 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 
 /* 在线设备网格 */
 .devices-title { margin: 6px 0 10px; }
+.devices-title { display: flex; align-items: center; gap: 10px; }
+#device-search {
+  flex: 1;
+  max-width: 220px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--fg);
+  font-size: 0.8rem;
+  padding: 5px 10px;
+  outline: none;
+}
+#device-search:focus { border-color: var(--accent); }
+.devices-wrap { position: relative; margin-bottom: 10px; }
+.devices-wrap::after { /* 右缘渐隐:提示可横滑 */
+  content: "";
+  position: absolute;
+  top: 0; right: -1px; bottom: 8px;
+  width: 34px;
+  background: linear-gradient(90deg, transparent, var(--card));
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.devices-wrap.scrollable::after { opacity: 1; }
 .devices {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  display: flex;
   gap: 10px;
-  margin-bottom: 10px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity;
+  padding-bottom: 6px; /* 给细滚动条留位 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
 }
 .device {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 10px 6px 8px;
+  padding: 10px 8px 8px;
   background: var(--bg);
   border: 2px solid var(--line);
   border-radius: 12px;
   cursor: pointer;
   color: var(--fg);
   transition: border-color 0.15s, background 0.15s;
-  min-width: 0;
+  flex: 0 0 auto;
+  width: 128px;
+  scroll-snap-align: start;
 }
 .device:hover { border-color: var(--accent); }
 .device.selected { border-color: var(--accent2); background: rgba(55, 212, 160, 0.08); }

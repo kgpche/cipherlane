@@ -36,8 +36,12 @@
       </div>
     </div>
 
-    <h2 class="devices-title">在线设备 <span id="devices-count" class="dim"></span></h2>
-    <div id="devices" class="devices"></div>
+    <h2 class="devices-title">在线设备 <span id="devices-count" class="dim"></span>
+      <input id="device-search" placeholder="搜索名称 / IP（回车选中）" hidden>
+    </h2>
+    <div id="devices-wrap" class="devices-wrap">
+      <div id="devices" class="devices"></div>
+    </div>
     <p id="devices-empty" class="hint">同一局域网的设备打开本页后会出现在这里；点击选中即可直发，无需传递链接。</p>
 
     <div id="drop" class="drop">
