@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -149,7 +149,7 @@ sh build/package.sh            # artifacts in build/dist/
 | `cipherlane_<v>_windows_x64.zip` | Windows x64 | Unzip and double-click `cipherlane.exe` (console shows address + QR code) |
 | `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | Unzip and double-click `cipherlane.command` (if Gatekeeper complains: right-click → Open) |
 
-Built on Node **SEA (single executable applications)**: the server and all frontend assets are embedded into official Node binaries per platform. Linux/Windows are true single files (125MB/87MB, 31MB/33MB compressed); macOS ships a dual-arch source bundle (75MB). The build script caches official binaries and postject, verifies downloads against SHASUMS256, and emits a `SHA256SUMS_<v>.txt` alongside the artifacts.
+Built on Node **SEA (single executable applications)**: the server and all frontend assets are embedded into official Node binaries per platform. Linux/Windows are true single files (125MB/87MB, 31MB/33MB compressed); macOS ships a dual-arch source bundle (75MB). The build script caches official binaries and postject, verifies downloads against SHASUMS256. **Naming convention**: artifacts are `cipherlane_<version>_<platform>.<format>`, checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; the startup banner and page footer both carry the version — quote it when reporting issues.
 
 Source deployment stays zero-dependency: `node server.js` (Node ≥ 18).
 
@@ -226,6 +226,11 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.4.1** (2026-10-15)
+- Device bar redesigned: wrapping grid → **single horizontal row + name/IP search** (search box appears above 6 devices, Enter selects the match) — with 15 devices the send area returns above the fold (measured 413px, down from ~1300px); desktop wheel scrolls horizontally on the row; heartbeat re-renders no longer reset scroll position; devices sorted by name (zh collation)
+- Fixes: fixed 128px card width clipped the fingerprint tail (now content-driven, zero clipping by pixel assertion); returning to the landing page after receiving didn't refresh (late offers now render, devices refresh immediately, the stale `#ROOM.KEY` fragment is cleared from the address bar)
+- Naming convention completed: checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; startup banner and page footer carry the version (package.json embedded into SEA so packaged binaries can read it)
 
 **v0.4.0** (2026-10-13)
 - Resume support (link mode; server stays zero-persistence, privacy model unchanged): chunks switch from consume-on-read to replayable — with `X-Resume` the room's GETs become read-only, and a new `POST /progress` endpoint frees buffers per the receiver's persisted position; backpressure window and memory bounds unchanged

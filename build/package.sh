@@ -134,15 +134,16 @@ rm -rf "$BUILD/macos-root"
 mkdir -p "$PKG/app"
 cp server.js package.json "$PKG/app/"
 cp -r public logo "$PKG/app/"
-cp "$BUILD/node-mac-a" "$PKG/node-arm64"
-cp "$BUILD/node-mac-x" "$PKG/node-x64"
-chmod +x "$PKG/node-arm64" "$PKG/node-x64"
+# 内层 Node 运行时带项目前缀:拖出文件夹也能认出归属
+cp "$BUILD/node-mac-a" "$PKG/cipherlane-node-arm64"
+cp "$BUILD/node-mac-x" "$PKG/cipherlane-node-x64"
+chmod +x "$PKG/cipherlane-node-arm64" "$PKG/cipherlane-node-x64"
 cat > "$PKG/cipherlane.command" << 'EOF'
 #!/bin/sh
 # 双击启动密道服务器（Terminal 中显示地址与二维码，Ctrl+C 退出）
 cd "$(dirname "$0")"
 ARCH=$(uname -m)
-if [ "$ARCH" = "arm64" ]; then NODE=./node-arm64; else NODE=./node-x64; fi
+if [ "$ARCH" = "arm64" ]; then NODE=./cipherlane-node-arm64; else NODE=./cipherlane-node-x64; fi
 exec "$NODE" app/server.js "$@"
 EOF
 chmod +x "$PKG/cipherlane.command"
@@ -164,5 +165,5 @@ tar czf "$DIST/cipherlane_${VER}_macos_universal.tar.gz" -C "$BUILD/macos-root" 
 echo
 echo "✓ 打包完成："
 # 发布校验和：随 Release 一起公布，供下载方验证完整性
-( cd "$DIST" && sha256sum cipherlane_* > SHA256SUMS_"${VER}".txt )
+( cd "$DIST" && sha256sum cipherlane_* > "cipherlane-${VER}-SHA256SUMS.txt" )
 ls -la "$DIST"

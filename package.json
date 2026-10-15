@@ -1,6 +1,6 @@
 {
   "name": "cipherlane",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "密道 · cipherlane —— 局域网端到端加密传输：设备直发（X25519）或链接收发，HTTP 明文环境下内容依然加密",
   "keywords": ["lan", "file-transfer", "e2e-encryption", "x25519", "aes-gcm", "airdrop", "p2p"],
   "author": "kgpche",

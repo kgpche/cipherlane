@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -148,7 +148,7 @@ sh build/package.sh            # 产物在 build/dist/
 | `cipherlane_<v>_windows_x64.zip` | Windows x64 | 解压后双击 `cipherlane.exe`（控制台显示地址与二维码） |
 | `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | 解压后双击 `cipherlane.command`（首次若被 Gatekeeper 拦截：右键→打开） |
 
-技术：Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进各平台官方 Node 二进制；Linux/Windows 为纯单文件（125MB/87MB，压缩后 31MB/33MB），macOS 为双架构源码包（75MB）。打包脚本自动缓存官方二进制与 postject 工具，下载经 SHASUMS256 校验；构建产物附带 `SHA256SUMS_<v>.txt`。
+技术：Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进各平台官方 Node 二进制；Linux/Windows 为纯单文件（125MB/87MB，压缩后 31MB/33MB），macOS 为双架构源码包（75MB）。打包脚本自动缓存官方二进制与 postject 工具，下载经 SHASUMS256 校验。**命名规范**：产物统一 `cipherlane_<版本>_<平台>.<格式>`，校验和为 `cipherlane-<版本>-SHA256SUMS.txt`，macOS 内层运行时为 `cipherlane-node-<架构>`；启动横幅与页面 footer 均带版本号，报问题时直接引用。
 
 纯源码部署仍然零依赖：`node server.js` 即可（Node ≥ 18）。
 
@@ -225,6 +225,16 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.4.1**（2026-10-15）
+- 设备栏重排：换行网格 → **单行横滑 + 名称/IP 搜索**（>6 台出现搜索框，回车选中
+  匹配设备）——15 台设备时发送区从 1300px 外回到首屏（实测 413px）；桌面滚轮
+  悬停转横滑，心跳重渲染不打断横滑位置；设备按名称本地化排序（zh 拼序）
+- 修复：卡片定宽 128px 裁掉指纹尾巴（改内容自适应，像素级断言零裁切）；
+  接收后返回首页不刷新（延迟邀请补画 + 设备即时刷新 + 地址栏残留接收链接清除）
+- 命名规范补全：校验和 `cipherlane-<版本>-SHA256SUMS.txt`、macOS 内层
+  `cipherlane-node-<架构>`；启动横幅与页面 footer 带版本号（SEA 内嵌
+  package.json，打包二进制可读）
 
 **v0.4.0**（2026-10-13）
 - 断点续传（链接模式，服务端零持久化，隐私模型不变）：

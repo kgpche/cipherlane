@@ -114,6 +114,13 @@ const sea = (() => {
   } catch { return null }
 })()
 const readAsset = (rel) => (sea ? Buffer.from(sea.getAsset(rel)) : fs.readFileSync(path.join(__dirname, rel)))
+// 版本号:SEA 从内嵌资产读,源码模式直接 require;供横幅与页面 footer 展示
+const VERSION = (() => {
+  try {
+    const raw = sea ? Buffer.from(sea.getAsset('package.json')).toString('utf8') : fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')
+    return JSON.parse(raw).version || '?'
+  } catch { return '?' }
+})()
 const CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; " +
   "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
@@ -133,7 +140,9 @@ for (const [route, file, type] of [
   ['/style.css', 'public/style.css', 'text/css; charset=utf-8'],
 ]) {
   try {
-    staticFiles.set(route, { data: readAsset(file), type })
+    let data = readAsset(file)
+    if (file === 'public/index.html') data = Buffer.from(data.toString('utf8').replaceAll('__VERSION__', VERSION))
+    staticFiles.set(route, { data, type })
   } catch { /* 文件缺失时该路由 500 */ }
 }
 
@@ -670,7 +679,7 @@ async function banner() {
     ? ['127.0.0.1', ...Object.values(os.networkInterfaces()).flatMap((l) => l || [])
         .filter((ni) => ni.family === 'IPv4' && !ni.internal).map((ni) => ni.address)]
     : listenAddrs
-  console.log('cipherlane · 密道 —— 局域网端到端加密传输')
+  console.log(`cipherlane · 密道 v${VERSION} —— 局域网端到端加密传输`)
   console.log('  服务器零知识：只中转密文，密钥永不离开收发双方的浏览器\n')
   for (const ip of ips) console.log(`  →  http://${ip}:${PORT}`)
   // 主局域网地址附带终端二维码，手机扫码即开

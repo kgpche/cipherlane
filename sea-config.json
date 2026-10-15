@@ -5,6 +5,7 @@
   "useSnapshot": false,
   "useCodeCache": false,
   "assets": {
+    "package.json": "package.json",
     "public/index.html": "public/index.html",
     "public/app.js": "public/app.js",
     "public/aesgcm.js": "public/aesgcm.js",
