@@ -362,6 +362,43 @@ async function main() {
       if (!(minI > doneAtKill)) throw new Error(`续传应从第 ${doneAtKill + 1} 片开始,实际首拉 i=${minI}`)
       fs.rmSync(rf, { force: true })
       ok(`断点续传:中途重导航 → IDB 记录 → 从第 ${minI} 片续传完成`)
+
+    // ---------- 10) 身份重置:应用内模态 —— 取消无副作用 / 确认换新且服务器同步 ----------
+    {
+      await navigate(c, sidA, S + '/')
+      await waitFor(c, sidA,
+        `/^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '重置前指纹')
+      const fp1 = await evalJs(c, sidA, `document.querySelector('#me-fp').textContent.trim()`)
+      const sk1 = await evalJs(c, sidA, `localStorage.getItem('cipherlane-sk')`)
+      // 取消路径:模态出现 → 取消 → 指纹/密钥不变;破坏性操作默认焦点在取消
+      await evalJs(c, sidA, `document.querySelector('#me-reset').click()`)
+      await waitFor(c, sidA, `!document.querySelector('#modal-mask').hidden`, 3000, '模态出现')
+      const focused = await evalJs(c, sidA, `document.activeElement.id`)
+      if (focused !== 'modal-cancel') throw new Error('破坏性操作默认焦点应在取消,实际: ' + focused)
+      await evalJs(c, sidA, `document.querySelector('#modal-cancel').click()`)
+      await waitFor(c, sidA, `document.querySelector('#modal-mask').hidden`, 3000, '模态关闭')
+      if (await evalJs(c, sidA, `document.querySelector('#me-fp').textContent.trim()`) !== fp1) {
+        throw new Error('取消不应改变指纹')
+      }
+      // 确认路径:重置 → reload → 指纹/密钥更换,服务器公钥同步
+      await evalJs(c, sidA, `document.querySelector('#me-reset').click()`)
+      await waitFor(c, sidA, `!document.querySelector('#modal-mask').hidden`, 3000, '模态再次出现')
+      await evalJs(c, sidA, `document.querySelector('#modal-ok').click()`)
+      await waitFor(c, sidA,
+        `document.readyState === 'complete' && document.querySelector('#me-fp') && /^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim()) && document.querySelector('#me-fp').textContent.trim() !== '${fp1}'`,
+        15000, 'reload 后新指纹')
+      const sk2 = await evalJs(c, sidA, `localStorage.getItem('cipherlane-sk')`)
+      if (sk2 === sk1) throw new Error('密钥未更换')
+      const pubPage = await evalJs(c, sidA, `toB64(identity.pk)`)
+      let synced = false
+      for (let i = 0; i < 40 && !synced; i++) {
+        const pubSrv = await evalJs(c, sidA, `(async () => (await (await fetch('/api/devices')).json()).devices[0]?.pub || '')()`)
+        if (pubSrv === pubPage) synced = true
+        else await sleep(250)
+      }
+      if (!synced) throw new Error('服务器公钥未同步为新身份')
+      ok('身份重置:模态取消无副作用 / 确认后指纹·密钥更换·服务器公钥同步')
+    }
     }
     }
 

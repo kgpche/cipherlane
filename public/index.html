@@ -119,6 +119,19 @@
   </section>
 </main>
 
+<!-- 应用内确认弹窗(替代原生 confirm:样式统一、破坏性操作默认焦点在取消、
+     嵌入式 webview 下原生 confirm 不可用的宿主也能用) -->
+<div id="modal-mask" class="modal-mask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title"></h3>
+    <p id="modal-body" class="dim"></p>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn">取消</button>
+      <button id="modal-ok" class="btn danger">确定</button>
+    </div>
+  </div>
+</div>
+
 <footer>
   <p>零依赖服务器 · X25519 设备直发 · 零知识中继 · 篡改即报错 · v__VERSION__</p>
 </footer>

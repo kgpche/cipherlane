@@ -293,6 +293,37 @@ const progressPost = (() => {
   }
 })()
 
+// ---------- 应用内确认弹窗(替代原生 confirm) ----------
+// 破坏性操作的默认焦点在"取消"(回车不会误确认),Esc/点遮罩 = 取消
+function uiConfirm({ title, body, okText = '确定', danger = false }) {
+  return new Promise((resolve) => {
+    const mask = $('#modal-mask')
+    const ok = $('#modal-ok')
+    const cancel = $('#modal-cancel')
+    $('#modal-title').textContent = title
+    $('#modal-body').textContent = body
+    ok.textContent = okText
+    ok.className = 'btn' + (danger ? ' danger' : ' primary')
+    mask.hidden = false
+    cancel.focus()
+    let done = false
+    const close = (v) => {
+      if (done) return
+      done = true
+      mask.hidden = true
+      ok.onclick = cancel.onclick = null
+      mask.onclick = null
+      document.removeEventListener('keydown', onKey)
+      resolve(v)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') close(false) }
+    ok.onclick = () => close(true)
+    cancel.onclick = () => close(false)
+    mask.onclick = (e) => { if (e.target === mask) close(false) }
+    document.addEventListener('keydown', onKey)
+  })
+}
+
 // ---------- 视图 ----------
 function showView(name) {
   for (const v of ['landing', 'send', 'recv']) $('#view-' + v).hidden = v !== name
@@ -945,7 +976,7 @@ async function doReceiveBatch(room, key, meta, signal) {
       dir = null // 手势过期等 → 内存模式兜底
     }
   }
-  if (!dir && (meta.size || 0) > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式目录保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
+  if (!dir && (meta.size || 0) > 512 * 1024 * 1024 && !(await uiConfirm({ title: '大文件接收', body: '此浏览器不支持流式目录保存，大文件将占用较多内存，确定继续？', okText: '继续' }))) return 'picker-dismissed'
 
   setStatus('recv-file-status', '📡 接收中…', 'warn')
   $('#fc-bar-wrap').hidden = false
@@ -1095,7 +1126,7 @@ async function doReceiveFile(room, key, meta, signal, rec) {
       }
     }
     if (!sink) {
-      if (meta.size > 512 * 1024 * 1024 && !confirm('此浏览器不支持流式保存，大文件将占用较多内存，继续？')) return 'picker-dismissed'
+      if (meta.size > 512 * 1024 * 1024 && !(await uiConfirm({ title: '大文件接收', body: '此浏览器不支持流式保存，大文件将占用较多内存，确定继续？', okText: '继续' }))) return 'picker-dismissed'
       sink = { mode: 'mem', parts: [] }
       done = 0
     }
@@ -1267,11 +1298,17 @@ document.addEventListener('paste', (e) => {
   }
   // 重置身份密钥：换新 X25519 身份（identity 是启动时读入的模块常量，重载页面生效最干净）。
   // 曾向你发过的设备会看到"⚠ 公钥已变化"——这正是 TOFU 在起作用
-  $('#me-reset').onclick = () => {
-    if (!confirm('重置身份密钥？你的公钥指纹将变化，向你要过文件的设备会看到"公钥已变化"警示。')) return
+  $('#me-reset').onclick = async () => {
+    const ok = await uiConfirm({
+      title: '重置身份密钥？',
+      body: '将生成新的 X25519 身份,旧公钥作废。曾向你发过文件的设备会看到"⚠ 公钥已变化"警示——这正是防调包机制在起作用,属预期行为。',
+      okText: '重置',
+      danger: true,
+    })
+    if (!ok) return
     const kp = X25519.genKey()
     store.set('cipherlane-sk', toB64(kp.sk))
-    location.reload()
+    location.reload() // identity 是启动时读入的模块常量,重载生效最干净
   }
 }
 
