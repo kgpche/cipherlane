@@ -219,6 +219,10 @@ async function main() {
     // ---------- 2) 定向发送到离线设备:建立失败必须有退路(回归:曾死锁) ----------
     await navigate(c, sidA, S + '/')
     await evalJs(c, sidA, `
+      // 桩掉心跳设备刷新:注入的幽灵设备若恰逢 5s 心跳,会被真实列表覆盖
+      // (selectedDevice 落空走"离线"分支,本场景等待的报错不出现)——CI 慢机上
+      // 曾因此 flake。后续场景不依赖真实设备列表。
+      refreshDevices = () => {}
       deviceCache.push({ ip: '10.99.0.5', id: 'ghost', name: '幽灵设备', pub: toB64(X25519.genKey().pk) })
       selectedIp = '10.99.0.5'
       renderDevices()`)
