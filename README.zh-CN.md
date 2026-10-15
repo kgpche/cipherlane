@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -225,6 +225,14 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.4.2**（2026-10-15）
+- 性能：内存模式断点记录与进度上报按 8 片（8MB）粒度对齐落盘。v0.4.0 逐片
+  重写整条 IDB 数组，耗时随片数线性增长（实测 100MB 时每片 116ms，1GB 外推
+  约十分钟，会反超加密耗时）；代价为崩溃后最多重拉 8MB。FSA 流式模式不受影响
+- 资源画像（200MB 回环实测存档）：中继吞吐 109 MB/s（近千兆线速），服务器
+  CPU 44%，空闲 RSS 76MB，传输峰值 202MB，房间回收后增量回落 43%（其余为
+  V8 堆延迟归还，无记账泄漏）
 
 **v0.4.1**（2026-10-15）
 - 设备栏重排：换行网格 → **单行横滑 + 名称/IP 搜索**（>6 台出现搜索框，回车选中

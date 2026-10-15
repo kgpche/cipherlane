@@ -1141,10 +1141,21 @@ async function doReceiveFile(room, key, meta, signal, rec) {
     const sp = speed(got)
     $('#recv-meta').textContent =
       `已接收 ${fmtBytes(got)} / ${fmtBytes(meta.size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
-    // 滞后一片提交(同 CLI):写完 j 片才声明 j 之前的都安全,留整片余量
-    progressPost(room, j - 1 > done ? j - 1 : done)
     done = j
-    if (sink.mode === 'mem') await saveRec() // FSA 模式句柄已存,无需逐片更新
+    if (sink.mode === 'mem') {
+      // 内存模式:断点记录与进度上报同粒度同节奏——每 8 片先把 parts 数组
+      // 落盘(IDB),成功后才把服务端进度推到该断点。保证 server.through 不
+      // 越过已持久化位置(否则重进房间会拉到已释放的分片→410)。整条数组
+      // 重写的耗时随片数线性增长(实测 100MB 每片 116ms),逐片写不值得;
+      // 代价为崩溃后最多重拉 8MB。
+      if (j % 8 === 0) {
+        await saveRec()
+        progressPost(room, j + 1)
+      }
+    } else {
+      // FSA 模式:write resolve 即入内核,断点无需落盘,保持滞后一片提交
+      progressPost(room, j - 1 > done ? j - 1 : done)
+    }
   }
 
   if (sink.mode === 'fs') {

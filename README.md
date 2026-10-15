@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -226,6 +226,10 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.4.2** (2026-10-15)
+- Performance: memory-mode checkpoint records and progress reports now flush together at 8-chunk (8MB) granularity. v0.4.0 rewrote the whole IDB array per chunk — cost grows linearly (measured 116ms/chunk at 100MB; ~10 minutes extrapolated for 1GB, overtaking crypto); the trade-off is re-pulling at most 8MB after a crash. FSA streaming mode is unaffected
+- Resource profile (200MB over loopback, archived): relay throughput 109 MB/s (near gigabit line rate), server CPU 44%, idle RSS 76MB, peak 202MB during transfer, 43% of the increment returned after room reclamation (the rest is V8 heap deferred return — no accounting leak)
 
 **v0.4.1** (2026-10-15)
 - Device bar redesigned: wrapping grid → **single horizontal row + name/IP search** (search box appears above 6 devices, Enter selects the match) — with 15 devices the send area returns above the fold (measured 413px, down from ~1300px); desktop wheel scrolls horizontally on the row; heartbeat re-renders no longer reset scroll position; devices sorted by name (zh collation)
