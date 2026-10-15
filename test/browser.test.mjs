@@ -89,6 +89,13 @@ async function waitFor(c, sid, expr, timeout = 20000, what = '') {
 }
 
 const textOf = (sel) => `document.querySelector('${sel}') ? document.querySelector('${sel}').textContent : null`
+// 全局不变量:所有带 hidden 的元素计算样式必须为 display:none。
+// 历史教训:自定义 display(flex/grid)会压过 UA 的 [hidden],曾致 6 处常显
+// (含模态遮罩全屏常驻、刷新即弹窗)——DOM 属性断言测不出,必须查计算样式。
+const hiddenInvariant = (c, sid) =>
+  evalJs(c, sid, `[...document.querySelectorAll('[hidden]')]
+    .filter((el) => getComputedStyle(el).display !== 'none')
+    .map((el) => el.id || el.className)`)
 
 // ---------- 启动:服务器 + 无头浏览器 ----------
 function launchServer() {
@@ -215,6 +222,10 @@ async function main() {
     await waitFor(c, sidB, `[...document.querySelectorAll('.o-name')].some((x) => x.textContent.includes('延迟到达的邀请'))`, 5000, '邀请卡')
     await evalJs(c, sidB, `incomingOffers.delete('fake01'); renderIncoming()`)
     ok('返回首页:hash 清理 + 设备立即刷新 + 延迟邀请补画(回归)')
+    {
+      const bad = await hiddenInvariant(c, sidB)
+      if (bad.length) throw new Error('hidden 属性被 display 覆盖: ' + bad.join(','))
+    }
 
     // ---------- 2) 定向发送到离线设备:建立失败必须有退路(回归:曾死锁) ----------
     await navigate(c, sidA, S + '/')
@@ -365,6 +376,10 @@ async function main() {
 
     // ---------- 10) 身份重置:应用内模态 —— 取消无副作用 / 确认换新且服务器同步 ----------
     {
+      // 冻结其他页面:sidB/sidC 与 sidA 同 IP(共享或轮换同一设备条目),其心跳
+      // 会在公钥同步断言窗口内与 sidA 的新公钥互相覆盖,造成竞态
+      await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidB).catch(() => {})
+      await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidC).catch(() => {})
       await navigate(c, sidA, S + '/')
       await waitFor(c, sidA,
         `/^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '重置前指纹')
@@ -377,6 +392,10 @@ async function main() {
       if (focused !== 'modal-cancel') throw new Error('破坏性操作默认焦点应在取消,实际: ' + focused)
       await evalJs(c, sidA, `document.querySelector('#modal-cancel').click()`)
       await waitFor(c, sidA, `document.querySelector('#modal-mask').hidden`, 3000, '模态关闭')
+      {
+        const bad = await hiddenInvariant(c, sidA)
+        if (bad.length) throw new Error('hidden 属性被 display 覆盖(取消后): ' + bad.join(','))
+      }
       if (await evalJs(c, sidA, `document.querySelector('#me-fp').textContent.trim()`) !== fp1) {
         throw new Error('取消不应改变指纹')
       }

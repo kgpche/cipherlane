@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -226,6 +226,10 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.4.3** (2026-10-15, hotfix)
+- Fixed: custom `display` (flex/grid) rules override the browser's default `[hidden]{display:none}`, silently defeating the hidden attribute. A full audit found 6 elements affected: the confirmation modal overlay added in v0.4.1 **popped up full-screen on every refresh** (empty title and body), plus 5 long-standing cases (send-target row / QR box / receive-from row / file card / action button groups) rendering as stray empty boxes. A one-line defensive reset `[hidden]{display:none!important}` fixes all of them
+- Test infrastructure lesson: hidden assertions previously checked the DOM property (which cannot catch this bug class); they now enforce a computed-style invariant (every [hidden] element must have display:none), applied in two scenarios; the identity-reset scenario freezes same-IP sibling pages to remove a device-entry race
 
 **v0.4.2** (2026-10-15)
 - Performance: memory-mode checkpoint records and progress reports now flush together at 8-chunk (8MB) granularity. v0.4.0 rewrote the whole IDB array per chunk — cost grows linearly (measured 116ms/chunk at 100MB; ~10 minutes extrapolated for 1GB, overtaking crypto); the trade-off is re-pulling at most 8MB after a crash. FSA streaming mode is unaffected

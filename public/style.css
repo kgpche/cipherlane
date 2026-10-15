@@ -12,6 +12,10 @@
   --radius: 14px;
 }
 * { box-sizing: border-box; }
+/* 防御性复位:任何自定义 display(flex/grid)都会压过 UA 的 [hidden]{display:none},
+   导致 hidden 属性失效(曾致 6 处元素常显/常隐错误,含模态遮罩全屏常驻)。
+   显示一律通过移除 hidden 实现,本守卫不影响任何正常显隐。 */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;

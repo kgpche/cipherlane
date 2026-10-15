@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.2-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -225,6 +225,16 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.4.3**（2026-10-15，热修）
+- 修复：自定义 `display`（flex/grid）会压过浏览器默认的 `[hidden]{display:none}`，
+  导致 hidden 属性失效——全局盘点共 6 处中招：v0.4.1 新增的确认弹窗遮罩
+  **每次刷新都全屏弹出**（空标题空正文），另有 5 处历史存量（发送目标行/
+  二维码区/接收来源行/文件卡/操作按钮组）以空盒子形式错显。加入
+  `[hidden]{display:none!important}` 防御性复位一行根治
+- 测试基建吸取教训：hidden 断言此前查 DOM 属性（测不出本类 bug），改为
+  **计算样式不变量**（所有 [hidden] 元素 display 必须为 none），两处场景落地；
+  身份重置场景冻结同 IP 兄弟页面消除设备条目竞态
 
 **v0.4.2**（2026-10-15）
 - 性能：内存模式断点记录与进度上报按 8 片（8MB）粒度对齐落盘。v0.4.0 逐片
