@@ -196,7 +196,25 @@ async function main() {
     await waitFor(c, sidB, `document.querySelector('#recv-text-status').textContent.includes('已解密接收')`, 10000, '接收完成状态')
     // ack 凭证闭环:接收方带 proof ack → 发送方轮询本地校验通过
     await waitFor(c, sidA, `document.querySelector('#send-status').textContent.includes('凭证校验通过')`, 10000, '发送方凭证校验')
-    ok('链接模式文本全链路:发送 → 链接 → 逐字一致 → ack 凭证校验通过')
+
+    // ---------- 1b) 返回首页:hash 清理 + 延迟邀请补画(回归:曾不刷新/不补画) ----------
+    await evalJs(c, sidB, `document.querySelector('#recv-text-back').click()`)
+    await waitFor(c, sidB, `!document.querySelector('#view-landing').hidden`, 5000, '返回首页')
+    const hashNow = await evalJs(c, sidB, `location.hash`)
+    if (hashNow !== '') throw new Error('返回后地址栏 hash 未清除: ' + hashNow)
+    // 模拟一条在接收视图期间到达的邀请:注入后经 showView 往返,应被补画
+    await evalJs(c, sidB, `(async () => {
+      const kp = X25519.genKey()
+      const key = X25519.sessionKey(X25519.dh(identity.sk, kp.pk), kp.pk, identity.pk, 'Ab3xYz9kLm')
+      const hint = toB64(await sealWith(key, enc.encode(JSON.stringify({ kind: 'text', size: 12 }))))
+      incomingOffers.set('fake01', { id: 'fake01', room: 'Ab3xYz9kLm', pub: toB64(kp.pk), hint, from: { ip: '192.168.137.9', name: '延迟到达的邀请' } })
+      showView('recv')
+      showView('landing')
+    })()`)
+    await waitFor(c, sidB, `!document.querySelector('#incoming-wrap').hidden`, 5000, '延迟邀请区域可见')
+    await waitFor(c, sidB, `[...document.querySelectorAll('.o-name')].some((x) => x.textContent.includes('延迟到达的邀请'))`, 5000, '邀请卡')
+    await evalJs(c, sidB, `incomingOffers.delete('fake01'); renderIncoming()`)
+    ok('返回首页:hash 清理 + 设备立即刷新 + 延迟邀请补画(回归)')
 
     // ---------- 2) 定向发送到离线设备:建立失败必须有退路(回归:曾死锁) ----------
     await navigate(c, sidA, S + '/')

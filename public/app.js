@@ -296,6 +296,14 @@ const progressPost = (() => {
 // ---------- 视图 ----------
 function showView(name) {
   for (const v of ['landing', 'send', 'recv']) $('#view-' + v).hidden = v !== name
+  if (name === 'landing') {
+    // 清掉残留的接收链接(#ROOM.KEY):避免复制地址栏带出过期链接;replaceState 不触发 hashchange
+    if (location.hash.length > 1) history.replaceState(null, '', location.pathname)
+    // 立即刷新设备列表(不等 5s 心跳);补画收发期间到达的邀请
+    // (pollOffers 在非首页时有意跳过渲染,返回时在此补上)
+    refreshDevices()
+    renderIncoming()
+  }
 }
 const setBar = (id, pct) => { $('#' + id).style.width = Math.min(100, pct * 100).toFixed(1) + '%' }
 const setStatus = (id, text, cls) => {
