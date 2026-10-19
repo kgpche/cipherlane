@@ -307,37 +307,62 @@
     return out
   }
 
-  // GHASH(H, C)（无 AAD；长度块按比特数）——8-bit 窗口表
-  function ghash(ct, tables) {
-    _y.fill(0)
-    const blocks = Math.ceil(ct.length / 16)
+  // GHASH 累加一个数据段（按 16B 分块、末块补零）；AAD 与密文共用
+  function ghashUpdate(data, tables) {
+    const blocks = Math.ceil(data.length / 16)
     for (let b = 0; b < blocks; b++) {
       const off = b * 16
-      const len = Math.min(16, ct.length - off)
+      const len = Math.min(16, data.length - off)
       _x.fill(0)
-      _x.set(ct.subarray(off, off + len))
+      _x.set(data.subarray(off, off + len))
       for (let k = 0; k < 16; k++) _y[k] ^= _x[k]
       gfMulT8(_y, tables, _y)
     }
-    // 长度块：[0^64 | bitlen(C)]，bitlen < 2^53 安全
+  }
+
+  // 64 位大端比特长度写入（byteLen < 2^53，分高低 32 位）
+  function writeBitLen(buf, off, byteLen) {
+    const hi = Math.floor(byteLen / 536870912) // (byteLen*8) >>> 32
+    const lo = (byteLen % 536870912) * 8
+    buf[off] = (hi >>> 24) & 0xff
+    buf[off + 1] = (hi >>> 16) & 0xff
+    buf[off + 2] = (hi >>> 8) & 0xff
+    buf[off + 3] = hi & 0xff
+    buf[off + 4] = (lo >>> 24) & 0xff
+    buf[off + 5] = (lo >>> 16) & 0xff
+    buf[off + 6] = (lo >>> 8) & 0xff
+    buf[off + 7] = lo & 0xff
+  }
+
+  // GHASH(H, A, C)：GCM 规范，AAD 先于密文，长度块 [len(A)|len(C)]（比特）。
+  // 无 AAD（空 aad）时输出与旧实现逐字节一致（等价于零长度 AAD）。
+  function ghash(aad, ct, tables) {
+    _y.fill(0)
+    ghashUpdate(aad, tables)
+    ghashUpdate(ct, tables)
     _x.fill(0)
-    let v = ct.length * 8
-    for (let k = 15; k >= 8; k--) {
-      _x[k] = v & 0xff
-      v = Math.floor(v / 256)
-    }
+    writeBitLen(_x, 0, aad.length)
+    writeBitLen(_x, 8, ct.length)
     for (let k = 0; k < 16; k++) _y[k] ^= _x[k]
     gfMulT8(_y, tables, _y)
     return Uint8Array.from(_y)
   }
 
-  function gcmTag(rk32, tables, iv, ct) {
+  function gcmTag(rk32, tables, iv, aad, ct) {
     _j0.set(iv); _j0[12] = 0; _j0[13] = 0; _j0[14] = 0; _j0[15] = 1
     encryptBlockT(rk32, _j0, _mask) // E(K, J0)：标签掩码
-    const S = ghash(ct, tables)
+    const S = ghash(aad, ct, tables)
     const tag = new Uint8Array(16)
     for (let k = 0; k < 16; k++) tag[k] = _mask[k] ^ S[k]
     return tag
+  }
+
+  // AAD 归一化：undefined/null → 空（与旧无 AAD 行为逐字节一致）
+  const EMPTY = new Uint8Array(0)
+  function normAad(aad) {
+    if (aad == null) return EMPTY
+    if (!(aad instanceof Uint8Array)) throw new Error('aad 必须是 Uint8Array')
+    return aad
   }
 
   // ============ 对外 API ============
@@ -349,29 +374,31 @@
     return iv
   }
 
-  // encrypt(key, iv, pt) → { ct, tag }（与 node aes-256-gcm 逐字节一致）
-  function encrypt(key, iv, pt) {
+  // encrypt(key, iv, pt, aad?) → { ct, tag }（与 node aes-256-gcm + setAAD 逐字节一致）
+  function encrypt(key, iv, pt, aad) {
     if (!(iv instanceof Uint8Array) || iv.length !== 12) throw new Error('iv 必须是 12 字节')
+    const A = normAad(aad)
     const { rk32, tables } = keyCache(key)
     const ct = ctrXor(rk32, iv, pt)
-    const tag = gcmTag(rk32, tables, iv, ct)
+    const tag = gcmTag(rk32, tables, iv, A, ct)
     return { ct, tag }
   }
 
-  // decrypt(key, iv, ct, tag) → pt；验签失败抛错
-  function decrypt(key, iv, ct, tag) {
+  // decrypt(key, iv, ct, tag, aad?) → pt；验签失败抛错（先验签后解密）
+  function decrypt(key, iv, ct, tag, aad) {
+    const A = normAad(aad)
     const { rk32, tables } = keyCache(key)
-    const calc = gcmTag(rk32, tables, iv, ct)
+    const calc = gcmTag(rk32, tables, iv, A, ct)
     let diff = 0
     for (let k = 0; k < 16; k++) diff |= calc[k] ^ tag[k]
     if (diff !== 0) throw new Error('GCM 验证失败：密钥错误或数据被篡改')
     return ctrXor(rk32, iv, ct)
   }
 
-  // seal(key, pt, iv?) → iv || ct || tag
-  function seal(key, pt, iv) {
-    iv = iv || randomIV()
-    const { ct, tag } = encrypt(key, iv, pt)
+  // seal(key, pt, aad?) → iv || ct || tag
+  function seal(key, pt, aad) {
+    const iv = randomIV()
+    const { ct, tag } = encrypt(key, iv, pt, aad)
     const out = new Uint8Array(12 + ct.length + 16)
     out.set(iv, 0)
     out.set(ct, 12)
@@ -379,13 +406,13 @@
     return out
   }
 
-  // open(key, packed) → pt
-  function open(key, packed) {
+  // open(key, packed, aad?) → pt
+  function open(key, packed, aad) {
     if (!(packed instanceof Uint8Array) || packed.length < 28) throw new Error('数据不完整')
     const iv = packed.subarray(0, 12)
     const ct = packed.subarray(12, packed.length - 16)
     const tag = packed.subarray(packed.length - 16)
-    return decrypt(key, iv, ct, tag)
+    return decrypt(key, iv, ct, tag, aad)
   }
 
   const api = { seal, open, encrypt, decrypt, expandKey256, encryptBlock, encryptBlockT, keyCache, _test: { SBOX, gfMulRef, mulX, buildTables, gfMulT, buildTables8, gfMulT8, TE0 } }

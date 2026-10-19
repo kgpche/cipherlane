@@ -89,35 +89,54 @@ function hasUserGesture() {
 const avatarSvg = (seed, size) => Avatar.svg(seed, size)
 
 // ---------- 公钥指纹（TOFU：首次使用即信任，此后变化即警示） ----------
-// SHA256 前 4 字节十六进制，供双方人工口头比对；指纹不匹配 = 有人调包了公钥
+// SHA256 前 16 字节（128bit / 32 hex）十六进制，供双方人工口头比对；指纹不匹配 = 有人调包了公钥
 function fpOf(pubB64) {
-  const h = SHA256.hash(fromB64(pubB64)).subarray(0, 4)
+  const h = SHA256.hash(fromB64(pubB64)).subarray(0, 16)
   return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 const knownPubs = {
   load() { try { return JSON.parse(store.get('cipherlane-pubs') || '{}') } catch { return {} } },
   save(m) { store.set('cipherlane-pubs', JSON.stringify(m)) },
 }
+// TOFU 记录：首次见即记录；已记录时返回是否与本次公钥一致（不覆盖旧记录）
+function seenPub(ip, pubB64) {
+  const known = knownPubs.load()
+  if (!known[ip]) {
+    known[ip] = pubB64
+    knownPubs.save(known)
+    return true
+  }
+  return known[ip] === pubB64
+}
+
+// ---------- 分片位置绑定（协议 v2）：AAD = UTF-8("cipherlane/chunk/v2|" + room + "|" + index) ----------
+// 与 cli.mjs 的构造必须逐字节一致；index 十进制无补零。旧发送端（meta.v=1）不带 AAD。
+function chunkAAD(room, index) {
+  return enc.encode('cipherlane/chunk/v2|' + room + '|' + index)
+}
 
 // ---------- 加密层（AES-GCM，双路径） ----------
 // 密钥按次传输经参数传递（不做全局状态：同页并发收发会互相污染对方的密钥）
-async function sealWith(rawKey, pt) {
+async function sealWith(rawKey, pt, aad) {
   if (subtle) {
     const k = await subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
     const iv = crypto.getRandomValues(new Uint8Array(12))
-    const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, k, pt))
+    const params = { name: 'AES-GCM', iv }
+    if (aad) params.additionalData = aad
+    const ct = new Uint8Array(await subtle.encrypt(params, k, pt))
     return concat(iv, ct)
   }
-  return AESGCM.seal(rawKey, pt)
+  return AESGCM.seal(rawKey, pt, aad)
 }
-async function unsealWith(rawKey, packed) {
+async function unsealWith(rawKey, packed, aad) {
   if (subtle) {
     const k = await subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
     const iv = packed.subarray(0, 12)
     const ct = packed.subarray(12)
-    return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv }, k, ct))
+    const params = { name: 'AES-GCM', iv, ...(aad ? { additionalData: aad } : {}) }
+    return new Uint8Array(await subtle.decrypt(params, k, ct))
   }
-  return AESGCM.open(rawKey, packed)
+  return AESGCM.open(rawKey, packed, aad)
 }
 // ---------- 加密 RPC：分片加解密走 Worker 池（不卡进度条、多核并行），不可用/崩溃回退主线程 ----------
 const cryptoRPC = (() => {
@@ -154,18 +173,22 @@ const cryptoRPC = (() => {
     } catch { pool = [] }
     return pool
   }
-  async function call(op, key, data) {
+  async function call(op, key, data, aad) {
     const ws = ensure()
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
-    const fallback = () => (op === 'seal' ? sealWith(key, bytes) : unsealWith(key, bytes))
+    const fallback = () => (op === 'seal' ? sealWith(key, bytes, aad) : unsealWith(key, bytes, aad))
     if (!ws.length) return fallback()
     const w = ws[next++ % ws.length] // 轮转分发：各分片相互独立，无需保序
+    // aad 以 ArrayBuffer 传给 worker（可能为 null）；构造器输入保证视图覆盖整个 buffer
+    const aadBuf = aad
+      ? (aad.byteOffset === 0 && aad.byteLength === aad.buffer.byteLength ? aad.buffer : aad.slice().buffer)
+      : null
     try {
       return await new Promise((resolve, reject) => {
         const id = ++seq
         pending.set(id, { resolve, reject })
         // 输入不 transfer（保留主线程副本供回退），输出由 worker 零拷贝回传
-        w.postMessage({ id, op, key, data: bytes })
+        w.postMessage({ id, op, key, data: bytes, aad: aadBuf })
       })
     } catch (e) {
       if (pool !== null && pool.length === 0) return fallback() // 池已退役（onerror 已重置 pool）
@@ -174,8 +197,8 @@ const cryptoRPC = (() => {
   }
   return call
 })()
-const sealRPC = (key, pt) => cryptoRPC('seal', key, pt)
-const unsealRPC = (key, packed) => cryptoRPC('unseal', key, packed)
+const sealRPC = (key, pt, aad) => cryptoRPC('seal', key, pt, aad)
+const unsealRPC = (key, packed, aad) => cryptoRPC('unseal', key, packed, aad)
 
 // ack 密钥凭证：SHA256(key ‖ 标签 ‖ 房间号)。无密钥者算不出、服务器只转存不验证，
 // 发送方取回后本地比对即可分辨伪造 ack（与 cli.mjs 的 node:crypto 构造逐字节一致）
@@ -525,6 +548,7 @@ function renderIncoming() {
       <div class="o-body">
         <div class="o-title"><b class="o-name"></b><span class="o-ip"></span><span class="o-fp dim"></span></div>
         <div class="o-preview dim"></div>
+        <div class="o-fp-warn err" hidden></div>
         <div class="o-error err" hidden></div>
       </div>
       <div class="o-actions">
@@ -553,6 +577,15 @@ async function previewOffer(o, card) {
     const key = X25519.sessionKey(X25519.dh(identity.sk, theirPub), theirPub, identity.pk, o.room)
     const info = JSON.parse(dec.decode(await unsealWith(key, fromB64(o.hint))))
     o._key = key
+    // TOFU：首次见记录；与记录不一致则持续警示，且接受前必须二次确认
+    const same = seenPub(o.from.ip, o.pub)
+    o._fpChanged = !same
+    if (!same) {
+      const warn = card.querySelector('.o-fp-warn')
+      warn.hidden = false
+      warn.textContent = '⚠ 发送方公钥已变化（此前记录的公钥不同），可能有人调包'
+      card.classList.add('fp-changed')
+    }
     const p = card.querySelector('.o-preview')
     p.textContent = info.kind === 'text'
       ? '📝 一段文本 · ' + fmtBytes(info.size || 0)
@@ -576,6 +609,16 @@ async function rejectOffer(o) {
 
 async function acceptOffer(o) {
   if (!o._key) return
+  // TOFU：发送方公钥与此前记录不一致时，接受前必须二次确认（防服务器调包公钥）
+  if (o._fpChanged) {
+    const go = await uiConfirm({
+      title: '⚠ 发送方公钥已变化',
+      body: '该设备此前记录的公钥与本次邀请不同。可能是对方重置了身份密钥，也可能是有人在调包公钥（中间人）。请先与对方当面/口头核对指纹，确认无误后再继续。',
+      okText: '我已核对，仍要接收',
+      danger: true,
+    })
+    if (!go) return
+  }
   // 先锁定邀请，避免双击重复接受
   incomingOffers.delete(o.id)
   renderIncoming()
@@ -662,6 +705,21 @@ async function startSend(kind, payload, target) {
   if (kind === 'batch' && payload.length > FILES_MAX) {
     alert(`文件数超过上限 ${FILES_MAX}（当前 ${payload.length}），请分批发送`)
     return
+  }
+  // TOFU（设备直发）：目标公钥与此前记录不一致时，投递前必须二次确认（防服务器调包公钥）
+  if (target) {
+    const known = knownPubs.load()
+    if (known[target.ip] && known[target.ip] !== target.pub) {
+      const go = await uiConfirm({
+        title: '⚠ 目标设备公钥已变化',
+        body: `设备 ${target.ip} 此前记录的公钥与当前不同。可能是对方重置了身份密钥，也可能是有人在调包公钥（中间人）。请先与对方当面/口头核对指纹 #${fpOf(target.pub)}，确认无误后再发送。`,
+        okText: '我已核对，仍要发送',
+        danger: true,
+      })
+      if (!go) return
+    } else if (!known[target.ip]) {
+      seenPub(target.ip, target.pub)
+    }
   }
   showView('send')
   const isText = kind === 'text'
@@ -814,22 +872,23 @@ async function startSend(kind, payload, target) {
   }
 
   try {
-    // 0 号分片：加密元信息（文件名也加密）
+    // 0 号分片：加密元信息（文件名也加密）；协议 v2：每片用 room+index 的 AAD 绑定位置
     const meta = isBatch
-      ? { v: 1, type: 'batch', files: manifest, count, size }
-      : { v: 1, type: isText ? 'text' : 'file', name, mime, size, count }
-    await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta))), ctl.signal)
+      ? { v: 2, type: 'batch', files: manifest, count, size }
+      : { v: 2, type: isText ? 'text' : 'file', name, mime, size, count }
+    await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta)), chunkAAD(room, 0)), ctl.signal)
 
     // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
     const speed = makeSpeed()
     if (isBatch) {
       let sent = 0
+      let ci = 1 // 全局分片序号（跨文件连续，与接收端 idx 对齐）
       for (let f = 0; f < payload.length; f++) {
         const { file, rel } = payload[f]
         const n = manifest[f].count
         for (let i = 0; i < n; i++) {
           const pt = new Uint8Array(await file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size)).arrayBuffer())
-          await postChunk(room, token, await sealRPC(key, pt), ctl.signal)
+          await postChunk(room, token, await sealRPC(key, pt, chunkAAD(room, ci++)), ctl.signal)
           sent += pt.length
           setBar('bar-sent', size ? sent / size : 1)
           const sp = speed(sent)
@@ -839,17 +898,18 @@ async function startSend(kind, payload, target) {
       }
       if (size === 0) setBar('bar-sent', 1)
     } else if (isText) {
-      await postChunk(room, token, await sealRPC(key, enc.encode(payload)), ctl.signal)
+      await postChunk(room, token, await sealRPC(key, enc.encode(payload), chunkAAD(room, 1)), ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
     } else {
       let off = 0
       let nextEnc = null
       while (off < size) {
-        const encThis = nextEnc || sealRPC(key, new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()))
+        const idx = off / CHUNK + 1 // 本片全局序号（0 号是 meta）
+        const encThis = nextEnc || sealRPC(key, new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()), chunkAAD(room, idx))
         const nextOff = off + CHUNK
         nextEnc = nextOff < size
-          ? sealRPC(key, new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()))
+          ? sealRPC(key, new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()), chunkAAD(room, idx + 1))
           : null
         await postChunk(room, token, await encThis, ctl.signal)
         off = Math.min(nextOff, size)
@@ -889,11 +949,17 @@ async function receiveInto(room, key, fromInfo, fromLink = false) {
   $('#recv-text-back').onclick = back
   $('#recv-file-back').onclick = back
 
-  let meta
+  let meta, useAAD
   try {
-    // 0 号分片 = 加密元信息
+    // 0 号分片 = 加密元信息。协议 v2 先按 AAD 解，失败回退 v1（旧发送端/旧夹具）
     const packed = await getChunk(room, 0, ctl.signal)
-    meta = JSON.parse(dec.decode(await unsealWith(key, packed)))
+    let pt0
+    try {
+      pt0 = await unsealWith(key, packed, chunkAAD(room, 0))
+    } catch {
+      pt0 = await unsealWith(key, packed)
+    }
+    meta = JSON.parse(dec.decode(pt0))
   } catch (e) {
     if (ctl.signal.aborted) return
     $('#recv-title').textContent = '📥 接收'
@@ -901,16 +967,18 @@ async function receiveInto(room, key, fromInfo, fromLink = false) {
     setStatus('recv-file-status', '❌ ' + e.message, 'err')
     return
   }
+  // 后续分片路径由 meta.v 决定：v2 必须带 AAD；v1（旧发送端）走无 AAD 旧路径
+  useAAD = meta.v === 2
 
-  if (meta.type === 'text') return receiveText(room, key, ctl)
-  if (meta.type === 'batch') return receiveBatch(room, key, meta, ctl)
+  if (meta.type === 'text') return receiveText(room, key, meta, ctl, useAAD)
+  if (meta.type === 'batch') return receiveBatch(room, key, meta, ctl, useAAD)
   // 断点续传仅链接模式(设备直发的会话密钥不落盘);fromLink 由入口传入
   const rec = fromLink ? await resumeDB.get(room) : null
-  return receiveFile(room, key, meta, ctl, rec)
+  return receiveFile(room, key, meta, ctl, rec, useAAD)
 }
 
 // 文本：解密即呈现，无进度条无保存动作
-async function receiveText(room, key, ctl) {
+async function receiveText(room, key, meta, ctl, useAAD) {
   $('#recv-title').textContent = '📥 接收文本'
   $('#recv-text-layout').hidden = false
   setStatus('recv-text-status', '🟡 正在解密…', 'warn')
@@ -918,7 +986,10 @@ async function receiveText(room, key, ctl) {
   $('#recv-text-meta').hidden = true
   $('#recv-copy').hidden = true
   try {
-    const pt = dec.decode(await unsealRPC(key, await getChunk(room, 1, ctl.signal)))
+    const ptBytes = await unsealRPC(key, await getChunk(room, 1, ctl.signal), useAAD ? chunkAAD(room, 1) : null)
+    // 完整性：明文长度必须与 meta.size 一致，否则不展示、不 ack
+    if (ptBytes.length !== meta.size) throw new Error(`完整性校验失败：文本长度 ${ptBytes.length} ≠ ${meta.size}`)
+    const pt = dec.decode(ptBytes)
     $('#recv-text').hidden = false
     $('#recv-text').textContent = pt
     $('#recv-text-meta').hidden = false
@@ -946,7 +1017,7 @@ function safeSeg(seg) {
 }
 
 // 批量接收:manifest 顺序拉流,逐文件写入目录(Chromium 流式)/内存模式逐个下载
-async function receiveBatch(room, key, meta, ctl) {
+async function receiveBatch(room, key, meta, ctl, useAAD) {
   $('#recv-title').textContent = '📥 接收批量文件'
   $('#recv-file-layout').hidden = false
   $('#recv-filecard').hidden = false
@@ -956,7 +1027,7 @@ async function receiveBatch(room, key, meta, ctl) {
   $('#recv-meta').textContent = ''
   $('#recv-actions').hidden = true
 
-  const start = () => doReceiveBatch(room, key, meta, ctl.signal).then((r) => {
+  const start = () => doReceiveBatch(room, key, meta, ctl.signal, useAAD).then((r) => {
     if (r === 'picker-dismissed') {
       $('#recv-actions').hidden = false
       setStatus('recv-file-status', '🟢 已就绪，点击接收并保存', 'ok')
@@ -968,7 +1039,7 @@ async function receiveBatch(room, key, meta, ctl) {
   start()
 }
 
-async function doReceiveBatch(room, key, meta, signal) {
+async function doReceiveBatch(room, key, meta, signal, useAAD) {
   const hasGesture = hasUserGesture()
   // 目录选择器:有新鲜手势的 Chromium 流式落盘;否则内存模式完成后逐个下载
   let dir = null
@@ -981,6 +1052,10 @@ async function doReceiveBatch(room, key, meta, signal) {
     }
   }
   if (!dir && (meta.size || 0) > 512 * 1024 * 1024 && !(await uiConfirm({ title: '大文件接收', body: '此浏览器不支持流式目录保存，大文件将占用较多内存，确定继续？', okText: '继续' }))) return 'picker-dismissed'
+
+  // manifest 自洽性：各文件大小之和必须等于 meta.size（完整性校验前置）
+  const manifestSum = (meta.files || []).reduce((n, f) => n + (f.size || 0), 0)
+  if (manifestSum !== (meta.size || 0)) throw new Error(`完整性校验失败：manifest 总大小 ${manifestSum} ≠ ${meta.size || 0}`)
 
   setStatus('recv-file-status', '📡 接收中…', 'warn')
   $('#fc-bar-wrap').hidden = false
@@ -1003,9 +1078,11 @@ async function doReceiveBatch(room, key, meta, signal) {
       ws = await fh.createWritable()
     } else parts8 = []
     const n = info.count || 0
+    let fgot = 0 // 本文件累计明文字节
     for (let i = 0; i < n; i++) {
-      const pt = await unsealRPC(key, await getChunk(room, idx + i, signal)) // GCM 验签失败直接抛错
+      const pt = await unsealRPC(key, await getChunk(room, idx + i, signal), useAAD ? chunkAAD(room, idx + i) : null) // GCM 验签失败直接抛错
       got += pt.length
+      fgot += pt.length
       if (ws) await ws.write(pt)
       else parts8.push(pt)
       setBar('bar-recv', meta.size ? got / meta.size : 1)
@@ -1015,7 +1092,10 @@ async function doReceiveBatch(room, key, meta, signal) {
     idx += n
     if (ws) await ws.close()
     else memParts.push({ name: fname, blob: new Blob(parts8) })
+    // 完整性：每个文件的累计字节数必须与 manifest 一致，否则不落下载、不 ack
+    if (fgot !== (info.size || 0)) throw new Error(`完整性校验失败：${info.name || fname} 大小 ${fgot} ≠ ${info.size || 0}`)
   }
+  if (got !== (meta.size || 0)) throw new Error(`完整性校验失败：总大小 ${got} ≠ ${meta.size || 0}`)
   if (!dir) {
     // 内存模式:顺序触发下载(浏览器会请求"下载多个文件"授权,点允许即可)
     const urls = []
@@ -1038,7 +1118,7 @@ async function doReceiveBatch(room, key, meta, signal) {
   await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
 }
 
-async function receiveFile(room, key, meta, ctl, rec) {
+async function receiveFile(room, key, meta, ctl, rec, useAAD) {
   $('#recv-title').textContent = '📥 接收文件'
   $('#recv-file-layout').hidden = false
   $('#recv-filecard').hidden = !meta.size
@@ -1055,7 +1135,7 @@ async function receiveFile(room, key, meta, ctl, rec) {
     $('#start-recv').textContent = '继续接收并保存'
     $('#start-recv').onclick = () => {
       $('#recv-actions').hidden = true
-      doReceiveFile(room, key, meta, ctl.signal, rec).catch((e) => {
+      doReceiveFile(room, key, meta, ctl.signal, rec, useAAD).catch((e) => {
         if (!ctl.signal.aborted) setStatus('recv-file-status', '❌ ' + e.message, 'err')
       })
     }
@@ -1072,7 +1152,7 @@ async function receiveFile(room, key, meta, ctl, rec) {
 
   setStatus('recv-file-status', '🟡 准备接收…', 'warn')
   $('#start-recv').textContent = '接收并保存'
-  const start = () => doReceiveFile(room, key, meta, ctl.signal).then((r) => {
+  const start = () => doReceiveFile(room, key, meta, ctl.signal, null, useAAD).then((r) => {
     if (r === 'picker-dismissed') {
       $('#recv-actions').hidden = false
       setStatus('recv-file-status', '🟢 已就绪，点击接收并保存', 'ok')
@@ -1084,7 +1164,7 @@ async function receiveFile(room, key, meta, ctl, rec) {
   start() // 自动开始：手势新鲜时直接弹保存选择器；被关闭/失败则显示手动按钮
 }
 
-async function doReceiveFile(room, key, meta, signal, rec) {
+async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
   // 仅在有激活手势时才自动拉起保存选择器（接受邀请的点击）；
   // 无手势（链接模式直接打开/手势过期/嵌入式 webview）直接走内存模式自动下载，
   // 避免个别环境（如 Electron webview）无手势时选择器 Promise 永久挂起
@@ -1164,7 +1244,7 @@ async function doReceiveFile(room, key, meta, signal, rec) {
     pump()
     const packed = await p
     const j = i // 本片的绝对序号(供进度上报)
-    const pt = await unsealRPC(key, packed) // GCM 验签失败会直接抛错
+    const pt = await unsealRPC(key, packed, useAAD ? chunkAAD(room, j) : null) // GCM 验签失败会直接抛错
     got += pt.length
     if (sink.mode === 'fs') await sink.ws.write({ type: 'write', position: pos, data: pt })
     else sink.parts.push(pt)
@@ -1197,6 +1277,12 @@ async function doReceiveFile(room, key, meta, signal, rec) {
       sink.ws = await handle.createWritable({ keepExistingData: true })
       progressPost(room, j + 1)
     }
+  }
+
+  // 完整性：累计明文长度必须与 meta.size 一致，否则不算成功、不 ack
+  if (got !== meta.size) {
+    if (sink.mode === 'fs') { try { await sink.ws.close() } catch {} }
+    throw new Error(`完整性校验失败：文件大小 ${got} ≠ ${meta.size}`)
   }
 
   if (sink.mode === 'fs') {

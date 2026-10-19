@@ -35,6 +35,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === '-o') opts.out = args[++i]
   else if (args[i] === '--to') opts.to = args[++i]
   else if (args[i] === '--name') opts.name = args[++i]
+  else if (args[i] === '--verify') opts.verify = args[++i]
   else if (args[i] === '--yes') opts.yes = true
   else pos.push(args[i])
 }
@@ -47,12 +48,13 @@ function usage() {
 
 用法:
   node cli.mjs devices                       [--server http://<局域网IP>:7777]
-  node cli.mjs send <文件/目录...> [--to <设备IP>] [--name <名称>] [--server ...]   # 多路径/目录递归
-  node cli.mjs send-text <文本> [--to <设备IP>] [--name <名称>] [--server ...]
+  node cli.mjs send <文件/目录...> [--to <设备IP>] [--verify <指纹hex≥8>] [--name <名称>] [--server ...]
+  node cli.mjs send-text <文本> [--to <设备IP>] [--verify <指纹hex≥8>] [--name <名称>] [--server ...]
   node cli.mjs recv '<接收链接>' [-o 输出路径]
   node cli.mjs listen [--yes] [-o 保存目录] [--name <名称>] [--server ...]
 
 设备直发：--to 指定在线设备（node cli.mjs devices 查看），密钥 X25519 协商，无需传链接。
+  指纹 = SHA256(X25519 公钥) 前 16 字节（32 hex）；可用 --verify 核对目标指纹（≥8 位前缀）。
 listen：常驻接收端，无浏览器的机器也能被直发（--yes 自动接受）。`)
   process.exit(1)
 }
@@ -76,19 +78,43 @@ function safeName(raw) {
   return base || 'received'
 }
 
+// 终端输出净化：远端可控字符串（设备名/文件名/预览/邀请字段）打印前过滤 C0/C1、
+// ANSI CSI/OSC 转义，防终端注入（光标移动、标题改写、OSC 52 剪贴板写入等）。
+function clean(raw, max = 200) {
+  let s = String(raw == null ? '' : raw)
+  s = s.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC ... BEL/ST
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')              // CSI
+    .replace(/\x1b[@-Z\\-_]/g, '')                        // 其他两字节转义
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')                 // C0/C1 控制字符
+  if (s.length > max) s = s.slice(0, max) + '…'
+  return s
+}
+
+// 公钥指纹（TOFU）：SHA256(原始 32B 公钥) 前 16 字节 → 32 hex。与 public/app.js 的 fpOf 一致。
+function fpOfPub(rawPub) {
+  return createHash('sha256').update(Buffer.from(rawPub)).digest().subarray(0, 16).toString('hex')
+}
+const fpOfB64 = (pubB64) => fpOfPub(fromB64u(pubB64))
+
+// 分片位置绑定（协议 v2）：AAD = UTF-8("cipherlane/chunk/v2|" + room + "|" + index)
+// 与 public/app.js 的 chunkAAD 必须逐字节一致；index 十进制无补零。
+const chunkAAD = (room, index) => Buffer.from('cipherlane/chunk/v2|' + room + '|' + index, 'utf8')
+
 // ---------- AES-GCM（与浏览器端格式一致：IV(12) || 密文 || TAG(16)） ----------
-function seal(key, pt) {
+function seal(key, pt, aad) {
   const iv = randomBytes(12)
   const c = createCipheriv('aes-256-gcm', key, iv)
+  if (aad) c.setAAD(Buffer.from(aad))
   const ct = Buffer.concat([c.update(pt), c.final(), c.getAuthTag()])
   return Buffer.concat([iv, ct])
 }
-function unseal(key, packed) {
+function unseal(key, packed, aad) {
   packed = Buffer.from(packed)
   if (packed.length < 28) throw new Error('数据不完整')
   const iv = packed.subarray(0, 12)
   const tag = packed.subarray(packed.length - 16)
   const d = createDecipheriv('aes-256-gcm', key, iv)
+  if (aad) d.setAAD(Buffer.from(aad))
   d.setAuthTag(tag)
   return Buffer.concat([d.update(packed.subarray(12, packed.length - 16)), d.final()])
 }
@@ -215,6 +241,19 @@ function makeProgress(origin, room) {
   }
 }
 
+// 读 0 号 meta：先按协议 v2（AAD room|0）解，失败回退 v1（旧发送端/旧测试夹具）。
+// resume=false 用于设备直发（经典消费语义，避免直发单文件无进度上报时触发背压死锁）。
+async function readMeta(origin, room, key, resume = true) {
+  const packed = await getChunkAt(origin, room, 0, resume)
+  let pt
+  try {
+    pt = unseal(key, packed, chunkAAD(room, 0))
+  } catch {
+    pt = unseal(key, packed)
+  }
+  return JSON.parse(pt)
+}
+
 // ---------- 接收文件落盘 ----------
 // .part 临时名 + 成功后改名；opts.startFrom > 1 时为续传（追加写，从该数据分片继续）。
 // 中断保留 .part：重跑同一命令按大小对齐到分片边界续传；错误若是 GCM 验签失败
@@ -239,12 +278,14 @@ async function receiveToFile(target, meta, pull, opts = {}) {
     await new Promise((r) => ws.end(r))
   } catch (e) {
     ws.destroy()
-    if (!/GCM|auth/i.test(e.message)) {
+    if (!/GCM|auth|完整性/.test(e.message)) {
       // 传输性中断:保留 .part 供续传
       console.log(`\n  ⏸ 传输中断,进度已保留: ${part}\n  重跑同一命令即可从断点继续（链接与输出路径不变）`)
     }
     throw e
   }
+  // 完整性：累计明文长度必须与 meta.size 一致（多/少/错位都算失败），不一致不 ack
+  if (got !== meta.size) throw new Error(`完整性校验失败：文件大小 ${got} ≠ ${meta.size}`)
   await fsp.rename(part, target)
 }
 
@@ -271,10 +312,13 @@ async function listDevices() {
 async function doDevices() {
   const list = await listDevices()
   if (!list.length) return console.log('当前没有在线设备（对方打开本页或运行 listen 后出现）')
-  console.log(`在线设备 ${list.length} 台：\n`)
-  for (const d of list)
-    console.log(`  ${avatarOf(d.ip)}  ${(d.name || '未命名设备').padEnd(20)} ${d.ip}${presence && d.ip === presence.ip ? '  （本机）' : ''}`)
-  console.log(`\n直发示例: node cli.mjs send big.zip --to ${list[0].ip}`)
+  console.log(`在线设备 ${list.length} 台（指纹 = SHA256(公钥) 前 32 hex，可与对方当面核对）：\n`)
+  for (const d of list) {
+    const self = presence && d.ip === presence.ip ? '  （本机）' : ''
+    console.log(`  ${avatarOf(d.ip)}  ${clean(d.name || '未命名设备', 32).padEnd(20)} ${clean(d.ip, 64)}${self}`)
+    console.log(`      ${' '.repeat(2)}#${fpOfB64(d.pub)}`)
+  }
+  console.log(`\n直发示例: node cli.mjs send big.zip --to ${list[0].ip} --verify <对方指纹前8位以上>`)
 }
 
 // ---------- 房间建立 / 邀请等待（单文件与批量共用） ----------
@@ -288,6 +332,17 @@ async function openRoom(preview, identity) {
     target = devices.find((d) => d.ip === opts.to)
     if (!target) throw new Error(`设备 ${opts.to} 不在线（node cli.mjs devices 查看）`)
     if (presence && target.ip === presence.ip) throw new Error('不能发送给自己')
+    // TOFU 指纹核对：显示目标指纹；--verify 给出 ≥8 位 hex 前缀，不匹配拒绝发送
+    const fp = fpOfB64(target.pub)
+    if (opts.verify !== undefined) {
+      const want = String(opts.verify).toLowerCase().replace(/^#/, '')
+      if (!/^[0-9a-f]{8,32}$/.test(want)) throw new Error('--verify 需要 8~32 位十六进制指纹前缀')
+      if (!fp.startsWith(want)) throw new Error(`目标指纹不符：期望 ${want}… 实际 #${fp}（可能被调包，已拒绝发送）`)
+      console.log(`\n  ✓ 目标 ${clean(target.name || '未命名设备', 32)} @ ${clean(target.ip, 64)} 指纹核对通过 #${fp}`)
+    } else {
+      console.log(`\n  ⚠ 目标 ${clean(target.name || '未命名设备', 32)} @ ${clean(target.ip, 64)} 指纹 #${fp}`)
+      console.log('    请与对方当面/口头核对；下次可用 --verify <指纹前8位以上> 强制校验')
+    }
     key = roomKey(dh(identity.seed, fromB64u(target.pub)), identity.pub, fromB64u(target.pub), room)
     const hint = b64u(seal(key, Buffer.from(JSON.stringify(preview))))
     const r = await fetch(`${server}/api/rooms/${room}/offer`, {
@@ -296,7 +351,7 @@ async function openRoom(preview, identity) {
       body: JSON.stringify({ to: target.ip, pub: b64u(identity.pub), hint }),
     })
     if (!r.ok) throw new Error('投递邀请失败 ' + r.status)
-    console.log(`\n${avatarOf(target.ip)}  已向 ${(target.name || '未命名设备')} (${target.ip}) 发出邀请，等待接受…`)
+    console.log(`\n${avatarOf(target.ip)}  已向 ${clean(target.name || '未命名设备', 32)} (${clean(target.ip, 64)}) 发出邀请，等待接受…`)
     const deadline = Date.now() + 5 * 60 * 1000
     for (;;) {
       if (Date.now() > deadline) throw new Error('对方超时未接受')
@@ -333,10 +388,9 @@ async function awaitAck(room, key, target) {
       const st = await getState(room)
       if (st.acked) {
         const verified = st.ackProof && st.ackProof === ackProofOf(key, room)
-        const who = target ? (target.name || target.ip) : '对方'
-        console.log(verified
-          ? `\n\n✅ ${who}已完整接收（凭证校验通过）`
-          : `\n\n⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造\n`)
+        const who = target ? clean(target.name || target.ip, 32) : '对方'
+        if (verified) console.log(`\n\n✅ ${who}已完整接收（凭证校验通过）`)
+        else console.log(`\n\n⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造\n`)
         return
       }
     } catch {
@@ -355,12 +409,13 @@ async function doSend({ type, name, size, readChunk }) {
   const { room, token, key, target } = await openRoom(
     { kind: type, name: type === 'text' ? null : name, size }, identity)
 
-  const meta = { v: 1, type, name: type === 'text' ? null : name, mime: null, size, count }
-  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta))))
+  // 协议 v2：0 号 meta 与每个数据分片都用 room+index 的 AAD 绑定位置
+  const meta = { v: 2, type, name: type === 'text' ? null : name, mime: null, size, count }
+  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
 
   for (let i = 1; i < count; i++) {
     const pt = await readChunk(i - 1)
-    await postChunk(room, token, seal(key, pt))
+    await postChunk(room, token, seal(key, pt, chunkAAD(room, i)))
     const done = i * CHUNK
     process.stdout.write(`\r  已发送 ${fmt(Math.min(done, size))} / ${fmt(size)}`)
   }
@@ -406,10 +461,12 @@ async function doSendBatch(files) {
   const { room, token, key, target } = await openRoom(
     { kind: 'batch', count: manifest.length, size: totalSize }, identity)
   const count = 1 + manifest.reduce((n, m) => n + m.count, 0)
-  const meta = { v: 1, type: 'batch', files: manifest, count, size: totalSize }
-  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta))))
+  // 协议 v2：全局分片序号（跨文件连续），每片 AAD 绑定 room+index
+  const meta = { v: 2, type: 'batch', files: manifest, count, size: totalSize }
+  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
 
   let sent = 0
+  let ci = 1 // 全局分片序号（0 号是 meta）
   for (let f = 0; f < files.length; f++) {
     const { abs, rel, size } = files[f]
     const n = manifest[f].count
@@ -424,9 +481,9 @@ async function doSendBatch(files) {
           if (!bytesRead) break
           read += bytesRead
         }
-        await postChunk(room, token, seal(key, read === len ? buf : buf.subarray(0, read)))
+        await postChunk(room, token, seal(key, read === len ? buf : buf.subarray(0, read), chunkAAD(room, ci++)))
         sent += read
-        process.stdout.write(`\r  [${f + 1}/${files.length}] ${rel.slice(0, 28).padEnd(28)} 已发送 ${fmt(sent)} / ${fmt(totalSize)}`)
+        process.stdout.write(`\r  [${f + 1}/${files.length}] ${clean(rel, 28).padEnd(28)} 已发送 ${fmt(sent)} / ${fmt(totalSize)}`)
       }
       await fh.close()
     }
@@ -441,23 +498,26 @@ function safeJoin(dir, rel) {
   const parts = String(rel || '').split('/').map(safeName).filter(Boolean)
   return parts.length ? path.join(dir, ...parts) : path.join(dir, 'received')
 }
-async function receiveBatch(origin, room, key, meta, outDir) {
+async function receiveBatch(origin, room, key, meta, outDir, useAAD) {
   await fsp.mkdir(outDir, { recursive: true })
   const progress = makeProgress(origin, room)
   await progress(1)
+  // manifest 自洽性前置校验：各文件大小之和必须等于 meta.size
+  const manifestSum = (meta.files || []).reduce((n, f) => n + (f.size || 0), 0)
+  if (manifestSum !== (meta.size || 0)) throw new Error(`完整性校验失败：manifest 总大小 ${manifestSum} ≠ ${meta.size || 0}`)
   let idx = 1 // 下一个文件的首个数据分片序号
   for (const f of meta.files) {
     const target = safeJoin(outDir, f.name)
     await fsp.mkdir(path.dirname(target), { recursive: true })
     if (!f.count) {
       await fsp.writeFile(target, Buffer.alloc(0))
-      console.log(`\n  ✓ ${f.name}（0 B，空文件）`)
+      console.log(`\n  ✓ ${clean(f.name)}（0 B，空文件）`)
       continue
     }
     const start = idx
     idx += f.count
-    await receiveResumable(origin, room, key, { ...f, count: f.count + 1 }, target, start)
-    console.log(`\n  ✓ ${f.name}（${fmt(f.size)}）`)
+    await receiveResumable(origin, room, key, { ...f, count: f.count + 1 }, target, start, useAAD)
+    console.log(`\n  ✓ ${clean(f.name)}（${fmt(f.size)}）`)
   }
 }
 
@@ -472,33 +532,36 @@ async function doRecv(link) {
   const room = m[1]
 
   // X-Resume 让房间进入可续传模式（旧服务器忽略该头，自动退化为不可续传）
-  const meta = JSON.parse(unseal(key, await getChunkAt(origin, room, 0, true)))
+  const meta = await readMeta(origin, room, key)
+  const useAAD = meta.v === 2 // 后续分片路径由 meta.v 决定；v1 旧发送端走无 AAD 旧路径
   if (meta.type === 'batch') {
     const dir = opts.out || '.'
-    await receiveBatch(origin, room, key, meta, dir)
+    await receiveBatch(origin, room, key, meta, dir, useAAD)
     await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
     console.log(`\n\n✅ 已解密并保存 ${meta.files.length} 个文件到 ${path.resolve(dir)}\n`)
     return
   }
   if (meta.type === 'text') {
-    const pt = unseal(key, await getChunkAt(origin, room, 1))
+    const pt = unseal(key, await getChunkAt(origin, room, 1, true), useAAD ? chunkAAD(room, 1) : null)
+    if (pt.length !== meta.size) throw new Error(`完整性校验失败：文本长度 ${pt.length} ≠ ${meta.size}`)
     process.stdout.write(pt)
     await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
     return
   }
   const target = opts.out || safeName(meta.name)
-  await receiveResumable(origin, room, key, meta, target, 1)
+  await receiveResumable(origin, room, key, meta, target, 1, useAAD)
   await fetch(`${origin}/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
   console.log(`\n\n✅ 已解密并保存到 ${target}（${fmt(meta.size)}）\n`)
 }
 
 // 单文件接收:.part 存在则对齐分片边界续传;首片 GCM 验签失败 = .part 与本次
 // 传输不符（换了链接/密钥）→ 删除重来。start = 该文件数据分片的全局起始序号。
-async function receiveResumable(origin, room, key, meta, target, start) {
+async function receiveResumable(origin, room, key, meta, target, start, useAAD) {
   const progress = makeProgress(origin, room)
   if (start === 1) await progress(1) // 元信息已解析
   const run = (startFrom, initialGot) => receiveToFile(target, meta,
-    async (i) => unseal(key, await getChunkAt(origin, room, start + i - 1, true)),
+    async (i) => unseal(key, await getChunkAt(origin, room, start + i - 1, true),
+      useAAD ? chunkAAD(room, start + i - 1) : null),
     // 滞后一片提交：write 回调(已入内核)后才声明"前一片安全"，留出一整片余量——
     // 否则击杀瞬间磁盘 stat 可能落后内核刷盘,重跑会拉到已释放的分片(410 behind)
     { startFrom, initialGot, onChunk: (i) => progress(start + i - 1) })
@@ -577,19 +640,22 @@ async function doListen() {
 
 async function handleOffer(o, identity, ask) {
   const theirPub = fromB64u(o.pub)
+  const fp = fpOfPub(theirPub) // 发送方指纹（TOFU 人工核对锚点）
   const key = roomKey(dh(identity.seed, theirPub), theirPub, identity.pub, o.room)
 
   let preview
   try {
     preview = JSON.parse(unseal(key, fromB64u(o.hint)))
   } catch {
-    console.log(`\n  ⚠ 来自 ${o.from.ip} 的邀请预览解密失败（可能被篡改），已拒绝`)
+    console.log(`\n  ⚠ 来自 ${clean(o.from.ip, 64)} 的邀请预览解密失败（可能被篡改），已拒绝`)
     return fetch(`${server}/api/offers/${o.id}/reject`, { method: 'POST', headers: { 'X-Device-Secret': presence.secret } })
   }
   const desc = preview.kind === 'text' ? `一段文本（${fmt(preview.size || 0)}）`
-    : preview.kind === 'batch' ? `${preview.count} 个文件（${fmt(preview.size || 0)}）`
-    : `${preview.name || '未命名文件'}（${fmt(preview.size || 0)}）`
-  console.log(`\n${avatarOf(o.from.ip || '?')}  ${(o.from.name || '未知设备')} @ ${o.from.ip} 想发给你：${desc}`)
+    : preview.kind === 'batch' ? `${clean(preview.count, 12)} 个文件（${fmt(preview.size || 0)}）`
+    : `${clean(preview.name || '未命名文件', 64)}（${fmt(preview.size || 0)}）`
+  console.log(`\n${avatarOf(o.from.ip || '?')}  ${clean(o.from.name || '未知设备', 32)} @ ${clean(o.from.ip, 64)} 想发给你：${desc}`)
+  console.log(`  发送方公钥指纹 #${fp}`)
+  console.log('  （请与发送方当面/口头核对；不会自动比对）')
 
   if (!opts.yes) {
     if (!process.stdin.isTTY) {
@@ -606,16 +672,21 @@ async function handleOffer(o, identity, ask) {
   const r = await fetch(`${server}/api/offers/${o.id}/accept`, { method: 'POST', headers: { 'X-Device-Secret': presence.secret } })
   if (!r.ok) throw new Error('接受失败 ' + r.status)
 
-  const meta = JSON.parse(unseal(key, await getChunkAt(server, o.room, 0)))
+  // 设备直发用经典消费语义（resume=false）：直发单文件无进度上报，
+  // 若让房间进入可续传模式会因 through 不前进触发发送方背压死锁。
+  const meta = await readMeta(server, o.room, key, false)
+  const useAAD = meta.v === 2
+  const pull = async (i) => unseal(key, await getChunkAt(server, o.room, i, false), useAAD ? chunkAAD(o.room, i) : null)
   if (meta.type === 'batch') {
     const dir = opts.out || '.'
-    await receiveBatch(server, o.room, key, meta, dir)
+    await receiveBatch(server, o.room, key, meta, dir, useAAD)
     await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, o.room) }) }).catch(() => {})
     console.log(`\n  ✅ 已解密保存 ${meta.files.length} 个文件到 ${path.resolve(dir)}\n`)
     return
   }
   if (meta.type === 'text') {
-    const pt = unseal(key, await getChunkAt(server, o.room, 1))
+    const pt = await pull(1)
+    if (pt.length !== meta.size) throw new Error(`完整性校验失败：文本长度 ${pt.length} ≠ ${meta.size}`)
     console.log('  ──────── 文本开始 ────────')
     process.stdout.write(pt)
     if (!pt.toString().endsWith('\n')) console.log()
@@ -625,9 +696,9 @@ async function handleOffer(o, identity, ask) {
   }
 
   const target = path.join(opts.out || '.', safeName(meta.name))
-  await receiveToFile(target, meta, async (i) => unseal(key, await getChunkAt(server, o.room, i)))
+  await receiveToFile(target, meta, pull)
   await fetch(`${server}/api/rooms/${o.room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, o.room) }) }).catch(() => {})
-  console.log(`\n  ✅ 已解密保存到 ${target}（${fmt(meta.size)}）\n`)
+  console.log(`\n  ✅ 已解密保存到 ${safeName(meta.name)}（${fmt(meta.size)}）\n`)
 }
 
 // ---------- main ----------

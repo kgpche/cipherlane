@@ -200,11 +200,11 @@ async function main() {
     await navigate(c, sidA, S + '/')
     await navigate(c, sidB, S + '/')
 
-    // 公钥指纹：心跳拿到 IP 后,本机名片显示 8 位十六进制指纹(TOFU 人工比对锚点)
+    // 公钥指纹：心跳拿到 IP 后,本机名片显示 32 位十六进制指纹(128bit TOFU 人工比对锚点)
     await waitFor(c, sidA,
-      `document.querySelector('#me-fp') && /^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim())`,
+      `document.querySelector('#me-fp') && /^#[0-9a-f]{32}$/.test(document.querySelector('#me-fp').textContent.trim())`,
       10000, '本机指纹显示')
-    ok('公钥指纹显示:本机名片 8 位十六进制')
+    ok('公钥指纹显示:本机名片 32 位十六进制(128bit)')
 
     // ---------- 1) 链接模式文本全链路 ----------
     const secret = '浏览器 E2E 冒烟 ✅ 中文与 emoji 🚀 ' + randomBytes(8).toString('hex')
@@ -243,6 +243,83 @@ async function main() {
       if (bad.length) throw new Error('hidden 属性被 display 覆盖: ' + bad.join(','))
     }
 
+    // ---------- 1c) 协议 v2：错位分片（错误 index 的 AAD）必须被拒绝 ----------
+    // 红测证明：旧实现无 AAD，对分片位置完全盲（legacyBlind 用旧格式无 AAD 密文证明：
+    // 任意位置的密文都能被旧接收端解开）；新接收端按 index 绑定 AAD，错位必须报错、不 ack。
+    {
+      // 注：本页经 LAN IP 打开（publicOrigin 把回环升级为 LAN 地址）→ 非安全上下文，
+      // 恰好覆盖"纯 JS AES-GCM + Worker"降级路径上的 AAD；构造端也用纯 JS AESGCM。
+      const setup = await evalJs(c, sidB, `(async () => {
+        const created = await (await fetch('/api/rooms', { method: 'POST' })).json()
+        const room = created.room, token = created.token
+        const key = crypto.getRandomValues(new Uint8Array(32))
+        const meta = { v: 2, type: 'file', name: 'aad-misplaced.bin', mime: 'application/octet-stream', size: CHUNK, count: 2 }
+        const AAD = (i) => enc.encode('cipherlane/chunk/v2|' + room + '|' + i)
+        const seal = (pt, aadBytes) => AESGCM.seal(key, pt, aadBytes)
+        const post = async (bytes) => {
+          for (;;) {
+            const r = await fetch('/api/rooms/' + room + '/chunk', { method: 'POST', headers: { 'X-Room-Token': token }, body: bytes })
+            if (r.status === 429) { await new Promise((res) => setTimeout(res, 100)); continue }
+            if (!r.ok) throw new Error('post chunk ' + r.status)
+            return
+          }
+        }
+        await post(seal(enc.encode(JSON.stringify(meta)), AAD(0))) // meta 用正确 AAD
+        const data = new Uint8Array(CHUNK).fill(7)
+        const misplaced = seal(data, AAD(0)) // 故意用 0 号 AAD 放到 1 号位置
+        await post(misplaced)
+        // 正控：用其原始 AAD(0) 可解 → 失败确实来自位置绑定而非密文损坏
+        const controlOk = AESGCM.open(key, misplaced, AAD(0)).length === CHUNK
+        // 旧实现（无 AAD）对位置完全盲：旧格式无 AAD 密文在任何 index 都能解
+        const blindOk = AESGCM.open(key, seal(data, null)).length === CHUNK
+        return {
+          link: publicOrigin() + '/#' + room + '.' + toB64(key),
+          room, controlOk, blindOk,
+        }
+      })()`)
+      if (!setup.controlOk) throw new Error('构造错误:错位密文用其原始 AAD 应可解开')
+      if (!setup.blindOk) throw new Error('构造错误:旧无 AAD 格式应能解开（位置盲证明失败）')
+      await navigate(c, sidB, setup.link)
+      await waitFor(c, sidB, `document.querySelector('#recv-file-status').textContent.startsWith('❌')`, 20000, '错位分片报错')
+      const errText = await evalJs(c, sidB, textOf('#recv-file-status'))
+      if (/已保存/.test(errText)) throw new Error('错位分片不应被当作成功: ' + errText)
+      if (!/GCM|解密|验签/.test(errText)) throw new Error('错位分片应以验签失败报错,实际: ' + errText)
+      const acked = await evalJs(c, sidB, `(async () => (await (await fetch('/api/rooms/${setup.room}/state')).json()).acked)()`)
+      if (acked) throw new Error('错位分片失败后不应 ack')
+      ok('协议 v2 错位分片被拒绝且不 ack（旧无 AAD 实现位置盲：blindOk 已证）')
+    }
+
+    // ---------- 1d) 邀请 TOFU：offer 公钥与此前记录不一致 → 卡片警示 + 接受前确认 ----------
+    {
+      await navigate(c, sidB, S + '/')
+      await waitFor(c, sidB, `!document.querySelector('#view-landing').hidden`, 5000, '回到首页')
+      await evalJs(c, sidB, `(async () => {
+        const room = 'Ab3xYz9kLm'
+        const kp = X25519.genKey()
+        const key = X25519.sessionKey(X25519.dh(identity.sk, kp.pk), kp.pk, identity.pk, room)
+        const hint = await sealWith(key, enc.encode(JSON.stringify({ kind: 'text', size: 3 })))
+        const known = knownPubs.load()
+        known['192.168.137.9'] = toB64(X25519.genKey().pk) // 记录不同公钥 → 触发变化
+        knownPubs.save(known)
+        incomingOffers.set('tofu01', { id: 'tofu01', room, pub: toB64(kp.pk), hint: toB64(hint), from: { ip: '192.168.137.9', name: 'TOFU 发送方' } })
+        renderIncoming()
+      })()`)
+      await waitFor(c, sidB,
+        `[...document.querySelectorAll('.o-fp-warn')].some((x) => !x.hidden && x.textContent.includes('公钥已变化'))`,
+        5000, '邀请卡片 TOFU 警示')
+      await waitFor(c, sidB, `!document.querySelector('.o-accept').disabled`, 5000, '预览解密完成')
+      await evalJs(c, sidB, `document.querySelector('.o-accept').click()`)
+      await waitFor(c, sidB, `!document.querySelector('#modal-mask').hidden`, 5000, '邀请 TOFU 确认弹窗')
+      const t = await evalJs(c, sidB, `document.querySelector('#modal-title').textContent`)
+      if (!/公钥已变化/.test(t)) throw new Error('邀请确认弹窗应提示公钥变化,实际: ' + t)
+      await evalJs(c, sidB, `document.querySelector('#modal-cancel').click()`)
+      await waitFor(c, sidB, `document.querySelector('#modal-mask').hidden`, 3000, '取消弹窗')
+      const still = await evalJs(c, sidB, `incomingOffers.has('tofu01') && !document.querySelector('#view-landing').hidden`)
+      if (!still) throw new Error('取消后邀请应保留且不得进入接收')
+      await evalJs(c, sidB, `incomingOffers.delete('tofu01'); renderIncoming()`)
+      ok('邀请 TOFU：发送方公钥变化 → 卡片警示 + 接受前确认，取消不接收')
+    }
+
     // ---------- 2) 定向发送到离线设备:建立失败必须有退路(回归:曾死锁) ----------
     await navigate(c, sidA, S + '/')
     await evalJs(c, sidA, `
@@ -262,6 +339,35 @@ async function main() {
     await waitFor(c, sidA, `!document.querySelector('#view-landing').hidden`, 5000, '返回首页')
     await evalJs(c, sidA, `selectedIp = null; deviceCache = deviceCache.filter((d) => d.ip !== '10.99.0.5'); renderDevices()`)
     ok('定向到离线设备:报"建立密道失败" + "返回首页"可退(回归覆盖)')
+
+    // ---------- 2b) 直发 TOFU：目标公钥变化必须先弹确认，取消则绝不发送 ----------
+    {
+      const warned = await evalJs(c, sidA, `(() => {
+        refreshDevices = () => {}
+        const kp = X25519.genKey()
+        deviceCache.push({ ip: '10.99.0.6', id: 'tofu', name: 'TOFU设备', pub: toB64(kp.pk) })
+        const known = knownPubs.load()
+        known['10.99.0.6'] = toB64(X25519.genKey().pk) // 记录一把不同公钥 → 触发变化
+        knownPubs.save(known)
+        selectedIp = '10.99.0.6'
+        renderDevices()
+        return document.querySelectorAll('.device.fp-changed').length
+      })()`)
+      if (!(warned >= 1)) throw new Error('公钥变化设备卡应有"⚠ 公钥已变化"警示')
+      await evalJs(c, sidA, `document.querySelector('#text').value = 'TOFU 确认测试'`)
+      await evalJs(c, sidA, `document.querySelector('#send-text').click()`)
+      await waitFor(c, sidA, `!document.querySelector('#modal-mask').hidden`, 5000, '直发 TOFU 确认弹窗')
+      const tf = await evalJs(c, sidA, `document.querySelector('#modal-title').textContent`)
+      if (!/公钥已变化/.test(tf)) throw new Error('确认弹窗应提示公钥变化,实际: ' + tf)
+      // 取消 → 不得进入发送视图、不得建房/发送
+      await evalJs(c, sidA, `document.querySelector('#modal-cancel').click()`)
+      await waitFor(c, sidA, `document.querySelector('#modal-mask').hidden`, 3000, '取消关闭弹窗')
+      if (!(await evalJs(c, sidA, `!document.querySelector('#view-landing').hidden`))) {
+        throw new Error('取消后应留在首页（不发送）')
+      }
+      await evalJs(c, sidA, `selectedIp = null; deviceCache = deviceCache.filter((d) => d.ip !== '10.99.0.6'); renderDevices()`)
+      ok('直发 TOFU：公钥变化弹确认，取消后不发送')
+    }
 
     // ---------- 3) 同序号并发拉取:X-Resume 只读回放,双双拿到同一份(回归:曾 500+永久挂起) ----------
     // 浏览器端 getChunk 常带 X-Resume → 房间为可续传模式,同序号并发=多播;
@@ -398,7 +504,7 @@ async function main() {
       await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidC).catch(() => {})
       await navigate(c, sidA, S + '/')
       await waitFor(c, sidA,
-        `/^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '重置前指纹')
+        `/^#[0-9a-f]{32}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '重置前指纹')
       const fp1 = await evalJs(c, sidA, `document.querySelector('#me-fp').textContent.trim()`)
       const sk1 = await evalJs(c, sidA, `localStorage.getItem('cipherlane-sk')`)
       // 取消路径:模态出现 → 取消 → 指纹/密钥不变;破坏性操作默认焦点在取消
@@ -420,7 +526,7 @@ async function main() {
       await waitFor(c, sidA, `!document.querySelector('#modal-mask').hidden`, 3000, '模态再次出现')
       await evalJs(c, sidA, `document.querySelector('#modal-ok').click()`)
       await waitFor(c, sidA,
-        `document.readyState === 'complete' && document.querySelector('#me-fp') && /^#[0-9a-f]{8}$/.test(document.querySelector('#me-fp').textContent.trim()) && document.querySelector('#me-fp').textContent.trim() !== '${fp1}'`,
+        `document.readyState === 'complete' && document.querySelector('#me-fp') && /^#[0-9a-f]{32}$/.test(document.querySelector('#me-fp').textContent.trim()) && document.querySelector('#me-fp').textContent.trim() !== '${fp1}'`,
         15000, 'reload 后新指纹')
       const sk2 = await evalJs(c, sidA, `localStorage.getItem('cipherlane-sk')`)
       if (sk2 === sk1) throw new Error('密钥未更换')
@@ -457,9 +563,9 @@ async function main() {
         const key = crypto.getRandomValues(new Uint8Array(32))
         const meta = { v: 1, type: 'file', name: 'fsa-resume-e2e.bin', mime: 'application/octet-stream', size, count: 13 }
         const seal = async (pt) => {
-          const k = await subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt', 'decrypt'])
+          const k = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt', 'decrypt'])
           const iv = crypto.getRandomValues(new Uint8Array(12))
-          const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, k, pt))
+          const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, pt))
           const out = new Uint8Array(12 + ct.length)
           out.set(iv); out.set(ct, 12)
           return out

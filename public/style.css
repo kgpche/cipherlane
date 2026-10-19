@@ -169,8 +169,11 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 }
 .device .d-sub {
   display: flex;
-  gap: 6px;
+  flex-wrap: wrap; /* 128bit 指纹比 IP 长：允许换行，绝不截短 */
+  gap: 2px 6px;
   align-items: baseline;
+  justify-content: center;
+  max-width: 100%;
   white-space: nowrap;
 }
 .device .d-sub.warn { color: var(--danger); font-size: 0.75rem; }
@@ -190,10 +193,13 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
   margin: 8px 0;
 }
 .o-body { flex: 1; min-width: 0; }
-.o-title { display: flex; gap: 6px; align-items: baseline; }
+.o-title { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; }
 .o-title .o-ip { color: var(--dim); font-size: 0.78rem; }
 .o-preview { font-size: 0.88rem; margin-top: 4px; }
 .o-error { color: var(--danger); font-size: 0.82rem; margin-top: 4px; }
+/* 邀请公钥 TOFU 变化警示（接受前必须二次确认） */
+.o-fp-warn { color: var(--danger); font-size: 0.82rem; margin-top: 4px; font-weight: 600; }
+.offer.fp-changed { border-color: var(--danger); }
 .o-actions { display: flex; flex-direction: column; gap: 8px; }
 .o-actions .btn { padding: 7px 16px; }
 
@@ -324,16 +330,18 @@ h2 { margin: 0 0 12px; font-size: 1.15rem; }
 
 footer { text-align: center; color: var(--dim); font-size: 0.78rem; padding: 18px; }
 
-/* 公钥指纹（TOFU 人工比对）：等宽小字，变更警示用 danger 色 */
+/* 公钥指纹（TOFU 人工比对）：128bit / 32 hex，等宽小字；窄屏自动换行不截短 */
 .fp, .d-fp, .o-fp, .rf-fp {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  letter-spacing: 0.4px;
+  font-size: 10px;
+  letter-spacing: 0;
+  word-break: break-all;
 }
 .device .d-fp { color: var(--dim); flex-shrink: 0; }
 .device .d-fp.warn, .device.fp-changed { color: var(--danger); }
 .device.fp-changed { border-color: var(--danger); }
 .o-title .o-fp { margin-left: 6px; }
+.rf-fp { margin-left: 4px; }
 
 /* 名片上的幽灵按钮（重置身份密钥） */
 .link-btn {
