@@ -2,6 +2,9 @@
 build/*
 !build/package.sh
 
+# Rust 构建产物（本地缓存，绝不可入库；历史上曾误提交 800MB+）
+cipherlane-rs/target/
+
 # 会话/工具
 .zcode/
 node_modules/
