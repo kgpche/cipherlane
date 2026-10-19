@@ -30,7 +30,11 @@ const DEVICE_NAME_MAX: usize = 32;
 const OFFER_TTL_MS: u128 = 5 * 60 * 1000;
 const OFFERS_MAX: usize = 8;
 const REJECT_GRACE_MS: u128 = 2 * 60 * 1000;
-const WORKERS: usize = 256;
+// 工作线程：每监听地址 128 个、128KB 小栈。足以承载 LAN 规模的长轮询并发
+// （每接收方 ≤4 挂起 × 30 设备 ≈ 120）；小栈把虚拟内存从 2MB/线程压到 128KB，
+// 避免 256×2MB=1.6GB VIRT 被 system monitor 误读为"内存泄漏"（实际 RSS ~5MB）。
+const WORKERS: usize = 128;
+const WORKER_STACK: usize = 128 * 1024;
 const ROOM_ID_LEN: usize = 10;
 
 const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -1031,12 +1035,14 @@ fn main() {
         for _ in 0..WORKERS {
             let server = server.clone();
             let ctx = ctx.clone();
-            std::thread::spawn(move || loop {
-                match server.recv() {
-                    Ok(req) => handle(req, &ctx),
-                    Err(_) => break,
-                }
-            });
+            let _ = std::thread::Builder::new()
+                .stack_size(WORKER_STACK)
+                .spawn(move || loop {
+                    match server.recv() {
+                        Ok(req) => handle(req, &ctx),
+                        Err(_) => break,
+                    }
+                });
         }
     }
 
