@@ -203,6 +203,18 @@ fn valid_room_id(s: &str) -> bool {
 fn touch(room: &Room) {
     *room.last_active.lock().unwrap() = now_ms();
 }
+// 全局缓冲计数：所有加值都必须在持有房间 inner 锁时完成（锁序 inner → global_buffered），
+// 与 take_chunk / advance_through / destroy_room 的减法串行，避免"减法先于加法"造成
+// usize 瞬时回绕（窗口内并发上传会被误判超限 429）。减法再用 saturating_sub 兜底：
+// 即使将来记账再出错，也不会留下一个巨大计数把全站上传永久顶死。
+fn counter_add(c: &Mutex<usize>, n: usize) {
+    let mut g = c.lock().unwrap();
+    *g = g.saturating_add(n);
+}
+fn counter_sub(c: &Mutex<usize>, n: usize) {
+    let mut g = c.lock().unwrap();
+    *g = g.saturating_sub(n);
+}
 
 // ---------- 连接活性检测（Linux）----------
 // 同步模型无法感知客户端断连；轮询 /proc/net/tcp，客户端 abort 后连接
@@ -295,10 +307,10 @@ fn pending_offers_for(world: &World, ip: &str) -> Vec<serde_json::Value> {
     }
     list
 }
-fn take_chunk(inner: &mut RoomInner, world: &World, i: u64) -> Option<Arc<Vec<u8>>> {
+fn take_chunk(inner: &mut RoomInner, counter: &Mutex<usize>, i: u64) -> Option<Arc<Vec<u8>>> {
     let c = inner.buffer.remove(&i)?;
-    inner.bytes -= c.len();
-    *world.global_buffered.lock().unwrap() -= c.len();
+    inner.bytes = inner.bytes.saturating_sub(c.len());
+    counter_sub(counter, c.len());
     inner.head = i + 1;
     if inner.head > inner.pulled {
         inner.pulled = inner.head;
@@ -306,7 +318,7 @@ fn take_chunk(inner: &mut RoomInner, world: &World, i: u64) -> Option<Arc<Vec<u8
     inner.receiver_seen = true;
     Some(c)
 }
-fn advance_through(inner: &mut RoomInner, world: &World, through: u64) -> bool {
+fn advance_through(inner: &mut RoomInner, counter: &Mutex<usize>, through: u64) -> bool {
     if through > inner.posted {
         return false;
     }
@@ -322,13 +334,23 @@ fn advance_through(inner: &mut RoomInner, world: &World, through: u64) -> bool {
             true
         }
     });
-    inner.bytes -= freed;
-    *world.global_buffered.lock().unwrap() -= freed;
+    inner.bytes = inner.bytes.saturating_sub(freed);
+    counter_sub(counter, freed);
     inner.through = through;
     if inner.through > inner.pulled {
         inner.pulled = inner.through;
     }
     true
+}
+// 插入分片并记账：inner.bytes 与 global_buffered 的加值都在调用方持有的 inner 锁内完成，
+// 与所有减法路径串行，杜绝"减法先于加法"的瞬时回绕。
+fn insert_chunk(inner: &mut RoomInner, counter: &Mutex<usize>, i: u64, body: Vec<u8>) -> usize {
+    let arc = Arc::new(body);
+    let added = arc.len();
+    inner.buffer.insert(i, arc);
+    inner.bytes = inner.bytes.saturating_add(added);
+    counter_add(counter, added);
+    added
 }
 fn destroy_room(world: &World, room: &Arc<Room>) {
     {
@@ -342,7 +364,7 @@ fn destroy_room(world: &World, room: &Arc<Room>) {
         let mut inner = room.inner.lock().unwrap();
         let bytes = std::mem::take(&mut inner.bytes);
         inner.buffer.clear();
-        *world.global_buffered.lock().unwrap() -= bytes;
+        counter_sub(&world.global_buffered, bytes);
         inner.dead = true;
         if let Some(o) = &inner.offer {
             world.offers_by_id.lock().unwrap().remove(&o.id);
@@ -394,7 +416,7 @@ fn pull_chunk(world: &Arc<World>, room: &Arc<Room>, ip: &str, i: u64, resume: bo
                 // 挂起中被并发取走 → 冲突；新到访已消费 → consumed
                 return if parked { Pull::Conflict } else { Pull::Gone("consumed") };
             }
-            if let Some(c) = take_chunk(&mut inner, world, i) {
+            if let Some(c) = take_chunk(&mut inner, &world.global_buffered, i) {
                 touch(room);
                 return Pull::Done(c.as_ref().clone());
             }
@@ -867,6 +889,12 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     return jerr(req, 400, "empty-chunk");
                 }
                 let mut inner = room.inner.lock().unwrap();
+                // 房间清扫可能与慢速请求竞争：已销毁的房间不再接受分片，否则分片记账
+                // 只增不减（房间已从 rooms 移除，永远不会再有 destroy 来释放这笔计数）。
+                if inner.dead {
+                    drop(inner);
+                    return jerr(req, 410, "gone");
+                }
                 let outstanding = if inner.resumable { inner.posted - inner.through } else { inner.buffer.len() as u64 };
                 let global = *w.global_buffered.lock().unwrap();
                 if outstanding >= ROOM_CHUNKS_BUF || inner.bytes + body.len() > ROOM_BYTES_MAX || global + body.len() > GLOBAL_BYTES_MAX {
@@ -875,12 +903,9 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 }
                 let i = inner.posted;
                 inner.posted += 1;
-                let arc = Arc::new(body);
-                let added = arc.len();
-                inner.buffer.insert(i, arc);
-                inner.bytes += added;
+                // 记账与插入在同一 inner 临界区内完成（旧实现是 drop(inner) 之后才 += 全局计数）
+                insert_chunk(&mut inner, &w.global_buffered, i, body);
                 drop(inner);
-                *w.global_buffered.lock().unwrap() += added;
                 touch(&room);
                 room.cond.notify_all();
                 return json_resp(req, 200, serde_json::json!({ "index": i }).to_string());
@@ -938,7 +963,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     drop(inner);
                     return jerr(req, 409, "not-resumable");
                 }
-                if !advance_through(&mut inner, w, through) {
+                if !advance_through(&mut inner, &w.global_buffered, through) {
                     drop(inner);
                     return jerr(req, 400, "bad-through");
                 }
@@ -1081,5 +1106,75 @@ fn main() {
     println!("\n等待传输…（Ctrl+C 退出）");
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_room() -> RoomInner {
+        RoomInner {
+            token: String::new(),
+            posted: 0,
+            head: 0,
+            pulled: 0,
+            buffer: HashMap::new(),
+            bytes: 0,
+            receiver_seen: false,
+            sender_done: false,
+            acked: false,
+            ack_proof: None,
+            resumable: false,
+            through: 0,
+            rejected_at: None,
+            offer: None,
+            dead: false,
+        }
+    }
+
+    // 减法兜底：旧实现用裸 `-=`，减法先于加法时会回绕成巨值（窗口内其它上传被 429）。
+    #[test]
+    fn counter_sub_never_wraps() {
+        let c = Mutex::new(0usize);
+        counter_sub(&c, BODY_MAX);
+        assert_eq!(*c.lock().unwrap(), 0);
+        counter_add(&c, 10);
+        counter_sub(&c, 4);
+        assert_eq!(*c.lock().unwrap(), 6);
+    }
+
+    // 插入/取走分片后，房间字节数与全局计数必须同步归零；重复取走不得二次扣减。
+    #[test]
+    fn insert_and_take_keep_byte_accounting_in_sync() {
+        let c = Mutex::new(0usize);
+        let mut room = empty_room();
+        insert_chunk(&mut room, &c, 0, vec![7u8; 1024]);
+        insert_chunk(&mut room, &c, 1, vec![7u8; 2048]);
+        assert_eq!(*c.lock().unwrap(), 3072);
+        assert_eq!(room.bytes, 3072);
+        let c0 = take_chunk(&mut room, &c, 0).expect("chunk 0 应可取");
+        assert_eq!(c0.len(), 1024);
+        assert_eq!(room.bytes, 2048);
+        assert_eq!(*c.lock().unwrap(), 2048);
+        assert!(take_chunk(&mut room, &c, 0).is_none());
+        assert_eq!(*c.lock().unwrap(), 2048);
+    }
+
+    // progress 只释放 [1, through) 的数据分片，0 号 manifest 必须保留（续传重读用）。
+    #[test]
+    fn progress_releases_below_through_but_keeps_manifest() {
+        let c = Mutex::new(0usize);
+        let mut room = empty_room();
+        for i in 0..3u64 {
+            insert_chunk(&mut room, &c, i, vec![0u8; 100]);
+        }
+        room.posted = 3; // 真实路径里 posted 由 handler 递增，insert_chunk 只管数据与记账
+        assert_eq!(*c.lock().unwrap(), 300);
+        assert!(advance_through(&mut room, &c, 2));
+        assert_eq!(*c.lock().unwrap(), 200);
+        assert!(room.buffer.contains_key(&0));
+        assert!(advance_through(&mut room, &c, 2)); // 重复/滞后上报幂等
+        assert_eq!(*c.lock().unwrap(), 200);
     }
 }

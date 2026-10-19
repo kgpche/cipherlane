@@ -65,12 +65,14 @@ fetch_node node-win    https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-win-x64.
 fetch_node node-mac-a  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-arm64.tar.gz node-$NODE_VER-darwin-arm64/bin/node node-$NODE_VER-darwin-arm64.tar.gz
 fetch_node node-mac-x  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-x64.tar.gz   node-$NODE_VER-darwin-x64/bin/node   node-$NODE_VER-darwin-x64.tar.gz
 
-# ---------- 1.5) Rust 构建：musl 静态服务器 + 托盘（Linux deb 产物） ----------
+# ---------- 1.5) Rust 构建：musl 静态服务器 + musl 静态托盘（Linux deb 产物） ----------
+# 托盘也走 musl target：gnu target 会动态链接构建机的 glibc（曾达 GLIBC_2.39），
+# Ubuntu 22.04 / Debian 12 等旧发行版上直接加载失败。
 if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then
-  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml || exit 1
-  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane-tray || exit 1
+  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane || exit 1
+  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane-tray || exit 1
   RUST_SRV="$ROOT/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane"
-  RUST_TRAY="$ROOT/cipherlane-rs/target/release/cipherlane-tray"
+  RUST_TRAY="$ROOT/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane-tray"
 else
   echo "!! 未安装 Rust 工具链，Linux deb 将回退 Node SEA 版（rustup.rs 安装后重打包可切换）"
   RUST_SRV=""
@@ -157,7 +159,10 @@ After=network.target
 
 [Service]
 ExecStart=/usr/bin/cipherlane
-Environment=HOST=0.0.0.0 PORT=7777
+# 默认与源码运行一致：只绑 127.0.0.1 + 局域网（RFC1918）网卡，避免把明文页暴露到
+# VPN/公网网卡。确有全网卡需求（如 VPN 内访问）时用 drop-in 覆盖：
+#   systemctl edit cipherlane  →  [Service] Environment=HOST=0.0.0.0
+Environment=PORT=7777
 Restart=on-failure
 RestartSec=2
 # 最小权限运行：全部资源内嵌于二进制，无文件写入、无 home、无内核面需求
