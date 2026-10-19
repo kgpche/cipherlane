@@ -325,6 +325,73 @@ async function main() {
     await jfetch(`/api/rooms/${lr.room}/ack`, { method: 'POST' })
     ok('链接模式回归：随机密钥分片收发逐字节一致')
 
+    // ---------- 幂等重投：X-Chunk-Seq（无头旧语义 / duplicate / 乱序 / 非法 / 429 后同 seq 重投） ----------
+    {
+      const mkRoom = async () => (await jfetch('/api/rooms', { method: 'POST' })).json
+      const postSeq = (r, seq, body) => jfetch(`/api/rooms/${r.room}/chunk`, {
+        method: 'POST',
+        headers: { 'X-Room-Token': r.token, ...(seq === undefined ? {} : { 'X-Chunk-Seq': String(seq) }) },
+        body,
+      })
+      // 1) 旧客户端不带 X-Chunk-Seq 头：保持旧语义
+      let ir = await mkRoom()
+      let x = await postSeq(ir, undefined, Buffer.from('legacy-no-seq'))
+      assert.strictEqual(x.status, 200)
+      assert.strictEqual(x.json.index, 0)
+      assert.strictEqual((await jfetch(`/api/rooms/${ir.room}/state`)).json.posted, 1)
+      // 2) 同 seq 重投：duplicate，posted/分片数不变，零记账
+      x = await postSeq(ir, 1, Buffer.from('seq-one'))
+      assert.strictEqual(x.status, 200)
+      assert.strictEqual(x.json.index, 1)
+      const dup = await postSeq(ir, 1, Buffer.from('seq-one'))
+      assert.strictEqual(dup.status, 200)
+      assert.strictEqual(dup.json.duplicate, true)
+      assert.strictEqual(dup.json.index, 1)
+      assert.strictEqual((await jfetch(`/api/rooms/${ir.room}/state`)).json.posted, 2, '重复包不应推进 posted')
+      const dup0 = await postSeq(ir, 0, Buffer.from('legacy-no-seq'))
+      assert.strictEqual(dup0.json.duplicate, true)
+      assert.strictEqual((await jfetch(`/api/rooms/${ir.room}/state`)).json.posted, 2)
+      // 3) 跳号：posted=0 时直接 seq=1 → 409 out-of-order，posted 不动
+      const oor = await mkRoom()
+      x = await postSeq(oor, 1, Buffer.from('skip-zero'))
+      assert.strictEqual(x.status, 409)
+      assert.strictEqual(x.json.error, 'out-of-order')
+      assert.strictEqual(x.json.posted, 0)
+      assert.strictEqual((await jfetch(`/api/rooms/${oor.room}/state`)).json.posted, 0)
+      // 4) 非法 seq → 400 bad-seq（用原始 http 请求，避免 fetch 对头值做规范化）
+      const rawSeq = async (val) => {
+        const raw = await rawRequest(`/api/rooms/${oor.room}/chunk`, {
+          method: 'POST', headers: { 'X-Room-Token': oor.token, 'X-Chunk-Seq': val }, body: Buffer.from('bad'),
+        })
+        return { status: raw.status, json: JSON.parse(raw.body.toString('utf8') || '{}') }
+      }
+      for (const bad of ['x', '-1', '1.5', '1e2', '9007199254740993']) {
+        x = await rawSeq(bad)
+        assert.strictEqual(x.status, 400, `非法 seq ${JSON.stringify(bad)} 应 400`)
+        assert.strictEqual(x.json.error, 'bad-seq')
+      }
+      // 5) 背压 429 后用同 seq 重投成功：64 片窗口投满 → 第 65 片 429（posted 不推进）；
+      //    经典模式消费一片腾出预算 → 同 seq 重投 200，再次重投 duplicate
+      const br = await mkRoom()
+      for (let i = 0; i < 64; i++) {
+        x = await postSeq(br, i, Buffer.from('c' + i))
+        assert.strictEqual(x.status, 200, `第 ${i} 片应入库`)
+      }
+      const full = await postSeq(br, 64, Buffer.from('c64'))
+      assert.strictEqual(full.status, 429, '背压窗口满后应 429')
+      assert.strictEqual((await jfetch(`/api/rooms/${br.room}/state`)).json.posted, 64, '429 不得推进 posted')
+      const got0 = await fetch(`${S}/api/rooms/${br.room}/chunk?i=0`)
+      assert.strictEqual(got0.status, 200)
+      await got0.arrayBuffer()
+      const retry = await postSeq(br, 64, Buffer.from('c64'))
+      assert.strictEqual(retry.status, 200, '消费一片后同 seq 重投应成功')
+      assert.strictEqual(retry.json.index, 64)
+      const retryDup = await postSeq(br, 64, Buffer.from('c64'))
+      assert.strictEqual(retryDup.json.duplicate, true)
+      assert.strictEqual((await jfetch(`/api/rooms/${br.room}/state`)).json.posted, 65)
+      ok('幂等重投：无头旧语义 / duplicate 零记账 / 跳号 409 / 非法 400 / 429 后同 seq 重投成功')
+    }
+
     // ---------- 8) 并发拉取同一分片：先到先得，后来者明确失败，发送方不受影响 ----------
     // 回归：曾经 notifyChunk 会唤醒全部同序号 waiter 并在第二个 takeChunk 上崩溃
     // （发送方 POST 500、后来者响应永久挂起）。

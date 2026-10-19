@@ -786,6 +786,17 @@ async function handleRequest(req, res) {
         // 读包期间房间可能已被 DELETE/清扫销毁：不再接受分片，也不写任何全局计数
         if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         if (!body.length) return sendJson(res, 400, { error: 'empty-chunk' })
+        // 可选幂等序号 X-Chunk-Seq（旧客户端不带该头 → 保持 posted++ 旧语义）：
+        // seq<posted = 重投包：零记账/零背压/零 notify，直接 200 duplicate；seq>posted = 乱序 409。
+        const seqRaw = req.headers['x-chunk-seq']
+        let seq = null
+        if (seqRaw !== undefined) {
+          if (typeof seqRaw !== 'string' || !/^\d+$/.test(seqRaw)) return sendJson(res, 400, { error: 'bad-seq' })
+          seq = Number(seqRaw)
+          if (!Number.isSafeInteger(seq)) return sendJson(res, 400, { error: 'bad-seq' })
+          if (seq > room.posted) return sendJson(res, 409, { error: 'out-of-order', posted: room.posted })
+          if (seq < room.posted) return sendJson(res, 200, { ok: true, index: seq, duplicate: true })
+        }
         // 背压：发送方领先太多时让其稍后重试
         // 背压：经典模式按滞留分片数；可续传模式按 未确认分片数(posted - through)
         const outstanding = room.resumable ? room.posted - room.through : room.buffer.size

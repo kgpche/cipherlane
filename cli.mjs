@@ -184,20 +184,24 @@ async function createRoom() {
   if (!r.ok) throw new Error('创建房间失败 ' + r.status)
   return r.json()
 }
-async function postChunk(room, token, body) {
+// 幂等投递：请求头带 X-Chunk-Seq；超时/连接失败/429 重试都复用同一 seq，
+// 服务端据此把重复包识别为 duplicate（零记账），旧服务器忽略该头、退化为旧行为。
+async function postChunk(room, token, seq, body) {
   for (;;) {
     let r
     try {
       r = await fetchT(`${server}/api/rooms/${room}/chunk`, {
         method: 'POST',
-        headers: { 'X-Room-Token': token },
+        headers: { 'X-Room-Token': token, 'X-Chunk-Seq': String(seq) },
         body,
       }, 30_000)
     } catch (e) {
-      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投
+      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投（同 seq）
       throw e
     }
-    if (r.status === 429) { await sleep(250); continue }
+    if (r.status === 429) { await sleep(250); continue } // 背压:同 seq 重投
+    // 409 = 服务端 posted 与本地序号脱节（不能靠重试修复），明确报错而非静默重排
+    if (r.status === 409) throw new Error(`服务器分片计数不同步（seq=${seq}, out-of-order），请重新建立传输`)
     if (!r.ok) throw new Error('投递分片失败 ' + r.status)
     return
   }
@@ -411,11 +415,11 @@ async function doSend({ type, name, size, readChunk }) {
 
   // 协议 v2：0 号 meta 与每个数据分片都用 room+index 的 AAD 绑定位置
   const meta = { v: 2, type, name: type === 'text' ? null : name, mime: null, size, count }
-  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
+  await postChunk(room, token, 0, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
 
   for (let i = 1; i < count; i++) {
     const pt = await readChunk(i - 1)
-    await postChunk(room, token, seal(key, pt, chunkAAD(room, i)))
+    await postChunk(room, token, i, seal(key, pt, chunkAAD(room, i)))
     const done = i * CHUNK
     process.stdout.write(`\r  已发送 ${fmt(Math.min(done, size))} / ${fmt(size)}`)
   }
@@ -463,7 +467,7 @@ async function doSendBatch(files) {
   const count = 1 + manifest.reduce((n, m) => n + m.count, 0)
   // 协议 v2：全局分片序号（跨文件连续），每片 AAD 绑定 room+index
   const meta = { v: 2, type: 'batch', files: manifest, count, size: totalSize }
-  await postChunk(room, token, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
+  await postChunk(room, token, 0, seal(key, Buffer.from(JSON.stringify(meta)), chunkAAD(room, 0)))
 
   let sent = 0
   let ci = 1 // 全局分片序号（0 号是 meta）
@@ -481,7 +485,8 @@ async function doSendBatch(files) {
           if (!bytesRead) break
           read += bytesRead
         }
-        await postChunk(room, token, seal(key, read === len ? buf : buf.subarray(0, read), chunkAAD(room, ci++)))
+        const seq = ci++ // 全局序号（跨文件连续），重试复用
+        await postChunk(room, token, seq, seal(key, read === len ? buf : buf.subarray(0, read), chunkAAD(room, seq)))
         sent += read
         process.stdout.write(`\r  [${f + 1}/${files.length}] ${clean(rel, 28).padEnd(28)} 已发送 ${fmt(sent)} / ${fmt(totalSize)}`)
       }

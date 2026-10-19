@@ -168,6 +168,11 @@ fn hdr(req: &tiny_http::Request, name: &'static str) -> String {
         .map(|h| h.value.as_str().trim().to_string())
         .unwrap_or_default()
 }
+// 取某个头的全部原始值（不做 trim）。tiny_http 的 value 是 AsciiString，取字节不会引入
+// UTF-8 假设；同名头可能重复出现，调用方按 Node 的合并语义决定如何处理。
+fn hdr_values(req: &tiny_http::Request, name: &'static str) -> Vec<Vec<u8>> {
+    req.headers().iter().filter(|h| h.field.equiv(name)).map(|h| h.value.as_bytes().to_vec()).collect()
+}
 fn h(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
 }
@@ -214,6 +219,34 @@ fn counter_add(c: &Mutex<usize>, n: usize) {
 fn counter_sub(c: &Mutex<usize>, n: usize) {
     let mut g = c.lock().unwrap();
     *g = g.saturating_sub(n);
+}
+// X-Chunk-Seq 严格解析：只接受十进制非负整数，拒绝符号、中间空白、非数字和溢出。
+// 首尾允许 HTTP OWS（空格 / 制表符）——Node 的 req.headers 会去掉首尾空白，这里对齐；
+// 上限对齐 Node 的 Number.isSafeInteger（2^53-1），超过按 400 bad-seq 处理而不是 409。
+const CHUNK_SEQ_MAX: u64 = 9_007_199_254_740_991; // 2^53 - 1
+fn parse_chunk_seq(raw: &[u8]) -> Option<u64> {
+    let mut lo = 0usize;
+    let mut hi = raw.len();
+    while lo < hi && (raw[lo] == b' ' || raw[lo] == b'\t') {
+        lo += 1;
+    }
+    while hi > lo && (raw[hi - 1] == b' ' || raw[hi - 1] == b'\t') {
+        hi -= 1;
+    }
+    if lo == hi {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &b in &raw[lo..hi] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        if v > CHUNK_SEQ_MAX {
+            return None;
+        }
+    }
+    Some(v)
 }
 
 // ---------- 连接活性检测（Linux）----------
@@ -876,7 +909,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 return json_resp(req, 200, serde_json::json!({ "offer": oid }).to_string());
             }
 
-            // POST chunk
+            // POST chunk（可选 X-Chunk-Seq：发送端重投时幂等确认）
             if sub == "chunk" && method == "POST" {
                 if !token_ok {
                     return jerr(req, 403, "bad-token");
@@ -885,15 +918,49 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     Some(b) => b,
                     None => return jerr(req, 413, "bad-body"),
                 };
-                if body.is_empty() {
-                    return jerr(req, 400, "empty-chunk");
-                }
                 let mut inner = room.inner.lock().unwrap();
                 // 房间清扫可能与慢速请求竞争：已销毁的房间不再接受分片，否则分片记账
                 // 只增不减（房间已从 rooms 移除，永远不会再有 destroy 来释放这笔计数）。
                 if inner.dead {
                     drop(inner);
                     return jerr(req, 410, "gone");
+                }
+                if body.is_empty() {
+                    drop(inner);
+                    return jerr(req, 400, "empty-chunk");
+                }
+                // X-Chunk-Seq（可选头，向后兼容）：缺失 → 旧语义 index = posted++。
+                //   seq == posted → 正常入库，响应 {index:seq}
+                //   seq <  posted → 该序号已入账：200 duplicate，不写 buffer/bytes/global、
+                //                   不占背压、不 notify（重投幂等）
+                //   seq >  posted → 409 out-of-order（带当前 posted，发送端可据此对齐）
+                // 重复的同名头按 Node 的合并语义（"a, b"）必然非法，统一 400 bad-seq。
+                let seq_vals = hdr_values(&req, "X-Chunk-Seq");
+                let seq = match seq_vals.len() {
+                    0 => None,
+                    1 => match parse_chunk_seq(&seq_vals[0]) {
+                        Some(v) => Some(v),
+                        None => {
+                            drop(inner);
+                            return jerr(req, 400, "bad-seq");
+                        }
+                    },
+                    _ => {
+                        drop(inner);
+                        return jerr(req, 400, "bad-seq");
+                    }
+                };
+                if let Some(seq) = seq {
+                    let posted = inner.posted;
+                    if seq > posted {
+                        drop(inner);
+                        return json_resp(req, 409, format!("{{\"error\":\"out-of-order\",\"posted\":{}}}", posted));
+                    }
+                    if seq < posted {
+                        drop(inner);
+                        return json_resp(req, 200, format!("{{\"ok\":true,\"index\":{},\"duplicate\":true}}", seq));
+                    }
+                    // seq == posted：与无头路径一致，落到下面的背压检查/入库
                 }
                 let outstanding = if inner.resumable { inner.posted - inner.through } else { inner.buffer.len() as u64 };
                 let global = *w.global_buffered.lock().unwrap();
@@ -1176,5 +1243,33 @@ mod tests {
         assert!(room.buffer.contains_key(&0));
         assert!(advance_through(&mut room, &c, 2)); // 重复/滞后上报幂等
         assert_eq!(*c.lock().unwrap(), 200);
+    }
+
+    // X-Chunk-Seq 必须是严格十进制安全整数：+1/-1/中间空白/小数/非 ASCII/溢出/超 2^53-1
+    // 一律 400 bad-seq；首尾 OWS（空格/制表符）与 Node req.headers 的 trim 行为对齐。
+    #[test]
+    fn chunk_seq_parsing_is_strict_decimal() {
+        assert_eq!(parse_chunk_seq(b"0"), Some(0));
+        assert_eq!(parse_chunk_seq(b"007"), Some(7));
+        assert_eq!(parse_chunk_seq(b" 1 "), Some(1));
+        assert_eq!(parse_chunk_seq(b"\t2\t"), Some(2));
+        assert_eq!(parse_chunk_seq(b"9007199254740991"), Some(CHUNK_SEQ_MAX));
+        for bad in [
+            &b""[..],
+            &b" "[..],
+            &b"+1"[..],
+            &b"-1"[..],
+            &b"1 2"[..],
+            &b"1\t2"[..],
+            &b"1.0"[..],
+            &b"1e3"[..],
+            &b"a"[..],
+            &b"9007199254740992"[..],
+            &b"18446744073709551615"[..],
+            &b"18446744073709551616"[..],
+            &b"\xf0\x9f\x98\x80"[..],
+        ] {
+            assert!(parse_chunk_seq(bad).is_none(), "应拒绝 {:?}", bad);
+        }
     }
 }
