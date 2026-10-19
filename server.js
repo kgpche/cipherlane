@@ -11,6 +11,7 @@ const crypto = require('node:crypto')
 const os = require('node:os')
 const fs = require('node:fs')
 const path = require('node:path')
+const net = require('node:net')
 
 const PORT = Number(process.env.PORT || 7777)
 // HOST 空(默认)= 自动:绑 127.0.0.1 + 局域网(RFC1918)网卡;显式指定(如 0.0.0.0)则只绑该地址
@@ -76,6 +77,43 @@ function clientIp(req) {
   return ip
 }
 
+// ---------- Host / Origin 校验（仅 /api/*） ----------
+// 目的：防跨站 CSRF 与 DNS rebinding。Host 是域名时一律拒绝，只有已知主机名与 IP
+// 字面量放行（rebinding 必须借助域名，而正常 LAN 访问用的都是 IP/localhost）。
+// CLI/tray 不带 Origin，只要 Host 合法即不受影响。
+const ALLOW_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+// 从 Host 头取 hostname：`example.com:7777`、`[::1]:7777`、`host.` 都要能归一化
+function hostnameOf(hostHeader) {
+  let h = String(hostHeader || '').trim().toLowerCase()
+  if (!h) return ''
+  if (net.isIP(h)) return h // 裸 IPv6/IPv4（无端口，非标准 Host 但可容错）
+  if (h.startsWith('[')) { // IPv6 字面量（带方括号/端口）
+    const end = h.indexOf(']')
+    h = end > 0 ? h.slice(1, end) : ''
+  } else {
+    const colon = h.indexOf(':')
+    if (colon !== -1) h = h.slice(0, colon)
+  }
+  return h.endsWith('.') ? h.slice(0, -1) : h
+}
+function hostAllowed(hostHeader) {
+  const h = hostnameOf(hostHeader)
+  return !!h && (ALLOW_HOSTS.has(h) || net.isIP(h) !== 0)
+}
+// Origin/Referer 若存在，其 host 也必须在允许集合内；缺失（CLI/同源 GET 被裁剪）直接放行
+function originAllowed(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return true
+  try { return hostAllowed(new URL(raw).host) } catch { return false }
+}
+
+function etagMatches(header, etag) {
+  if (!header) return false
+  const h = String(header).trim()
+  if (h === '*') return true
+  return h.split(',').some((t) => t.trim() === etag)
+}
+
 function sendJson(res, code, obj) {
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -89,19 +127,36 @@ function readBody(req, cap) {
   return new Promise((resolve, reject) => {
     const parts = []
     let n = 0
-    req.on('data', (c) => {
+    let settled = false
+    const fail = (e) => {
+      if (settled) return
+      settled = true
+      req.removeListener('data', onData)
+      req.resume() // 丢弃剩余请求体（不能 destroy：那样响应还没发出连接就重置了）
+      reject(e)
+    }
+    const onData = (c) => {
+      if (settled) return
       n += c.length
       if (n > cap) {
         const e = new Error('body too large')
         e.code = 413
-        req.destroy()
-        reject(e)
+        fail(e)
         return
       }
       parts.push(c)
+    }
+    req.on('data', onData)
+    req.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(parts))
     })
-    req.on('end', () => resolve(Buffer.concat(parts)))
-    req.on('error', reject)
+    req.on('error', (e) => {
+      if (settled) return
+      settled = true
+      reject(e)
+    })
   })
 }
 
@@ -146,7 +201,8 @@ for (const [route, file, type] of [
   try {
     let data = readAsset(file)
     if (file === 'public/index.html') data = Buffer.from(data.toString('utf8').replaceAll('__VERSION__', VERSION))
-    staticFiles.set(route, { data, type })
+    const etag = '"' + crypto.createHash('sha256').update(data).digest('hex') + '"'
+    staticFiles.set(route, { data, type, etag })
   } catch { /* 文件缺失时该路由 500 */ }
 }
 
@@ -181,7 +237,12 @@ function takeChunk(room, i) {
   room.buffer.delete(i)
   room.bytes -= c.length
   globalBuffered -= c.length
-  room.head = i + 1
+  // head 只在按序取走时推进；越序取走的序号通过"已投递但不在 buffer"推导，
+  // 避免越序 GET 把低序号分片变成不可达垃圾（也避免 taken 集合无界增长）。
+  if (i === room.head) {
+    room.head = i + 1
+    while (room.head < room.posted && !room.buffer.has(room.head)) room.head++
+  }
   if (room.head > room.pulled) room.pulled = room.head
   room.receiverSeen = true
   room.lastActive = Date.now()
@@ -251,6 +312,10 @@ function destroyRoom(room) {
   console.log(`[room] - ${room.id}`)
 }
 
+// destroyRoom 可能发生在任意 await（慢速请求体读取）期间：await 返回后写房间前必须复核存活，
+// 否则分片记账会落在已从 rooms 移除、再也不会被销毁的对象上 → globalBuffered 只增不减。
+const roomAlive = (room) => rooms.get(room.id) === room
+
 // ---------- 设备与邀请 ----------
 function deviceAlive(d) {
   return d && Date.now() - d.lastSeen <= DEVICE_TTL_MS
@@ -311,6 +376,8 @@ function handlePull(room, i, res, ip, resume) {
     })
     return res.end(body)
   }
+  // 已投递但不在缓冲区 = 已被越序/并发取走（经典模式取走即焚）→ 明确 410，不要挂空等待
+  if (i < room.posted) return sendJson(res, 410, { error: 'consumed' })
   // 发送方已声明结束但仍缺分片 → 传输被中断
   if (room.senderDone && i >= room.posted) return sendJson(res, 410, { error: 'sender-gone' })
   return parkWaiter(room, i, res, ip, null)
@@ -364,16 +431,36 @@ async function handleRequest(req, res) {
     const u = new URL(req.url, 'http://localhost')
     const p = u.pathname
 
-    // 静态页面
+    // /api/* 的 Host/Origin 闸门（防 DNS rebinding 与跨站 CSRF）。静态页不做限制，
+    // 这样自定义域名只影响 API 调用、不影响页面本身（误伤面最小）。
+    if (p === '/api' || p.startsWith('/api/')) {
+      if (!hostAllowed(req.headers.host)) return sendJson(res, 403, { error: 'bad-host' })
+      if (!originAllowed(req.headers.origin) || !originAllowed(req.headers.referer))
+        return sendJson(res, 403, { error: 'bad-origin' })
+    }
+
+    // 静态页面：HTML 仍 no-store；JS/CSS/SVG 用 ETag 做回源校验（no-cache）并支持 304
     if (req.method === 'GET' && staticFiles.has(p)) {
       const f = staticFiles.get(p)
-      res.writeHead(200, {
+      const html = f.type.startsWith('text/html')
+      const headers = {
         'Content-Type': f.type,
-        'Cache-Control': 'no-store',
         'Content-Security-Policy': CSP,
         'Referrer-Policy': 'no-referrer',
         'X-Content-Type-Options': 'nosniff',
-      })
+      }
+      if (html) {
+        headers['Cache-Control'] = 'no-store'
+        res.writeHead(200, headers)
+        return res.end(f.data)
+      }
+      headers['Cache-Control'] = 'no-cache' // 可缓存但必须回源校验
+      headers['ETag'] = f.etag
+      if (etagMatches(req.headers['if-none-match'], f.etag)) {
+        res.writeHead(304, headers)
+        return res.end()
+      }
+      res.writeHead(200, headers)
       return res.end(f.data)
     }
     if (p === '/favicon.ico') { res.writeHead(204); return res.end() }
@@ -506,6 +593,7 @@ async function handleRequest(req, res) {
         if (!room || room.offer.state !== 'pending' || room.offer.toIp !== ip)
           return sendJson(res, 410, { error: 'gone' })
         await readBody(req, 1024).catch(() => {})
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         room.lastActive = Date.now()
         if (mo[2] === 'accept') {
           room.offer.state = 'accepted'
@@ -565,6 +653,7 @@ async function handleRequest(req, res) {
         let body
         try { body = JSON.parse((await readBody(req, 8192)).toString('utf8') || '{}') }
         catch { return sendJson(res, 400, { error: 'bad-body' }) }
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         const target = devices.get(String(body.to || ''))
         if (!deviceAlive(target)) return sendJson(res, 404, { error: 'device-offline' })
         if (typeof body.pub !== 'string' || !PUB_RE.test(body.pub)) return sendJson(res, 400, { error: 'bad-pub' })
@@ -600,6 +689,8 @@ async function handleRequest(req, res) {
         } catch (e) {
           return sendJson(res, e.code === 413 ? 413 : 400, { error: 'bad-body' })
         }
+        // 读包期间房间可能已被 DELETE/清扫销毁：不再接受分片，也不写任何全局计数
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         if (!body.length) return sendJson(res, 400, { error: 'empty-chunk' })
         // 背压：发送方领先太多时让其稍后重试
         // 背压：经典模式按滞留分片数；可续传模式按 未确认分片数(posted - through)
@@ -621,14 +712,18 @@ async function handleRequest(req, res) {
       }
 
       if (sub === 'chunk' && req.method === 'GET') {
-        const i = Number(u.searchParams.get('i'))
-        if (!Number.isInteger(i) || i < 0) return sendJson(res, 400, { error: 'bad-index' })
+        const iRaw = u.searchParams.get('i')
+        // 缺省/非法 i 必须 400：Number(null) === 0 会把"没有参数"静默当成 0 号分片消费掉
+        if (iRaw === null || !/^\d+$/.test(iRaw)) return sendJson(res, 400, { error: 'bad-index' })
+        const i = Number(iRaw)
+        if (!Number.isSafeInteger(i)) return sendJson(res, 400, { error: 'bad-index' })
         return handlePull(room, i, res, clientIp(req), req.headers['x-resume'] === '1')
       }
 
       if (sub === 'done' && req.method === 'POST') {
         if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
         await readBody(req, 1024).catch(() => {})
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         room.senderDone = true
         room.lastActive = Date.now()
         return sendJson(res, 200, { ok: true })
@@ -639,6 +734,7 @@ async function handleRequest(req, res) {
       // 其危害等价于既有的分片抢拉（可用性攻击，见 README 安全模型）。
       if (sub === 'progress' && req.method === 'POST') {
         const body = await readBody(req, 1024).catch(() => null)
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         let through = null
         if (body) {
           try {
@@ -657,6 +753,7 @@ async function handleRequest(req, res) {
       // 由发送方在 state 里取回后本地核对——无密钥者伪造的 ack 发送方一眼可辨。
       if (sub === 'ack' && req.method === 'POST') {
         const body = await readBody(req, 1024).catch(() => null)
+        if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         let proof = null
         if (body) {
           try {
@@ -705,9 +802,28 @@ function lanAddresses() {
   return [...new Set(out)]
 }
 const listenAddrs = HOST ? [HOST] : ['127.0.0.1', ...lanAddresses()]
+// 补充 Host 白名单：显式 HOST（域名时）、os.hostname() 及其短名；IP 字面量由 hostAllowed 动态放行
+for (const addr of listenAddrs) {
+  const a = String(addr).toLowerCase()
+  if (a !== '0.0.0.0' && a !== '::' && net.isIP(a) === 0) ALLOW_HOSTS.add(a)
+}
+if (HOST && net.isIP(String(HOST)) === 0) ALLOW_HOSTS.add(String(HOST).toLowerCase())
+const osHost = String(os.hostname() || '').trim().toLowerCase()
+if (osHost) {
+  ALLOW_HOSTS.add(osHost)
+  ALLOW_HOSTS.add(osHost.split('.')[0])
+}
+// 自定义域名/反代/本地测试域名（如浏览器测试的 *.test）用显式白名单放行：
+// CIPHERLANE_EXTRA_HOSTS="files.lan,mybox.example"（逗号分隔，忽略端口）
+for (const h of String(process.env.CIPHERLANE_EXTRA_HOSTS || '').split(',')) {
+  const v = h.trim().toLowerCase().replace(/:\d+$/, '')
+  if (v) ALLOW_HOSTS.add(v)
+}
+const servers = []
 let listenReady = 0
 for (const addr of listenAddrs) {
   const s = http.createServer(handleRequest)
+  servers.push(s)
   s.on('clientError', (_err, socket) => socket.destroy())
   s.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
@@ -775,7 +891,30 @@ async function banner() {
   console.log('\n等待传输…（Ctrl+C 退出）')
 }
 
-process.on('SIGINT', () => {
-  console.log('\n再见')
-  process.exit(0)
-})
+// ---------- 优雅停机 ----------
+// SIGINT/SIGTERM 共用：先停监听，250ms 后结束残留连接（keep-alive/长轮询），
+// 2s 兜底强制退出。SIGINT 保留原有"再见"文案。
+let shuttingDown = false
+function shutdown(reason) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(reason === 'SIGTERM' ? '\n收到 SIGTERM，正在优雅停机…' : '\n再见')
+  const force = setTimeout(() => process.exit(0), 2000)
+  force.unref()
+  let pending = servers.length
+  const finish = () => { if (--pending <= 0) process.exit(0) }
+  if (!pending) process.exit(0)
+  for (const s of servers) {
+    try { s.close(finish) } catch { finish() }
+  }
+  const cut = setTimeout(() => {
+    for (const s of servers) {
+      if (typeof s.closeAllConnections === 'function') {
+        try { s.closeAllConnections() } catch {}
+      }
+    }
+  }, 250)
+  cut.unref()
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))

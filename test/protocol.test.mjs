@@ -3,6 +3,7 @@
 // 注：本测试收发双方都来自 127.0.0.1，与"一个 IP 一台终端"模型形成同 IP 退化场景：
 //     后注册者轮换设备条目，先注册者需重新注册拿新 secret —— 测试顺带覆盖该路径。
 import { spawn } from 'node:child_process'
+import http from 'node:http'
 import { randomBytes, createCipheriv, createDecipheriv, generateKeyPairSync, createPrivateKey, createPublicKey, diffieHellman, createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import assert from 'node:assert'
@@ -51,6 +52,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 async function jfetch(pathname, opts = {}) {
   const r = await fetch(S + pathname, opts)
   return { status: r.status, json: r.ok || (r.headers.get('content-type') || '').includes('json') ? await r.json().catch(() => ({})) : null }
+}
+
+// fetch 不能自定义 Host/Origin：用原始 http.request 验证 Host/Origin 闸门
+function rawRequest(pathname, { method = 'GET', headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: IP, port: PORT, path: pathname, method, headers }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }))
+    })
+    req.on('error', reject)
+    if (body) req.write(body)
+    req.end()
+  })
 }
 
 async function register(name) {
@@ -400,6 +415,125 @@ async function main() {
     }
 
     
+    // ---------- 静态资源：ETag/304（HTML 仍 no-store） ----------
+    if (!ALT) {
+      const a = await fetch(S + '/app.js')
+      assert.strictEqual(a.status, 200)
+      const etag = a.headers.get('etag')
+      assert(etag && /^"[0-9a-f]{64}"$/.test(etag), '静态 JS 应带强 ETag: ' + etag)
+      assert.strictEqual(a.headers.get('cache-control'), 'no-cache', 'JS 应回源校验（no-cache）')
+      await a.arrayBuffer()
+      const b = await fetch(S + '/app.js', { headers: { 'If-None-Match': etag } })
+      assert.strictEqual(b.status, 304, 'ETag 命中应 304')
+      assert.strictEqual(b.headers.get('etag'), etag)
+      const html = await fetch(S + '/')
+      assert.strictEqual(html.headers.get('cache-control'), 'no-store', 'HTML 必须保持 no-store')
+      await html.text()
+      ok('静态资源：JS 200+ETag/no-cache → 304；HTML 仍 no-store')
+    }
+
+    // ---------- 413 可达：超 BODY_MAX 回 JSON 而非 ECONNRESET ----------
+    if (!ALT) {
+      const r13 = await jfetch('/api/rooms', { method: 'POST' })
+      const rr13 = r13.json
+      const big = await fetch(`${S}/api/rooms/${rr13.room}/chunk`, {
+        method: 'POST',
+        headers: { 'X-Room-Token': rr13.token },
+        body: Buffer.alloc(2 * 1024 * 1024),
+      })
+      assert.strictEqual(big.status, 413, '超 BODY_MAX 应回 413，而不是连接重置')
+      assert.strictEqual((await big.json()).error, 'bad-body')
+      assert.strictEqual((await jfetch('/api/version')).status, 200, '413 后服务器应继续可用')
+      ok('413 可达：>1.5MiB 分片回 413 JSON（非 ECONNRESET），服务继续可用')
+    }
+
+    // ---------- 请求边界：?i 缺失 400 / 越序 GET 不产生不可达分片 / DEPTH=3 预取 ----------
+    if (!ALT) {
+      let rb = await jfetch('/api/rooms', { method: 'POST' })
+      const br = rb.json
+      const bkey = randomBytes(32)
+      const bpost = (pt) => jfetch(`/api/rooms/${br.room}/chunk`,
+        { method: 'POST', headers: { 'X-Room-Token': br.token }, body: seal(bkey, Buffer.from(pt)) })
+      for (const pt of ['meta', 'a', 'b']) await bpost(pt)
+      // 缺省/空 ?i 不能再被 Number(null)=0 静默当成 0 号分片
+      assert.strictEqual((await jfetch(`/api/rooms/${br.room}/chunk`)).status, 400, '缺 ?i 应 400')
+      assert.strictEqual((await fetch(`${S}/api/rooms/${br.room}/chunk?i=`)).status, 400, '空 ?i 应 400')
+      // 经典模式越序 GET：先取 1 不应让 0 变成不可达垃圾
+      assert.strictEqual((await fetch(`${S}/api/rooms/${br.room}/chunk?i=1`)).status, 200)
+      assert.strictEqual((await fetch(`${S}/api/rooms/${br.room}/chunk?i=0`)).status, 200, '越序取 1 后仍应能取 0')
+      assert.strictEqual((await fetch(`${S}/api/rooms/${br.room}/chunk?i=2`)).status, 200)
+      const bst = (await jfetch(`/api/rooms/${br.room}/state`)).json
+      assert.strictEqual(bst.head, 3, 'head 应在连续消费后推进到 3')
+      assert.strictEqual(bst.pulled, 3)
+      // 重复取已消费分片：明确 410，而不是挂到超时
+      assert.strictEqual((await fetch(`${S}/api/rooms/${br.room}/chunk?i=1`)).status, 410)
+      // 浏览器 DEPTH=3 并发预取（按序 0..3）不能被 head 逻辑破坏
+      rb = await jfetch('/api/rooms', { method: 'POST' })
+      const pr = rb.json
+      for (const pt of ['meta', '0', '1', '2']) await jfetch(`/api/rooms/${pr.room}/chunk`,
+        { method: 'POST', headers: { 'X-Room-Token': pr.token }, body: seal(bkey, Buffer.from(pt)) })
+      const par = await Promise.all([0, 1, 2, 3].map((i) => fetch(`${S}/api/rooms/${pr.room}/chunk?i=${i}`)))
+      assert.deepStrictEqual(par.map((x) => x.status), [200, 200, 200, 200], 'DEPTH=3 并发按序预取应全 200')
+      assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/state`)).json.head, 4)
+      ok('请求边界：缺/空 ?i→400；越序 GET 不产生不可达分片；DEPTH=3 并发预取正常')
+    }
+
+    // ---------- 房间销毁与慢速 chunk POST 竞态：410 gone，不向已销毁房间记账 ----------
+    {
+      const rc = await jfetch('/api/rooms', { method: 'POST' })
+      const rcr = rc.json
+      const payload = randomBytes(64 * 1024)
+      const half = payload.length >> 1
+      const race = new Promise((resolve, reject) => {
+        const q = http.request({
+          host: IP, port: PORT, path: `/api/rooms/${rcr.room}/chunk`, method: 'POST',
+          headers: { 'X-Room-Token': rcr.token, 'Content-Length': payload.length },
+        }, (res) => {
+          const chunks = []
+          res.on('data', (c) => chunks.push(c))
+          res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }))
+        })
+        q.on('error', reject)
+        q.write(payload.subarray(0, half)) // 服务器此刻阻塞在 readBody
+        setTimeout(async () => {
+          try {
+            const del = await jfetch(`/api/rooms/${rcr.room}`, { method: 'DELETE', headers: { 'X-Room-Token': rcr.token } })
+            assert.strictEqual(del.status, 200)
+            q.end(payload.subarray(half)) // body 读完时必须命中"房间已销毁"
+          } catch (e) { reject(e) }
+        }, 500)
+      })
+      const got = await race
+      assert.strictEqual(got.status, 410, `房间销毁后完成投递应 410 gone，实际 ${got.status}`)
+      assert.strictEqual(JSON.parse(got.body.toString('utf8') || '{}').error, 'gone')
+      // 顺序 DELETE 之后再投递：路由层已无此房间 → 404（与 Rust 版一致；竞态路径才是 410）
+      const sequential = await rawRequest(`/api/rooms/${rcr.room}/chunk`, {
+        method: 'POST', headers: { 'X-Room-Token': rcr.token }, body: Buffer.from('x'),
+      })
+      assert.strictEqual(sequential.status, 404)
+      // 服务器仍健康、记账未写坏：还能继续建房
+      assert.strictEqual((await jfetch('/api/rooms', { method: 'POST' })).status, 200)
+      ok('竞态：慢速 chunk POST 期间房间被 DELETE → 410 gone（不写已销毁房间）')
+    }
+
+    // ---------- Host/Origin 闸门：防 DNS rebinding / 跨站 CSRF ----------
+    if (!ALT) {
+      // 域名 Host（rebinding 前提）→ /api/* 403；IP 字面量 Host 正常
+      assert.strictEqual((await rawRequest('/api/devices', { headers: { Host: 'evil.example' } })).status, 403)
+      assert.strictEqual((await rawRequest('/api/devices', { headers: { Host: `127.0.0.1:${PORT}` } })).status, 200)
+      // 静态页不受 Host/Origin 限制（自定义域名不影响页面本身）
+      assert.strictEqual((await rawRequest('/', { headers: { Host: 'evil.example' } })).status, 200)
+      // 跨站 Origin 的 adopt 必须 403（网页 CSRF 不能设停机令牌）；同源放行
+      const evilAdopt = await rawRequest('/api/adopt', {
+        method: 'POST',
+        headers: { Host: `127.0.0.1:${PORT}`, Origin: 'https://evil.example', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'z'.repeat(24) }),
+      })
+      assert.strictEqual(evilAdopt.status, 403, '跨站 Origin 的 adopt 应 403')
+      assert.strictEqual((await rawRequest('/api/version', { headers: { Origin: `http://127.0.0.1:${PORT}` } })).status, 200)
+      ok('Host/Origin：域名 Host 403 / IP Host 200 / 跨站 Origin 403 / 同源放行 / 静态页不受限')
+    }
+
     // ---------- 面板端点 ----------
     {
       let r = await jfetch('/api/version')
@@ -437,6 +571,19 @@ async function main() {
       r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
       assert.strictEqual(r.status, 403)
       ok('adopt：回环接管 200 / 短令牌 400 / 二次接管 409 / shutdown 空令牌仍 403')
+    }
+
+    // ---------- SIGTERM 优雅停机：退出码 0 + 停机文案 ----------
+    if (!ALT) {
+      const exited = await new Promise((resolve) => {
+        const t = setTimeout(() => resolve(null), 3000)
+        child.once('close', (code, signal) => { clearTimeout(t); resolve({ code, signal }) })
+        child.kill('SIGTERM')
+      })
+      assert(exited, 'SIGTERM 后 3s 内未退出（优雅停机未生效）')
+      assert.strictEqual(exited.code, 0, `SIGTERM 应退出码 0，实际 code=${exited.code} signal=${exited.signal}`)
+      assert(/优雅停机/.test(logs), '应打印优雅停机文案: ' + logs.slice(-300))
+      ok('SIGTERM 优雅停机：关闭监听/连接后 exit 0')
     }
 
 console.log(`\nprotocol: 全部 ${passed} 组通过`)
