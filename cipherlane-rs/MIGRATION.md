@@ -1,0 +1,22 @@
+# Rust 重构计划（分阶段、协议兼容优先）
+
+## 原则
+- **浏览器端保持 JS 不动**：非安全上下文（http 局域网）的纯 JS 加密（AES-GCM/X25519/SHA-256）
+  无法用 Rust 替代（WASM 需要构建链与更大资产，破坏零构建理念）。Rust 重构范围 = 服务器 + CLI + 原生托盘。
+- **线协议逐字节兼容**：现有 8 套测试（protocol 14 组 / cli 6 组 / browser 10 组）为验收标准。
+  测试增加 `CIPHERLANE_TEST_SERVER` 环境变量,可对 Node 版或 Rust 版跑同一套断言（平价对照引擎）。
+- **迁移期 Node 版保留**,Rust 版达成全绿后切换打包,Node 版转维护模式。
+
+## 阶段
+- P0 工具链：`sudo apt install build-essential`（宿主构建脚本需要 cc;musl 静态目标交叉产物）
+- P1 服务器核心（本 crate）：静态资源(编译期内嵌 include_bytes,等价 SEA)、rooms/chunks 长轮询/背压、
+  presence/devices/offers、done/ack、清扫。验收 = protocol 测试对 Rust 全绿。
+- P2 面板端点(version/shutdown 令牌/update) + 打包：musl 静态单文件(≈3-5MB,替代 125MB SEA)、
+  deb(桌面集成沿用)、Windows(cross x86_64-pc-windows-gnu)、macOS。
+- P3 真·系统托盘（ksni crate,GNOME 需 AppIndicator 扩展——Ubuntu 自带）：菜单 打开/开启/退出/关于/检查更新。
+- P4 CLI 重构（rustcrypto：aes-gcm/x25519-dalek/sha2,与浏览器逐字节互通用现有 x25519 测试向量锁定）。
+
+## 备注
+- 无 cc 环境的兜底（已验证到链接层,记录备查）：~/.local/bin/ld-shim 用自带 rust-lld 做 cc→ld 方言翻译,
+  宿主 glibc 链接可通但构建脚本运行异常——正式环境直接装 build-essential。
+- 依赖面：tiny_http + serde_json + rand + base64（服务器零知识,无需任何加密库）。

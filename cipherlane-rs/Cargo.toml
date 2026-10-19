@@ -1,0 +1,17 @@
+[package]
+name = "cipherlane"
+version = "0.4.3"
+edition = "2021"
+description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器）"
+license = "MIT"
+
+[dependencies]
+tiny_http = "0.12"
+serde_json = "1"
+rand = "0.8"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
