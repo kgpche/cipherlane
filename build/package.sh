@@ -187,8 +187,20 @@ Description: cipherlane · 密道 —— 局域网端到端加密传输
  自包含单文件服务（内嵌 Node 运行时与全部前端资源），安装即用、无需 Node。
  安装后执行: sudo systemctl enable --now cipherlane
  然后浏览器打开 http://<本机IP>:7777
+Recommends: gnome-shell-extension-appindicator
 EOF
-printf '#!/bin/sh\nsystemctl daemon-reload 2>/dev/null || true\necho\necho "  cipherlane 已安装。启动服务：sudo systemctl enable --now cipherlane"\necho "  或前台运行：cipherlane"\necho\nexit 0\n' > "$DEBROOT/DEBIAN/postinst"
+cat > "$DEBROOT/DEBIAN/postinst" << 'POSTINST'
+#!/bin/sh
+systemctl daemon-reload 2>/dev/null || true
+# GNOME:启用 Ubuntu 自带的 appindicator 扩展,让系统托盘图标可见(无桌面会话时静默跳过)
+if command -v gnome-extensions >/dev/null 2>&1 && gnome-extensions list 2>/dev/null | grep -q '^ubuntu-appindicators@'; then
+  gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null || true
+fi
+echo
+echo "  cipherlane 已安装。应用列表点击 cipherlane,或等托盘图标(需 appindicator 扩展)自动出现"
+echo
+exit 0
+POSTINST
 chmod 755 "$DEBROOT/DEBIAN/postinst"
 dpkg-deb --build --root-owner-group "$DEBROOT" "$DIST/cipherlane_${VER}_amd64.deb" >/dev/null
 
