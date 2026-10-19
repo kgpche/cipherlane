@@ -29,3 +29,13 @@
 - 断连检测：/proc/net/tcp 轮询(100ms 片)等价 Node res.on('close') 的配额释放语义
 - 产物：release 单文件 ~800KB（Node SEA 125MB 的 1/156）；EADDRINUSE 友好提示保留
 - P2 待办：musl 静态构建入打包脚本、deb/exe/osx 切换 Rust 产物；P3 真·托盘(ksni)
+
+## P2/P3 完成记录（2026-10-19）
+- P3 真·系统托盘（ksni 0.3 + 纯 Rust zbus，零系统 libdbus 依赖）：
+  菜单 = 打开主页/打开控制面板/启动服务/停止服务/检查更新/关于/退出托盘；
+  托盘启动的服务持停机令牌；assume_sni_available 兼容 ubuntu:GNOME（watcher 未注册场景）；
+  D-Bus 注册验证通过（org.kde.StatusNotifierItem-*）
+- P2 deb 切换 Rust：cipherlane(musl 静态 0.9MB) + cipherlane-tray(2.3MB) +
+  /etc/xdg/autostart 自启 + 双主题图标（运行绿盾/停止灰盾）；
+  deb 31MB → 1.1MB；无 Rust 工具链时回退 Node SEA
+- Windows/macOS 暂留 Node SEA（待 mingw/osxcross 交叉工具链）

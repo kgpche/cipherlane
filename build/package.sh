@@ -1,5 +1,6 @@
 #!/bin/sh
-# cipherlane 多平台打包：一条命令产出 .deb / .exe(zip) / macOS 通用包
+# cipherlane 多平台打包：一条命令产出 .deb(Rust musl 静态) / .exe(zip, Node SEA) / macOS(Node SEA)
+# Linux 已切换 Rust 实现（~0.9MB 静态单文件 + 系统托盘）；Windows/macOS 待交叉工具链后切换
 #
 #   sh build/package.sh [版本号]      # 默认取 package.json 的 version
 #
@@ -64,6 +65,17 @@ fetch_node node-win    https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-win-x64.
 fetch_node node-mac-a  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-arm64.tar.gz node-$NODE_VER-darwin-arm64/bin/node node-$NODE_VER-darwin-arm64.tar.gz
 fetch_node node-mac-x  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-x64.tar.gz   node-$NODE_VER-darwin-x64/bin/node   node-$NODE_VER-darwin-x64.tar.gz
 
+# ---------- 1.5) Rust 构建：musl 静态服务器 + 托盘（Linux deb 产物） ----------
+if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then
+  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml || exit 1
+  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane-tray || exit 1
+  RUST_SRV="$ROOT/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane"
+  RUST_TRAY="$ROOT/cipherlane-rs/target/release/cipherlane-tray"
+else
+  echo "!! 未安装 Rust 工具链，Linux deb 将回退 Node SEA 版（rustup.rs 安装后重打包可切换）"
+  RUST_SRV=""
+fi
+
 # ---------- 2) SEA blob（跨平台共享；关 code cache 保证跨平台兼容） ----------
 echo ">> 生成 SEA blob…"
 node --experimental-sea-config sea-config.json
@@ -78,6 +90,7 @@ rm -rf "$DEBROOT"
 mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system" "$DEBROOT/usr/share/applications" "$DEBROOT/usr/share/icons/hicolor/scalable/apps"
 # 桌面集成:应用列表显示"cipherlane 密道",点击即在终端窗口运行服务器(显示地址与二维码)
 cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane.svg"
+cp logo/02-shield-lane-stopped.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane-stopped.svg"
 mkdir -p "$DEBROOT/usr/lib/cipherlane"
 cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'EOF'
 #!/bin/sh
@@ -109,8 +122,25 @@ Keywords=lan;transfer;encrypt;airdrop;密道;传输;加密;
 StartupNotify=true
 X-GNOME-UsesNotifications=false
 EOF
-cp "$BUILD/cipherlane-linux-x64" "$DEBROOT/usr/bin/cipherlane"
-chmod 755 "$DEBROOT/usr/bin/cipherlane"
+if [ -n "$RUST_SRV" ]; then
+  cp "$RUST_SRV" "$DEBROOT/usr/bin/cipherlane"
+  cp "$RUST_TRAY" "$DEBROOT/usr/bin/cipherlane-tray"
+  chmod 755 "$DEBROOT/usr/bin/cipherlane" "$DEBROOT/usr/bin/cipherlane-tray"
+  mkdir -p "$DEBROOT/etc/xdg/autostart"
+  cat > "$DEBROOT/etc/xdg/autostart/cipherlane-tray.desktop" << 'AUTOSTART'
+[Desktop Entry]
+Type=Application
+Name=cipherlane Tray
+Comment=密道系统托盘（打开/开启/退出/关于/检查更新）
+Exec=cipherlane-tray
+Icon=cipherlane
+Terminal=false
+NoDisplay=true
+AUTOSTART
+else
+  cp "$BUILD/cipherlane-linux-x64" "$DEBROOT/usr/bin/cipherlane"
+  chmod 755 "$DEBROOT/usr/bin/cipherlane"
+fi
 cat > "$DEBROOT/usr/lib/systemd/system/cipherlane.service" << 'EOF'
 [Unit]
 Description=cipherlane · 密道 —— 局域网端到端加密传输

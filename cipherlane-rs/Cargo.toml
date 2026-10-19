@@ -2,7 +2,7 @@
 name = "cipherlane"
 version = "0.4.3"
 edition = "2021"
-description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器）"
+description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器 + 系统托盘）"
 license = "MIT"
 
 [dependencies]
@@ -11,6 +11,15 @@ serde_json = "1"
 rand = "0.8"
 base64 = "0.22"
 if-addrs = "0.13"
+ksni = { version = "0.3", features = ["blocking"] }
+
+[[bin]]
+name = "cipherlane"
+path = "src/main.rs"
+
+[[bin]]
+name = "cipherlane-tray"
+path = "src/bin/tray.rs"
 
 [profile.release]
 opt-level = "z"
