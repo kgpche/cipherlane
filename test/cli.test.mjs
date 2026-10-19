@@ -177,6 +177,72 @@ async function main() {
       ok('断点续传:SIGKILL 中断 → .part 保留 → 重跑续传完成,字节一致')
     }
 
+
+    // ---------- 定向模式：devices / listen 常驻 / --to 直发 ----------
+    {
+      const net = await import('node:net')
+      // 127.0.0.2 伪装第二台终端:监听 127.0.0.2:PORT,以 127.0.0.2 为源地址转发到服务器
+      const proxy = net.createServer((c) => {
+        const u = net.connect({ host: '127.0.0.1', port: PORT, localAddress: '127.0.0.2' })
+        c.pipe(u); u.pipe(c)
+        c.on('error', () => u.destroy()); u.on('error', () => c.destroy())
+      })
+      await new Promise((r) => proxy.listen(PORT, '127.0.0.2', r))
+
+      // 接收端:listen --yes 常驻,经代理上线
+      const recvDir = path.join(TMP, 'targeted-recv')
+      await fsp.mkdir(recvDir, { recursive: true })
+      const listener = spawn(process.execPath, [CLI, 'listen', '--yes', '-o', recvDir, '--name', '测试机B', '--server', `http://127.0.0.2:${PORT}`], {
+        cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let lout = ''
+      listener.stdout.on('data', (d) => { lout += d })
+      listener.stderr.on('data', (d) => { lout += d })
+
+      // 等待 127.0.0.2 上线(经 /api/devices 轮询)
+      let up = false
+      for (let i = 0; i < 50 && !up; i++) {
+        await sleep(200)
+        try {
+          const j = await (await fetch(`${S}/api/devices`)).json()
+          up = j.devices.some((d) => d.ip === '127.0.0.2')
+        } catch {}
+      }
+      assert(up, 'listen 未能上线(127.0.0.2 未出现在设备列表)')
+
+      // devices 列表应含接收端
+      const dev = await runCli(['devices']).done
+      assert.strictEqual(dev.code, 0, dev.out)
+      assert(/测试机B/.test(dev.out) && /127\.0\.0\.2/.test(dev.out), 'devices 应列出对端: ' + dev.out)
+
+      // 定向发送文本(发送方经默认源地址 127.0.0.1)
+      const payload = '定向直发自动化验证:CLI send-text --to ' + Date.now()
+      const sender = runCli(['send-text', payload, '--to', '127.0.0.2', '--name', '测试机A'])
+      const sent = await sender.done
+      assert.strictEqual(sent.code, 0, sent.out)
+      assert(/已完整接收/.test(sent.out), '发送方应确认完整接收: ' + sent.out.slice(-200))
+      // 监听端应解密打印同一文本
+      let gotText = false
+      for (let i = 0; i < 50 && !gotText; i++) { gotText = lout.includes(payload); if (!gotText) await sleep(200) }
+      assert(gotText, 'listen 端应收到并解密文本,实际:\n' + lout.slice(-400))
+
+      // 定向发送文件并校验落盘
+      const fdata = randomBytes(1.5 * 1024 * 1024 + 99)
+      const tsrc = path.join(TMP, 'targeted-src.bin')
+      await fsp.writeFile(tsrc, fdata)
+      const sender2 = runCli(['send', tsrc, '--to', '127.0.0.2', '--name', '测试机A'])
+      const sent2 = await sender2.done
+      assert.strictEqual(sent2.code, 0, sent2.out)
+      const saved = path.join(recvDir, 'targeted-src.bin')
+      let savedOk = false
+      for (let i = 0; i < 50 && !savedOk; i++) { savedOk = fs.existsSync(saved); if (!savedOk) await sleep(200) }
+      await sleep(300) // 等待写完
+      assert(savedOk && Buffer.compare(fdata, fs.readFileSync(saved)) === 0, '定向文件应逐字节落盘')
+
+      listener.kill('SIGINT')
+      proxy.close()
+      ok('定向模式:devices 列表 / listen --yes 常驻 / send+send-text --to 双向确认+落盘一致')
+    }
     console.log(`\ncli: 全部 ${passed} 组通过`)
   } finally {
     server.kill('SIGINT')
