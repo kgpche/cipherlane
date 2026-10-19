@@ -16,6 +16,9 @@
     "public/crypto-worker.js": "public/crypto-worker.js",
     "public/style.css": "public/style.css",
     "logo/02-shield-lane.svg": "logo/02-shield-lane.svg",
-    "logo/02-shield-lane-small.svg": "logo/02-shield-lane-small.svg"
+    "logo/02-shield-lane-small.svg": "logo/02-shield-lane-small.svg",
+    "public/panel.html": "public/panel.html",
+    "public/panel.js": "public/panel.js",
+    "public/panel.css": "public/panel.css"
   }
 }

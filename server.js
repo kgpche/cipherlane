@@ -55,6 +55,7 @@ const rooms = new Map()
 const devices = new Map()      // ip → { ip, id, secret, name, pub, since, lastSeen }
 const offersById = new Map()   // 邀请 id → room（房间销毁时连带清理）
 let globalBuffered = 0
+const STARTED_AT = Date.now()
 
 // ---------- 工具 ----------
 function randRoomId() {
@@ -138,6 +139,9 @@ for (const [route, file, type] of [
   ['/logo.svg', 'logo/02-shield-lane.svg', 'image/svg+xml'],
   ['/logo-small.svg', 'logo/02-shield-lane-small.svg', 'image/svg+xml'],
   ['/style.css', 'public/style.css', 'text/css; charset=utf-8'],
+  ['/panel', 'public/panel.html', 'text/html; charset=utf-8'],
+  ['/panel.js', 'public/panel.js', 'text/javascript; charset=utf-8'],
+  ['/panel.css', 'public/panel.css', 'text/css; charset=utf-8'],
 ]) {
   try {
     let data = readAsset(file)
@@ -396,6 +400,39 @@ async function handleRequest(req, res) {
       devices.set(ip, fresh)
       console.log(`[device] + ${ip} ${name}`)
       return sendJson(res, 200, { ip, id: fresh.id, secret: fresh.secret })
+    }
+
+    // GET /api/version —— 面板用：版本与运行状态
+    if (p === '/api/version' && req.method === 'GET') {
+      return sendJson(res, 200, { version: VERSION, rooms: rooms.size, startedAt: STARTED_AT })
+    }
+
+    // POST /api/shutdown —— 面板"停止服务"：仅本机 + 会话停机令牌双重校验
+    if (p === '/api/shutdown' && req.method === 'POST') {
+      const token = process.env.CIPHERLANE_SHUTDOWN_TOKEN || ''
+      let body = {}
+      try { body = JSON.parse((await readBody(req, 1024)).toString('utf8') || '{}') } catch {}
+      const ip = clientIp(req)
+      if (!token || token.length < 16 || body.token !== token || (ip !== '127.0.0.1' && ip !== '::1'))
+        return sendJson(res, 403, { error: 'forbidden' })
+      sendJson(res, 200, { ok: true })
+      console.log('[panel] 服务已从控制面板停止')
+      setTimeout(() => process.exit(0), 150)
+      return
+    }
+
+    // GET /api/update —— 检查更新：CIPHERLANE_UPDATE_URL 指向返回纯文本版本号的 URL
+    if (p === '/api/update' && req.method === 'GET') {
+      const url = process.env.CIPHERLANE_UPDATE_URL
+      if (!url) return sendJson(res, 200, { source: null, current: VERSION, message: '未配置更新源（CIPHERLANE_UPDATE_URL）' })
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(5000) })
+        const latest = (await r.text()).trim()
+        const newer = /^[0-9]/.test(latest) && latest !== VERSION
+        return sendJson(res, 200, { source: url, current: VERSION, latest, newer })
+      } catch (e) {
+        return sendJson(res, 200, { source: url, current: VERSION, error: String((e && e.message) || e) })
+      }
     }
 
     // GET /api/devices —— 在线设备列表

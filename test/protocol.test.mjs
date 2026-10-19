@@ -395,7 +395,28 @@ async function main() {
       ok('可续传模式：只读回放 / progress 释放·单调·越界 / 经典模式不受影响')
     }
 
-    console.log(`\nprotocol: 全部 ${passed} 组通过`)
+    
+    // ---------- 面板端点 ----------
+    {
+      let r = await jfetch('/api/version')
+      assert.strictEqual(r.status, 200)
+      assert.ok(r.json.version && r.json.startedAt, 'version/startedAt')
+      // shutdown：无令牌 403 / 错令牌 403（不真正关停，保持测试服务器存活）
+      r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+      assert.strictEqual(r.status, 403, '空令牌应 403')
+      r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'x'.repeat(24) }) })
+      assert.strictEqual(r.status, 403, '错令牌应 403')
+      // update：未配置源时如实返回
+      r = await jfetch('/api/update')
+      assert.strictEqual(r.status, 200)
+      assert.strictEqual(r.json.source, null)
+      // panel 静态页可达
+      const html = await fetch(S + '/panel')
+      assert.ok(html.ok && (await html.text()).includes('控制面板'))
+      ok('面板端点：version / shutdown 令牌双闸 403 / update 无源如实 / panel 页可达')
+    }
+
+console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')
   }

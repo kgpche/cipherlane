@@ -78,6 +78,22 @@ rm -rf "$DEBROOT"
 mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system" "$DEBROOT/usr/share/applications" "$DEBROOT/usr/share/icons/hicolor/scalable/apps"
 # 桌面集成:应用列表显示"cipherlane 密道",点击即在终端窗口运行服务器(显示地址与二维码)
 cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane.svg"
+mkdir -p "$DEBROOT/usr/lib/cipherlane"
+cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'EOF'
+#!/bin/sh
+# cipherlane 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板
+PORT=${CIPHERLANE_PORT:-7777}
+URL="http://127.0.0.1:$PORT"
+probe() { (curl -sf "$URL/api/version" || wget -qO- "$URL/api/version") >/dev/null 2>&1; }
+if ! probe; then
+  TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)
+  CIPHERLANE_SHUTDOWN_TOKEN="$TOKEN" nohup /usr/bin/cipherlane >/var/log/cipherlane-app.log 2>&1 &
+  for i in $(seq 1 50); do probe && break; sleep 0.2; done
+  exec xdg-open "$URL/panel#$TOKEN"
+fi
+exec xdg-open "$URL/panel"
+EOF
+chmod 755 "$DEBROOT/usr/lib/cipherlane/cipherlane-app"
 cat > "$DEBROOT/usr/share/applications/cipherlane.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
@@ -85,9 +101,9 @@ Name=cipherlane
 Comment=局域网端到端加密传输
 Comment[en]=LAN end-to-end encrypted transfer
 GenericName=文件传输
-Exec=/usr/bin/cipherlane
+Exec=/usr/lib/cipherlane/cipherlane-app
 Icon=cipherlane
-Terminal=true
+Terminal=false
 Categories=Network;FileTransfer;Utility;
 Keywords=lan;transfer;encrypt;airdrop;密道;传输;加密;
 StartupNotify=true

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cipherlane · 控制面板</title>
+<link rel="icon" type="image/svg+xml" href="/logo-small.svg">
+<link rel="stylesheet" href="/panel.css">
+</head>
+<body>
+<main class="card">
+  <header>
+    <svg viewBox="0 0 100 100" width="40" height="40" aria-hidden="true"><rect width="100" height="100" rx="3" fill="#37D4A0" mask="url(#s)"/><defs><mask id="s"><rect width="100" height="100" fill="#fff"/><rect x="0" y="43" width="100" height="14" fill="#000"/></mask></defs><rect x="20" y="20" width="60" height="60" rx="14" fill="#37D4A0" mask="url(#s)" opacity="0"/><path d="M28 18 Q50 8 72 18 L86 24 V50 C86 72 70 86 50 92 C30 86 14 72 14 50 V24 Z" fill="#37d4a0" mask="url(#s)"/><circle cx="86" cy="50" r="5" fill="#f9ab00"/></svg>
+    <div>
+      <h1>cipherlane <span class="ver" id="ver">…</span></h1>
+      <p class="sub">服务运行中 · <span id="uptime">—</span> · 活跃房间 <span id="rooms">—</span></p>
+    </div>
+    <span class="dot" id="dot" title="运行中"></span>
+  </header>
+
+  <div class="actions">
+    <button id="open" class="btn primary">🌐 打开主页</button>
+    <button id="update" class="btn">⟳ 检查更新</button>
+    <button id="about" class="btn">ℹ️ 关于</button>
+    <button id="stop" class="btn danger">⏹ 退出（停止服务）</button>
+  </div>
+
+  <p class="result" id="result"></p>
+
+  <section id="about-box" class="about" hidden>
+    <p><b>cipherlane · 密道</b> —— 局域网端到端加密传输</p>
+    <p>设备直发（X25519 密钥协商）或链接收发；HTTP 明文环境下内容依然全程 AES-256-GCM 加密，中转服务器零知识。</p>
+    <p class="dim">MIT License · 零依赖（Node 内置模块 only）</p>
+  </section>
+</main>
+<footer><p>面板令牌仅存在于本页 #fragment，不会发送至服务器（停止服务时除外）</p></footer>
+<script src="/panel.js"></script>
+</body>
+</html>
