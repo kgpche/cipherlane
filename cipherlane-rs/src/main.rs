@@ -563,7 +563,9 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
     // ---- GET /api/version ----
     if path == "/api/version" && method == "GET" {
         let rooms = w.rooms.lock().unwrap().len();
-        return json_resp(req, 200, serde_json::json!({ "version": VERSION, "rooms": rooms, "startedAt": w.started_at }).to_string());
+        // lan：本机首选局域网地址（供回环来源的客户端升级链接/跳转目标；无则 null）
+        let lan = lan_addresses().first().map(|a| a.to_string());
+        return json_resp(req, 200, serde_json::json!({ "version": VERSION, "rooms": rooms, "startedAt": w.started_at, "lan": lan }).to_string());
     }
 
     // ---- POST /api/shutdown：仅本机 + 会话停机令牌 ----

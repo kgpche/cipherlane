@@ -717,7 +717,7 @@ async function startSend(kind, payload, target) {
     } else {
       key = new Uint8Array(32)
       crypto.getRandomValues(key)
-      link = location.origin + '/#' + room + '.' + toB64(key)
+      link = publicOrigin() + '/#' + room + '.' + toB64(key)
       setStatus('send-status', '🟡 等待接收方打开链接…', 'warn')
     }
   } catch (e) {
@@ -1310,6 +1310,15 @@ document.addEventListener('paste', (e) => {
     store.set('cipherlane-sk', toB64(kp.sk))
     location.reload() // identity 是启动时读入的模块常量,重载生效最干净
   }
+}
+
+// 链接/QR 的公共来源：回环打开时升级为 LAN 地址（对方可达），由服务器 /api/version 提示
+let LAN_HINT = null
+;(async () => { try { LAN_HINT = (await (await fetch('/api/version')).json()).lan || null } catch {} })()
+function publicOrigin() {
+  const h = location.hostname
+  const loop = h === '127.0.0.1' || h === 'localhost' || h === '::1'
+  return loop && LAN_HINT ? `http://${LAN_HINT}:${location.port || 7777}` : location.origin
 }
 
 // ---------- 启动 ----------

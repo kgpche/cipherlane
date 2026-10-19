@@ -59,6 +59,21 @@ impl CipherlaneTray {
     fn base(&self) -> String {
         format!("http://127.0.0.1:{}", port())
     }
+    // 主页用 LAN 地址打开：经回环打开会让链接/二维码变成 127.0.0.1（对方不可达）
+    fn lan_base(&self) -> String {
+        let lan = if_addrs::get_if_addrs()
+            .ok()
+            .map(|v| {
+                v.into_iter()
+                    .filter_map(|i| match i.ip() {
+                        std::net::IpAddr::V4(v4) if !v4.is_loopback() && v4.is_private() => Some(v4),
+                        _ => None,
+                    })
+                    .next()
+            })
+            .flatten();
+        format!("http://{}:{}", lan.map(|a| a.to_string()).unwrap_or_else(|| "127.0.0.1".into()), port())
+    }
     fn start_server(&mut self) {
         if self.running {
             return;
@@ -135,7 +150,7 @@ impl Tray for CipherlaneTray {
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         if self.running {
-            open(&format!("{}/", self.base()));
+            open(&format!("{}/", self.lan_base()));
         } else {
             self.start_server();
         }
@@ -162,7 +177,7 @@ impl Tray for CipherlaneTray {
             let base = self.base();
             items.push(MenuItem::Standard(StandardItem {
                 label: "打开主页".into(),
-                activate: Box::new(move |t: &mut Self| open(&format!("{}/", t.base().is_empty().then(|| base.clone()).unwrap_or(base.clone())))),
+                activate: Box::new(|t: &mut Self| open(&format!("{}/", t.lan_base()))),
                 ..Default::default()
             }));
             items.push(MenuItem::Standard(StandardItem {

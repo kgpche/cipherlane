@@ -28,7 +28,14 @@ async function refresh() {
   }
 }
 
-$('#open').onclick = () => window.open('/', '_blank')
+let lanHint = null // 服务器提示的首选局域网地址：回环打开面板时,主页跳转用 LAN（对方可达）
+{
+  fetch('/api/version').then((r) => r.json()).then((j) => { lanHint = j.lan || null }).catch(() => {})
+}
+$('#open').onclick = () => {
+  const loop = location.hostname === '127.0.0.1' || location.hostname === 'localhost' || location.hostname === '::1'
+  window.open(loop && lanHint ? `http://${lanHint}:${location.port || 7777}/` : '/', '_blank')
+}
 
 $('#about').onclick = () => { $('#about-box').hidden = !$('#about-box').hidden }
 

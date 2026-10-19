@@ -404,7 +404,7 @@ async function handleRequest(req, res) {
 
     // GET /api/version —— 面板用：版本与运行状态
     if (p === '/api/version' && req.method === 'GET') {
-      return sendJson(res, 200, { version: VERSION, rooms: rooms.size, startedAt: STARTED_AT })
+      return sendJson(res, 200, { version: VERSION, rooms: rooms.size, startedAt: STARTED_AT, lan: lanAddresses()[0] || null })
     }
 
     // POST /api/shutdown —— 面板"停止服务"：仅本机 + 会话停机令牌双重校验
