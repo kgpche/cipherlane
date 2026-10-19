@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -99,7 +99,7 @@ Sender browser/CLI                    LAN (plain HTTP, sniffable)             Re
 | `POST /api/presence` | Device heartbeat (last writer wins per IP, 5s heartbeat / 20s TTL) |
 | `GET /api/devices` | Online device list (IP / name / X25519 public key) |
 | `POST /api/rooms` | Create a transfer room (10-char base62 id ≈ 59.6 bits) |
-| `POST /api/rooms/:id/chunk` | Post ciphertext chunk (1 MiB plaintext each, backpressure window 64, requires room token) |
+| `POST /api/rooms/:id/chunk` | Post ciphertext chunk (1 MiB plaintext each, backpressure window 64, requires room token; optional `X-Chunk-Seq` idempotency sequence so timeout retries never duplicate chunks) |
 | `GET /api/rooms/:id/chunk?i=N` | Sequential pull (25s long-poll, one-shot consumption) |
 | `POST /api/rooms/:id/offer` | Attach a direct-send invitation (encrypted preview hint, must precede chunks) |
 | `GET /api/offers` | Long-poll this device's pending invitations (**secret + source IP double binding**) |
@@ -108,7 +108,7 @@ Sender browser/CLI                    LAN (plain HTTP, sniffable)             Re
 
 Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, 64 rooms / 96 MB buffered / 120 creates per minute per IP, ≤ 8 pending offers per device (5 min TTL), ≤ 256 devices.
 
-**Protocol v2 (v0.5.0+)**: every chunk is bound to its position via `AAD = cipherlane/chunk/v2|<room>|<index>`, so reordered, replayed or misplaced chunks are rejected by GCM; receivers verify the total plaintext length at the end (text / each file / total) and never ack on mismatch. Transfers sent by v0.5.0 **cannot be decrypted by v0.4.x receivers** (upgrade both ends together); new receivers remain compatible with old senders (v2 first, fall back to v1).
+**Protocol v2 (v0.5.0+)**: every chunk is bound to its position via `AAD = cipherlane/chunk/v2|<room>|<index>`, so reordered, replayed or misplaced chunks are rejected by GCM; receivers verify the total plaintext length at the end (text / each file / total) and never ack on mismatch. Transfers sent by v0.5.0 **cannot be decrypted by v0.4.x receivers** (upgrade both ends together); new receivers remain compatible with old senders (v2 first, fall back to v1). Since v0.5.1 chunk posts may carry an optional `X-Chunk-Seq` idempotency sequence (backward compatible): timeout/backpressure retries reuse the same sequence, so the server accepts each chunk only once — no duplicates or misalignment.
 
 ## Security Model
 
@@ -232,6 +232,11 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.5.1** (2026-10-19, reliability)
+- **Idempotent chunk delivery**: optional `X-Chunk-Seq` header; browser/CLI timeout and backpressure retries reuse the same sequence, so the server accepts each chunk exactly once — no duplicate or misaligned chunks when a response is lost. Implemented identically in the Node and Rust servers
+- **Frontend reliability**: API/heartbeat/invitation/state polling all have timeouts and in-flight guards; invitations are reconciled against the server's full list and title flashing stops when the list empties; device list renders diff-only (no more DOM rebuild/focus loss every 5s); only one receive pipeline can run at a time
+- **Tests**: protocol 26 groups (17 also run against the Rust server), browser 19 groups, CLI 10 groups
 
 **v0.5.0** (2026-10-19, security hardening)
 - **Protocol v2**: AES-GCM chunks now use AAD binding (room id + chunk index); reordered, replayed or misplaced chunks are rejected, and receivers verify total plaintext length (text / each file / total) before acking. v0.5.0 senders are **not** compatible with v0.4.x receivers (upgrade both ends); new receivers remain compatible with old senders

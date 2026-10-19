@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -98,7 +98,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 | `POST /api/presence` | 设备心跳注册（同 IP 最后写入者生效，5s 心跳 / 20s TTL） |
 | `GET /api/devices` | 在线设备列表（IP / 名称 / X25519 公钥） |
 | `POST /api/rooms` | 创建传输房间（房间号 10 位 base62 ≈ 59.6 bit） |
-| `POST /api/rooms/:id/chunk` | 投递密文分片（1 MiB 明文/片，背压窗口 64 片，需 room token） |
+| `POST /api/rooms/:id/chunk` | 投递密文分片（1 MiB 明文/片，背压窗口 64 片，需 room token；可选 `X-Chunk-Seq` 幂等序号，超时重投不重复入库） |
 | `GET /api/rooms/:id/chunk?i=N` | 顺序拉取（25s 长轮询，一次性消费） |
 | `POST /api/rooms/:id/offer` | 挂载定向邀请（加密预览 hint，须在投递分片之前） |
 | `GET /api/offers` | 长轮询本机待处理邀请（**secret + 来源 IP 双重绑定**） |
@@ -107,7 +107,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 
 限额：单房间 64 分片 / 64 MB 背压，全局 256 MB，单 IP 64 房 / 96 MB 滞留密文 / 120 建房每分钟，单设备待处理邀请 ≤ 8（TTL 5 分钟），设备表 ≤ 256。
 
-**协议 v2（v0.5.0+）**：每个分片以 `AAD = cipherlane/chunk/v2|<房间号>|<序号>` 绑定位置，重排、重放或错位分片会被 GCM 拒绝；接收端在完成时校验明文总长度（文本/每个文件/总量），不一致即失败且不发送 ack。v0.5.0 发送的传输**不能被 v0.4.x 接收端解密**（两端需同时升级）；新接收端仍兼容旧发送端（先试 v2、失败回退 v1）。
+**协议 v2（v0.5.0+）**：每个分片以 `AAD = cipherlane/chunk/v2|<房间号>|<序号>` 绑定位置，重排、重放或错位分片会被 GCM 拒绝；接收端在完成时校验明文总长度（文本/每个文件/总量），不一致即失败且不发送 ack。v0.5.0 发送的传输**不能被 v0.4.x 接收端解密**（两端需同时升级）；新接收端仍兼容旧发送端（先试 v2、失败回退 v1）。v0.5.1 起分片投递可带 `X-Chunk-Seq` 幂等序号（可选、向后兼容）：客户端超时/背压重投复用同一序号，服务端只认一次，不会重复入库或错位。
 
 ## 安全模型
 
@@ -231,6 +231,13 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.5.1**（2026-10-19，可靠性）
+- **分片投递幂等**：新增可选 `X-Chunk-Seq` 头；浏览器/CLI 的超时与背压重投复用同一序号，
+  服务端只接受一次，杜绝"响应丢失后重投"造成的重复分片/错位；Node 与 Rust 服务端同构
+- **前端可靠性**：API/心跳/邀请/状态轮询统一超时并防重入；邀请列表按服务端全量对账、
+  清空后停止标题闪烁；设备列表差量渲染（不再每 5s 重建丢焦点）；同一时刻仅一路接收
+- **测试**：protocol 26 组（其中 17 组同时跑 Rust 服务端平价）、browser 19 组、cli 10 组
 
 **v0.5.0**（2026-10-19，安全强化）
 - **协议 v2**：AES-GCM 分片加入 AAD 位置绑定（房间号 + 分片序号），重排/重放/错位分片被

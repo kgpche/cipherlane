@@ -1,6 +1,6 @@
 [package]
 name = "cipherlane"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器 + 系统托盘）"
 license = "MIT"
