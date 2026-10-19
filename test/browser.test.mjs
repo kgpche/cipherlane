@@ -6,6 +6,7 @@
 //   3) 同序号并发拉取：先到者得、后来者收到“正被另一个接收方使用”（回归：曾 500+挂起）
 //   4) 服务器中途下线：建立失败可退，返回按钮可用
 //   5) 文件传输全链路：真实 Worker 加密 + 接收方文件卡与完成状态
+//   6) FSA 流式保存 + 续传断点一致性：isActive 属性误调用回归 / fs 模式 done 落盘
 //
 // 无浏览器环境（未装 Chrome/Chromium 且未设 CHROME_BIN）打印“跳过”并以 0 退出，
 // 不阻断 npm test；CI 的 ubuntu 镜像自带 /usr/bin/google-chrome 可真实执行。
@@ -79,6 +80,18 @@ async function evalJs(c, sid, expression) {
   return r.result.value
 }
 
+// 带用户手势的求值(CDP userGesture=true 会注入真实用户激活):
+// 用于模拟"点击后才允许拉起保存选择器"的浏览器约束,断言 hasUserGesture() 为 true。
+async function evalJsGesture(c, sid, expression) {
+  const r = await c.send('Runtime.evaluate',
+    { expression, awaitPromise: true, returnByValue: true, userGesture: true }, sid)
+  if (r.exceptionDetails) {
+    const d = r.exceptionDetails.exception && r.exceptionDetails.exception.description
+    throw new Error('页面执行失败(gesture): ' + (d || r.exceptionDetails.text) + '\n  ← ' + expression.slice(0, 120))
+  }
+  return r.result.value
+}
+
 async function waitFor(c, sid, expr, timeout = 20000, what = '') {
   const t0 = Date.now()
   for (;;) {
@@ -100,12 +113,15 @@ const hiddenInvariant = (c, sid) =>
 // ---------- 启动:服务器 + 无头浏览器 ----------
 function launchServer() {
   // CL_SERVER_BIN: 直接测试打包产物（SEA 单文件二进制），而非源码
+  // CIPHERLANE_EXTRA_HOSTS: 第 6 组用假域名 cipherlane-insecure.test 模拟非安全上下文，
+  // 服务端 /api/* 的 Host 闸门默认只放行 IP/localhost，需显式白名单放行该域名。
+  const env = { ...process.env, PORT: String(PORT), CIPHERLANE_EXTRA_HOSTS: 'cipherlane-insecure.test' }
   const child = process.env.CL_SERVER_BIN
     ? spawn(process.env.CL_SERVER_BIN, [], {
-        env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
+        env, stdio: ['ignore', 'ignore', 'pipe'],
       })
     : spawn(process.execPath, ['server.js'], {
-        cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
+        cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'],
       })
   child.stderr.on('data', () => {}) // 丢弃启动横幅,避免管道写满
   return child
@@ -419,6 +435,138 @@ async function main() {
       ok('身份重置:模态取消无副作用 / 确认后指纹·密钥更换·服务器公钥同步')
     }
     }
+    }
+
+    // ---------- 11) FSA 流式保存 + 续传断点一致性 ----------
+    // 回归两个耦合缺陷:
+    //   a) navigator.userActivation.isActive 是布尔属性,旧代码 isActive() 必抛 TypeError
+    //      并被 catch 吞掉 → hasGesture 恒 false → showSaveFilePicker/showDirectoryPicker
+    //      整条流式保存分支是死代码,大文件全部退化为内存模式。
+    //   b) fs 模式只在一开始 saveRec(done 恒 0),传输中却把服务端 through 推前进;
+    //      刷新后按陈旧断点重拉已释放分片,必被 410 → FSA 续传实际不可用。
+    // 测试用 OPFS 真实句柄冒充用户在文件选择器里选中的文件,让 FSA 分支在无头
+    // 浏览器里真跑(createWritable / 绝对定位写 / IDB 句柄持久化 / 刷新续传)。
+    {
+      const setup = await evalJs(c, sidA, `(async () => {
+        const size = 12 * CHUNK - 12345
+        const plain = new Uint8Array(size)
+        // getRandomValues 单次上限 64KiB(QuotaExceededError),按 64KiB 循环填满
+        for (let off = 0; off < size; off += 65536) crypto.getRandomValues(plain.subarray(off, Math.min(off + 65536, size)))
+        const created = await (await fetch('/api/rooms', { method: 'POST' })).json()
+        const room = created.room, token = created.token
+        const key = crypto.getRandomValues(new Uint8Array(32))
+        const meta = { v: 1, type: 'file', name: 'fsa-resume-e2e.bin', mime: 'application/octet-stream', size, count: 13 }
+        const seal = async (pt) => {
+          const k = await subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt', 'decrypt'])
+          const iv = crypto.getRandomValues(new Uint8Array(12))
+          const ct = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, k, pt))
+          const out = new Uint8Array(12 + ct.length)
+          out.set(iv); out.set(ct, 12)
+          return out
+        }
+        const chunks = []
+        for (let off = 0; off < size; off += CHUNK) chunks.push(plain.subarray(off, Math.min(off + CHUNK, size)))
+        const post = async (bytes) => {
+          for (;;) {
+            const r = await fetch('/api/rooms/' + room + '/chunk', {
+              method: 'POST', headers: { 'X-Room-Token': token }, body: bytes,
+            })
+            if (r.status === 429) { await new Promise((res) => setTimeout(res, 100)); continue }
+            if (!r.ok) throw new Error('post chunk ' + r.status)
+            return
+          }
+        }
+        await post(await seal(enc.encode(JSON.stringify(meta))))
+        for (let i = 0; i < 9; i++) await post(await seal(chunks[i])) // 只投前 9 片:接收方会在第 8 片写出持久化检查点后停住
+        const dig = [...new Uint8Array(await crypto.subtle.digest('SHA-256', plain))]
+          .map((b) => b.toString(16).padStart(2, '0')).join('')
+        window.__fsa = { room, token, rest: chunks.slice(9), post, seal }
+        return { link: publicOrigin() + '/#' + room + '.' + toB64(key), room, size, dig }
+      })()`)
+      const frag = setup.link.slice(setup.link.indexOf('#'))
+      // 每个新文档都注入桩:用 OPFS 里真实 FileSystemFileHandle 冒充选择器结果,
+      // 且必须可结构化克隆(会被存进 IDB 供刷新后续传)。
+      const pickerStub = `
+        (() => {
+          const stub = async (opts) => {
+            window.__pickerCalls = (window.__pickerCalls || 0) + 1
+            window.__pickerName = opts && opts.suggestedName
+            const root = await navigator.storage.getDirectory()
+            return await root.getFileHandle('fsa-picked.bin', { create: true })
+          }
+          try { Object.defineProperty(window, 'showSaveFilePicker', { configurable: true, value: stub }) }
+          catch { try { window.showSaveFilePicker = stub } catch {} }
+        })()
+      `
+      const pgD = await newPage(c)
+      let sidD = pgD.sid
+      await c.send('Page.addScriptToEvaluateOnNewDocument', { source: pickerStub }, sidD)
+      await navigate(c, sidD, S + '/')
+
+      // ① 直接回归:属性类型 / 旧写法必抛错 / helper 在手势下为 true
+      const act = await evalJsGesture(c, sidD, `(() => {
+        let oldThrew = false
+        try { navigator.userActivation.isActive() } catch { oldThrew = true }
+        return { type: typeof navigator.userActivation.isActive, oldThrew, helper: hasUserGesture() }
+      })()`)
+      if (act.type !== 'boolean') throw new Error('userActivation.isActive 应为布尔属性,实际 ' + act.type)
+      if (!act.oldThrew) throw new Error('旧写法 isActive() 应抛 TypeError(属性不是方法)')
+      if (act.helper !== true) throw new Error('有用户手势时 hasUserGesture() 应为 true,实际 ' + act.helper)
+      ok('userActivation 回归:isActive 是布尔属性 → 旧 isActive() 必抛错,hasUserGesture() 手势下为 true')
+
+      // ② 手势内进入接收 → FSA 流式分支必须真的启用(旧代码此处恒走内存模式)
+      await evalJsGesture(c, sidD, `(location.hash = ${JSON.stringify(frag)}, 'ok')`)
+      await waitFor(c, sidD, `document.querySelector('#fc-name').textContent === 'fsa-resume-e2e.bin'`, 20000, 'FSA 接收文件卡')
+      await waitFor(c, sidD, `window.__pickerCalls >= 1`, 5000, 'showSaveFilePicker 被调用(FSA 分支启用)')
+      await waitFor(c, sidD, `!document.querySelector('#fc-bar-wrap').hidden`, 10000, '接收进度条出现')
+      let recD = null
+      for (let i = 0; i < 200 && !(recD && recD.done >= 8); i++) {
+        recD = await evalJs(c, sidD, `(async () => { const r = await resumeDB.get('${setup.room}'); return r ? { mode: r.mode, done: r.done } : null })()`)
+        if (!recD || recD.done < 8) await sleep(100)
+      }
+      if (!recD) throw new Error('IDB 无续传记录')
+      if (recD.mode !== 'fs') throw new Error('应走 FSA 流式保存(mode=fs),实际 ' + recD.mode + '(isActive 仍被误判为无手势?)')
+      if (recD.done < 8) throw new Error('fs 断点记录未随检查点落盘推进(done=' + recD.done + '),刷新后必回退重拉')
+      let through = 0
+      for (let i = 0; i < 100 && through < recD.done + 1; i++) {
+        through = await evalJs(c, sidD, `(async () => (await (await fetch('/api/rooms/${setup.room}/state')).json()).through)()`)
+        if (through < recD.done + 1) await sleep(50)
+      }
+      if (through > recD.done + 1) throw new Error('server.through(' + through + ') 越过已持久化断点 done=' + recD.done)
+      ok('FSA 断点记录:mode=fs、done=' + recD.done + ' 已落盘,server.through=' + through + ' ≤ done+1')
+
+      // ③ 刷新:关掉页面重开同源文档(等价 F5,保留 hash)。旧实现 rec.done=0 →
+      //    重进后从第 1 片重拉 → server 410 → “续传按钮”都不会出现。
+      await c.send('Target.closeTarget', { targetId: pgD.tid }).catch(() => {})
+      const pgD2 = await newPage(c)
+      sidD = pgD2.sid
+      await c.send('Page.addScriptToEvaluateOnNewDocument', { source: pickerStub }, sidD)
+      await navigate(c, sidD, S + '/?resume=' + Date.now() + frag)
+      await waitFor(c, sidD, `document.querySelector('#start-recv').textContent.includes('继续接收')`, 15000, '续传按钮出现')
+      const recAfter = await evalJs(c, sidD, `(async () => { const r = await resumeDB.get('${setup.room}'); return r ? { mode: r.mode, done: r.done } : null })()`)
+      if (!recAfter || recAfter.mode !== 'fs' || recAfter.done < 8) throw new Error('刷新后 FSA 断点记录丢失: ' + JSON.stringify(recAfter))
+      // 发送方补齐剩余分片并置 done,再点"继续接收并保存"
+      await evalJs(c, sidA, `(async () => {
+        for (const chunk of window.__fsa.rest) await window.__fsa.post(await window.__fsa.seal(chunk))
+        await fetch('/api/rooms/' + window.__fsa.room + '/done', { method: 'POST', headers: { 'X-Room-Token': window.__fsa.token } })
+      })()`)
+      await evalJsGesture(c, sidD, `document.querySelector('#start-recv').click()`)
+      await waitFor(c, sidD, `document.querySelector('#recv-file-status').textContent.includes('已保存')`, 60000, 'FSA 续传完成')
+      const out = await evalJs(c, sidD, `(async () => {
+        const root = await navigator.storage.getDirectory()
+        const f = await (await root.getFileHandle('fsa-picked.bin')).getFile()
+        const b = new Uint8Array(await f.arrayBuffer())
+        const d = [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))]
+          .map((x) => x.toString(16).padStart(2, '0')).join('')
+        return { size: b.length, dig: d }
+      })()`)
+      if (out.size !== setup.size || out.dig !== setup.dig) {
+        throw new Error('FSA 续传后文件内容不完整: size=' + out.size + '/' + setup.size + ' digest一致=' + (out.dig === setup.dig))
+      }
+      const recGone = await evalJs(c, sidD, `(async () => (await resumeDB.get('${setup.room}')) || null)()`)
+      if (recGone) throw new Error('完成后 IDB 断点记录未清理')
+      ok('FSA 刷新续传:保留 ' + recD.done + ' 片断点 → 续传后 SHA-256 与原文一致、断点记录已清理')
+      await c.send('Target.closeTarget', { targetId: pgD2.tid }).catch(() => {})
     }
 
     // ---------- 5) 服务器中途下线:建立失败可退 ----------

@@ -77,6 +77,13 @@ async function copyText(t) {
     return ok
   } catch { return false }
 }
+// 新鲜用户手势：UserActivation.isActive 是只读布尔属性（不是方法，调用会抛 TypeError），
+// 且个别嵌入式 webview 的 userActivation 实现不完整。两处接收入口共用同一兜底。
+function hasUserGesture() {
+  try {
+    return !!(navigator.userActivation && navigator.userActivation.isActive)
+  } catch { return false }
+}
 
 // ---------- 几何头像（avatar.js，单色相 Bauhaus 构图） ----------
 const avatarSvg = (seed, size) => Avatar.svg(seed, size)
@@ -962,10 +969,7 @@ async function receiveBatch(room, key, meta, ctl) {
 }
 
 async function doReceiveBatch(room, key, meta, signal) {
-  let hasGesture = false
-  try {
-    hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive && navigator.userActivation.isActive())
-  } catch { /* 部分嵌入式 webview 的 userActivation 实现不完整 */ }
+  const hasGesture = hasUserGesture()
   // 目录选择器:有新鲜手势的 Chromium 流式落盘;否则内存模式完成后逐个下载
   let dir = null
   if ('showDirectoryPicker' in window && hasGesture) {
@@ -1084,10 +1088,7 @@ async function doReceiveFile(room, key, meta, signal, rec) {
   // 仅在有激活手势时才自动拉起保存选择器（接受邀请的点击）；
   // 无手势（链接模式直接打开/手势过期/嵌入式 webview）直接走内存模式自动下载，
   // 避免个别环境（如 Electron webview）无手势时选择器 Promise 永久挂起
-  let hasGesture = false
-  try {
-    hasGesture = !!(navigator.userActivation && navigator.userActivation.isActive && navigator.userActivation.isActive())
-  } catch { /* 部分嵌入式 webview 的 userActivation 实现不完整 */ }
+  const hasGesture = hasUserGesture()
 
   // ---- 断点续传状态(链接模式):rec.done = 已持久化的最后数据分片序号 ----
   let done = rec && rec.done > 0 ? Math.min(rec.done, meta.count - 1) : 0
@@ -1173,19 +1174,28 @@ async function doReceiveFile(room, key, meta, signal, rec) {
     $('#recv-meta').textContent =
       `已接收 ${fmtBytes(got)} / ${fmtBytes(meta.size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
     done = j
+    // 断点/释放粒度：每 8 片做一次持久化检查点，崩溃后最多重拉 8MB。
+    const PERSIST_EVERY = 8
     if (sink.mode === 'mem') {
       // 内存模式:断点记录与进度上报同粒度同节奏——每 8 片先把 parts 数组
       // 落盘(IDB),成功后才把服务端进度推到该断点。保证 server.through 不
       // 越过已持久化位置(否则重进房间会拉到已释放的分片→410)。整条数组
       // 重写的耗时随片数线性增长(实测 100MB 每片 116ms),逐片写不值得;
       // 代价为崩溃后最多重拉 8MB。
-      if (j % 8 === 0) {
+      if (j % PERSIST_EVERY === 0) {
         await saveRec()
         progressPost(room, j + 1)
       }
-    } else {
-      // FSA 模式:write resolve 即入内核,断点无需落盘,保持滞后一片提交
-      progressPost(room, j - 1 > done ? j - 1 : done)
+    } else if (j % PERSIST_EVERY === 0) {
+      // FSA 模式的 writable 流在 close() 前不保证数据已提交（刷新/崩溃会丢弃
+      // 未 close 的缓冲），所以"断点"只能按已 close 的数据推进：先 close 提交，
+      // 再落盘 done，最后重开 keepExistingData 流继续绝对定位写。若只写不 close
+      // 就记 done，刷新续传会从流里没提交的字节之后继续，文件中间留空洞。
+      // 顺序也保证 server.through 永不越过已提交数据（崩溃后重拉已释放分片→410）。
+      await sink.ws.close()
+      await saveRec()
+      sink.ws = await handle.createWritable({ keepExistingData: true })
+      progressPost(room, j + 1)
     }
   }
 
