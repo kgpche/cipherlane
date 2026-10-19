@@ -20,3 +20,12 @@
 - 无 cc 环境的兜底（已验证到链接层,记录备查）：~/.local/bin/ld-shim 用自带 rust-lld 做 cc→ld 方言翻译,
   宿主 glibc 链接可通但构建脚本运行异常——正式环境直接装 build-essential。
 - 依赖面：tiny_http + serde_json + rand + base64（服务器零知识,无需任何加密库）。
+
+## P1 完成记录（2026-10-19）
+- 全协议端点移植：presence/devices/offers 长轮询/rooms/chunk(经典+X-Resume 可续传)/
+  done/progress/ack(凭证)/version/shutdown(令牌双闸)/update + 14 项静态资源编译期内嵌
+- 平价验证：protocol 14 组、cli 6 组、browser 10 组全部对 Rust 版跑通
+  （CIPHERLANE_TEST_SERVER / CL_SERVER_BIN 环境变量切换被测实现）
+- 断连检测：/proc/net/tcp 轮询(100ms 片)等价 Node res.on('close') 的配额释放语义
+- 产物：release 单文件 ~800KB（Node SEA 125MB 的 1/156）；EADDRINUSE 友好提示保留
+- P2 待办：musl 静态构建入打包脚本、deb/exe/osx 切换 Rust 产物；P3 真·托盘(ksni)

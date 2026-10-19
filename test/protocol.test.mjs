@@ -65,7 +65,11 @@ async function register(name) {
 
 async function main() {
   // ---------- 启动真实服务器 ----------
-  const child = spawn(process.execPath, ['server.js'], { cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] })
+  // 平价对照引擎：CIPHERLANE_TEST_SERVER 指向其他实现（如 Rust 版二进制）时对其跑同一套断言
+  const ALT = (process.env.CIPHERLANE_TEST_SERVER || '').trim()
+  const child = ALT
+    ? spawn(ALT, [], { cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] })
+    : spawn(process.execPath, ['server.js'], { cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] })
   let logs = ''
   child.stdout.on('data', (d) => { logs += d })
   child.stderr.on('data', (d) => { logs += d })
