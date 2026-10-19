@@ -231,9 +231,20 @@ impl Tray for CipherlaneTray {
             enabled: false,
             ..Default::default()
         }));
+        // 退出 = 关闭服务并退出托盘；服务为外部启动(无令牌)时如实标注
+        let (label, ext) = if self.token.is_some() {
+            ("退出（关闭服务并退出托盘）".to_string(), false)
+        } else {
+            ("退出托盘（服务为外部启动，不受影响）".to_string(), true)
+        };
         items.push(MenuItem::Standard(StandardItem {
-            label: "退出托盘".into(),
-            activate: Box::new(|_t: &mut Self| std::process::exit(0)),
+            label,
+            activate: Box::new(move |t: &mut Self| {
+                if !ext {
+                    t.stop_server(); // 先停服务（kill 子进程 + API 兜底）再退出
+                }
+                std::process::exit(0)
+            }),
             ..Default::default()
         }));
         items
