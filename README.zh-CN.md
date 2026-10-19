@@ -152,7 +152,7 @@ sh build/package.sh            # 产物在 build/dist/
 | `cipherlane_<v>_windows_x64.zip` | Windows x64 | 解压后双击 `cipherlane.exe`（控制台显示地址与二维码） |
 | `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | 解压后双击 `cipherlane.command`（首次若被 Gatekeeper 拦截：右键→打开） |
 
-技术：Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进各平台官方 Node 二进制；Linux/Windows 为纯单文件（125MB/87MB，压缩后 31MB/33MB），macOS 为双架构源码包（75MB）。打包脚本自动缓存官方二进制与 postject 工具，下载经 SHASUMS256 校验。**命名规范**：产物统一 `cipherlane_<版本>_<平台>.<格式>`，校验和为 `cipherlane-<版本>-SHA256SUMS.txt`，macOS 内层运行时为 `cipherlane-node-<架构>`；启动横幅与页面 footer 均带版本号，报问题时直接引用。
+技术：**Linux deb 使用 Rust 静态单文件**（musl 服务器 ≈0.95MB + 系统托盘，deb ≈1.1MB，无 glibc/Node 依赖）；Windows/macOS 使用 Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进官方 Node 二进制（Windows zip ≈33MB，macOS 双架构包 ≈75MB）。打包脚本自动缓存官方二进制与 postject 工具，下载经 SHASUMS256 校验。**命名规范**：产物统一 `cipherlane_<版本>_<平台>.<格式>`，校验和为 `cipherlane-<版本>-SHA256SUMS.txt`，macOS 内层运行时为 `cipherlane-node-<架构>`；启动横幅与页面 footer 均带版本号，报问题时直接引用。
 
 纯源码部署仍然零依赖：`node server.js` 即可（Node ≥ 18）。
 
@@ -199,6 +199,8 @@ cipherlane/
 ├── server.js           # 零依赖中继服务器：房间 + 设备在线 + 邀请（Node 内置模块 only）
 ├── cli.mjs             # 命令行：devices / 定向发送 / listen 常驻接收 / 链接收发
 ├── sea-config.json     # SEA 单文件可执行配置（资源内嵌清单）
+├── cipherlane-rs/      # Rust 版服务器 + 系统托盘（Linux deb 实际产物，协议与 Node 版平价）
+├── scripts/            # 一致性检查（版本号 / SEA 资产 ↔ server.js / 测试文件）
 ├── build/package.sh    # 一键打包：.deb / Windows exe / macOS 通用包
 ├── logo/               # Logo：盾上密径（主图 + favicon 小尺寸母版）
 ├── docs/screenshots/   # README 截图
@@ -219,7 +221,7 @@ cipherlane/
 npm test    # 或逐个: node test/<name>.test.mjs
 ```
 
-- **aesgcm**：S-box 标准向量、GHASH 交叉验证、0B~1MiB 与 node 原生逐字节比对
+- **aesgcm**：S-box 标准向量、GHASH 交叉验证、0B~1MiB 与 node 原生逐字节比对（含 AAD 与篡改拒绝）
 - **sha256**：FIPS 180-4 向量 + 500 组随机交叉
 - **x25519**：RFC 7748 向量 + 200 组随机 vs node ECDH 双向、小阶点拒绝
 - **qrcode**：RS 代数自检、定位图形/时序/格式信息结构断言

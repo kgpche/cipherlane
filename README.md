@@ -153,7 +153,7 @@ sh build/package.sh            # artifacts in build/dist/
 | `cipherlane_<v>_windows_x64.zip` | Windows x64 | Unzip and double-click `cipherlane.exe` (console shows address + QR code) |
 | `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | Unzip and double-click `cipherlane.command` (if Gatekeeper complains: right-click → Open) |
 
-Built on Node **SEA (single executable applications)**: the server and all frontend assets are embedded into official Node binaries per platform. Linux/Windows are true single files (125MB/87MB, 31MB/33MB compressed); macOS ships a dual-arch source bundle (75MB). The build script caches official binaries and postject, verifies downloads against SHASUMS256. **Naming convention**: artifacts are `cipherlane_<version>_<platform>.<format>`, checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; the startup banner and page footer both carry the version — quote it when reporting issues.
+Built with **Rust on Linux** (static musl single file: server ≈0.95MB + tray, deb ≈1.1MB, no glibc/Node dependency) and Node **SEA (single executable applications)** on Windows/macOS, where the server and all frontend assets are embedded into official Node binaries (Windows zip ≈33MB, macOS dual-arch bundle ≈75MB). The build script caches official binaries and postject, verifies downloads against SHASUMS256. **Naming convention**: artifacts are `cipherlane_<version>_<platform>.<format>`, checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; the startup banner and page footer both carry the version — quote it when reporting issues.
 
 Source deployment stays zero-dependency: `node server.js` (Node ≥ 18).
 
@@ -200,6 +200,8 @@ cipherlane/
 ├── server.js           # zero-dependency relay: rooms + presence + invitations (Node builtins only)
 ├── cli.mjs             # CLI: devices / direct send / listen / link send & receive
 ├── sea-config.json     # SEA single-executable config (asset manifest)
+├── cipherlane-rs/      # Rust server + system tray (shipped in the Linux deb; protocol-parity tested)
+├── scripts/            # consistency checks (version / SEA assets ↔ server.js / test files)
 ├── build/package.sh    # one-shot packaging: .deb / Windows exe / macOS universal
 ├── logo/               # logo art (main + favicon master)
 ├── docs/screenshots/   # README screenshots
@@ -220,7 +222,7 @@ cipherlane/
 npm test    # or run individually: node test/<name>.test.mjs
 ```
 
-- **aesgcm**: FIPS-197 S-box vectors, GHASH cross-validation, byte-identical to node:crypto for 0B–1MiB
+- **aesgcm**: FIPS-197 S-box vectors, GHASH cross-validation, byte-identical to node:crypto for 0B–1MiB (including AAD and tamper rejection)
 - **sha256**: FIPS 180-4 vectors + 500 random cross-checks
 - **x25519**: RFC 7748 vectors + 200 random pairs vs node ECDH (both directions), small-order rejection
 - **qrcode**: RS algebra self-checks, finder/timing/format structure assertions
