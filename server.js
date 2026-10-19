@@ -29,6 +29,14 @@ const ACK_IDLE_MS = 2 * 60 * 1000
 const LONGPOLL_MS = 25 * 1000
 const ROOM_RE = new RegExp(`^[0-9A-Za-z]{${ROOM_ID_LEN}}$`)
 const LONGPOLL_PER_IP = 8   // 单 IP 并发长轮询上限（正常收发 ≤4：预取 3 + 邀请 1），防 fd 耗尽
+// per-IP 配额：防止单个局域网 IP 耗尽全站房间/内存（CIPHERLANE_TEST_LIMITS=1 仅供测试降阈值）
+const PER_IP_ROOMS = 64                          // 单 IP 同时存活房间上限
+const PER_IP_BYTES = 96 * 1024 * 1024            // 单 IP 当前滞留密文字节上限
+const ROOM_CREATE_PER_MIN = 120                  // 单 IP 滑动 60s 建房上限
+const TEST_LIMITS = process.env.CIPHERLANE_TEST_LIMITS === '1'
+const IP_ROOMS_MAX = TEST_LIMITS ? 4 : PER_IP_ROOMS
+const IP_BYTES_MAX = TEST_LIMITS ? 2 * 1024 * 1024 : PER_IP_BYTES
+const UPDATE_CACHE_MS = 5 * 60 * 1000            // /api/update 成功结果缓存时长
 const longpollCount = new Map() // ip → 当前挂起长轮询数
 function longpollEnter(ip) {
   const n = (longpollCount.get(ip) || 0) + 1
@@ -55,7 +63,11 @@ const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 const rooms = new Map()
 const devices = new Map()      // ip → { ip, id, secret, name, pub, since, lastSeen }
 const offersById = new Map()   // 邀请 id → room（房间销毁时连带清理）
+const ipBytes = new Map()      // ip → 当前滞留密文字节（与 globalBuffered 同点增减）
+const ipCreates = new Map()    // ip → 最近 60s 建房时间戳（滑动窗口限流）
 let globalBuffered = 0
+let updateCache = null         // { at, payload }：/api/update 成功结果缓存
+let updateInflight = null      // 进行中的上游请求（并发去重）
 const STARTED_AT = Date.now()
 
 // ---------- 工具 ----------
@@ -112,6 +124,70 @@ function etagMatches(header, etag) {
   const h = String(header).trim()
   if (h === '*') return true
   return h.split(',').some((t) => t.trim() === etag)
+}
+
+// ---------- 安全与记账工具 ----------
+// 常量时间比较（长度不同直接 false；room token / device secret / shutdown token 都是 hex 串）
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
+}
+
+// 设备名：先剔除 C0/C1 控制字符（防终端转义注入），再 trim/slice
+function cleanDeviceName(raw) {
+  const s = String(raw || '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim().slice(0, DEVICE_NAME_MAX)
+  return s || '未命名设备'
+}
+
+// 密文字节记账：room.bytes / globalBuffered / ipBytes 必须在同一处成对增减，杜绝漂移
+function bytesAdd(room, n) {
+  room.bytes += n
+  globalBuffered += n
+  const ip = room.senderIp || ''
+  ipBytes.set(ip, (ipBytes.get(ip) || 0) + n)
+}
+function bytesDel(room, n) {
+  if (!n) return
+  room.bytes -= n
+  globalBuffered -= n
+  const ip = room.senderIp || ''
+  const left = (ipBytes.get(ip) || 0) - n
+  if (left > 0) ipBytes.set(ip, left)
+  else ipBytes.delete(ip)
+}
+function roomsByIp(ip) {
+  let n = 0
+  for (const r of rooms.values()) if (r.senderIp === ip) n++
+  return n
+}
+// 滑动 60s 建房速率：0 = 允许（已记账），>0 = 需等待的秒数
+function createRateWait(ip, now) {
+  const ts = (ipCreates.get(ip) || []).filter((t) => now - t < 60 * 1000)
+  if (ts.length >= ROOM_CREATE_PER_MIN) {
+    ipCreates.set(ip, ts)
+    return Math.max(1, Math.ceil((60 * 1000 - (now - ts[0])) / 1000))
+  }
+  ts.push(now)
+  ipCreates.set(ip, ts)
+  return 0
+}
+
+// 语义化版本比较：仅按数字段（0.4.3 > 0.4.2、0.4.3 == 0.4.3），非法值一律不视为更新
+function semverNewer(latest, current) {
+  const parse = (v) => {
+    const m = /^v?(\d+(?:\.\d+)*)/.exec(String(v || '').trim())
+    return m ? m[1].split('.').map(Number) : null
+  }
+  const a = parse(latest)
+  const b = parse(current)
+  if (!a || !b) return false
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] || 0
+    const y = b[i] || 0
+    if (x !== y) return x > y
+  }
+  return false
 }
 
 function sendJson(res, code, obj) {
@@ -207,10 +283,11 @@ for (const [route, file, type] of [
 }
 
 // ---------- 房间 ----------
-function createRoom() {
+function createRoom(senderIp) {
   const id = randRoomId()
   const room = {
     id,
+    senderIp: senderIp || '',
     token: crypto.randomBytes(16).toString('hex'),
     createdAt: Date.now(),
     lastActive: Date.now(),
@@ -235,8 +312,7 @@ function takeChunk(room, i) {
   const c = room.buffer.get(i)
   if (!c) return null // 已被并发拉取取走（分片一次性，不会再出现）
   room.buffer.delete(i)
-  room.bytes -= c.length
-  globalBuffered -= c.length
+  bytesDel(room, c.length)
   // head 只在按序取走时推进；越序取走的序号通过"已投递但不在 buffer"推导，
   // 避免越序 GET 把低序号分片变成不可达垃圾（也避免 taken 集合无界增长）。
   if (i === room.head) {
@@ -284,8 +360,7 @@ function advanceThrough(room, through) {
     // 0 号元信息分片不释放：续传的接收方重进房间时还要读 manifest
     if (i >= 1 && i < through) {
       room.buffer.delete(i)
-      room.bytes -= c.length
-      globalBuffered -= c.length
+      bytesDel(room, c.length)
     }
   }
   room.through = through
@@ -297,7 +372,7 @@ function advanceThrough(room, through) {
 function destroyRoom(room) {
   if (!rooms.has(room.id)) return
   rooms.delete(room.id)
-  globalBuffered -= room.bytes
+  bytesDel(room, room.bytes) // 与 globalBuffered/ipBytes 同步释放
   room.buffer.clear()
   room.bytes = 0
   for (const w of room.waiters) {
@@ -471,12 +546,11 @@ async function handleRequest(req, res) {
       let body
       try { body = JSON.parse((await readBody(req, 2048)).toString('utf8') || '{}') }
       catch { return sendJson(res, 400, { error: 'bad-body' }) }
-      const name = typeof body.name === 'string' && body.name.trim()
-        ? body.name.trim().slice(0, DEVICE_NAME_MAX) : '未命名设备'
+      const name = typeof body.name === 'string' ? cleanDeviceName(body.name) : '未命名设备'
       if (typeof body.pub !== 'string' || !PUB_RE.test(body.pub)) return sendJson(res, 400, { error: 'bad-pub' })
 
       const prev = devices.get(ip)
-      if (prev && req.headers['x-device-secret'] === prev.secret) {
+      if (prev && safeEqual(req.headers['x-device-secret'], prev.secret)) {
         prev.name = name
         prev.pub = body.pub
         prev.lastSeen = Date.now()
@@ -512,7 +586,7 @@ async function handleRequest(req, res) {
       let body = {}
       try { body = JSON.parse((await readBody(req, 1024)).toString('utf8') || '{}') } catch {}
       const ip = clientIp(req)
-      if (!token || token.length < 16 || body.token !== token || (ip !== '127.0.0.1' && ip !== '::1'))
+      if (!token || token.length < 16 || !safeEqual(body.token, token) || (ip !== '127.0.0.1' && ip !== '::1'))
         return sendJson(res, 403, { error: 'forbidden' })
       sendJson(res, 200, { ok: true })
       console.log('[panel] 服务已从控制面板停止')
@@ -521,17 +595,33 @@ async function handleRequest(req, res) {
     }
 
     // GET /api/update —— 检查更新：CIPHERLANE_UPDATE_URL 指向返回纯文本版本号的 URL
+    // 5min 缓存 + in-flight 去重（并发只打一次上游）；错误不缓存；只允许 http/https。
     if (p === '/api/update' && req.method === 'GET') {
       const url = process.env.CIPHERLANE_UPDATE_URL
       if (!url) return sendJson(res, 200, { source: null, current: VERSION, message: '未配置更新源（CIPHERLANE_UPDATE_URL）' })
-      try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(5000) })
-        const latest = (await r.text()).trim()
-        const newer = /^[0-9]/.test(latest) && latest !== VERSION
-        return sendJson(res, 200, { source: url, current: VERSION, latest, newer })
-      } catch (e) {
-        return sendJson(res, 200, { source: url, current: VERSION, error: String((e && e.message) || e) })
+      let parsed
+      try { parsed = new URL(url) } catch { return sendJson(res, 400, { source: url, current: VERSION, error: 'bad-update-url' }) }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+        return sendJson(res, 400, { source: url, current: VERSION, error: 'bad-update-url' })
+      const now = Date.now()
+      if (updateCache && now - updateCache.at < UPDATE_CACHE_MS) return sendJson(res, 200, updateCache.payload)
+      if (!updateInflight) {
+        updateInflight = (async () => {
+          try {
+            const r = await fetch(url, { signal: AbortSignal.timeout(5000) })
+            if (!r.ok) throw new Error('upstream ' + r.status)
+            const latest = (await r.text()).trim()
+            const payload = { source: url, current: VERSION, latest, newer: semverNewer(latest, VERSION) }
+            updateCache = { at: Date.now(), payload }
+            return payload
+          } catch (e) {
+            return { source: url, current: VERSION, error: String((e && e.message) || e) } // 错误不缓存
+          } finally {
+            updateInflight = null
+          }
+        })()
       }
+      return sendJson(res, 200, await updateInflight)
     }
 
     // GET /api/devices —— 在线设备列表
@@ -547,7 +637,7 @@ async function handleRequest(req, res) {
     if (p === '/api/offers' && req.method === 'GET') {
       const ip = clientIp(req)
       const dev = devices.get(ip)
-      if (!dev || req.headers['x-device-secret'] !== dev.secret) return sendJson(res, 401, { error: 'bad-secret' })
+      if (!dev || !safeEqual(req.headers['x-device-secret'], dev.secret)) return sendJson(res, 401, { error: 'bad-secret' })
       dev.lastSeen = Date.now()
       const respond = () => sendJson(res, 200, { offers: pendingOffersFor(ip) })
       if (pendingOffersFor(ip).length) return respond()
@@ -588,7 +678,7 @@ async function handleRequest(req, res) {
       if (mo) {
         const ip = clientIp(req)
         const dev = devices.get(ip)
-        if (!dev || req.headers['x-device-secret'] !== dev.secret) return sendJson(res, 401, { error: 'bad-secret' })
+        if (!dev || !safeEqual(req.headers['x-device-secret'], dev.secret)) return sendJson(res, 401, { error: 'bad-secret' })
         const room = offersById.get(mo[1])
         if (!room || room.offer.state !== 'pending' || room.offer.toIp !== ip)
           return sendJson(res, 410, { error: 'gone' })
@@ -607,11 +697,15 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/rooms —— 发送方创建房间
+    // POST /api/rooms —— 发送方创建房间（per-IP 房间数/建房速率双闸，防单 IP 耗尽全站）
     if (p === '/api/rooms' && req.method === 'POST') {
       await readBody(req, 1024).catch(() => {})
+      const ip = clientIp(req)
+      const rateWait = createRateWait(ip, Date.now())
+      if (rateWait > 0) return sendJson(res, 429, { error: 'ip-quota', retry: rateWait })
+      if (roomsByIp(ip) >= IP_ROOMS_MAX) return sendJson(res, 429, { error: 'ip-quota', retry: 1 })
       if (rooms.size >= ROOMS_MAX) return sendJson(res, 503, { error: 'too-many-rooms' })
-      const room = createRoom()
+      const room = createRoom(ip)
       return sendJson(res, 200, { room: room.id, token: room.token })
     }
 
@@ -624,7 +718,7 @@ async function handleRequest(req, res) {
 
       if (req.method === 'DELETE' && !sub) {
         if (!room) return sendJson(res, 404, { error: 'no-room' })
-        if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
+        if (!safeEqual(token, room.token)) return sendJson(res, 403, { error: 'bad-token' })
         destroyRoom(room)
         return sendJson(res, 200, { ok: true })
       }
@@ -647,7 +741,7 @@ async function handleRequest(req, res) {
 
       // POST /api/rooms/:id/offer —— 发送方把定向邀请挂到房间（须在投递分片之前）
       if (sub === 'offer' && req.method === 'POST') {
-        if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
+        if (!safeEqual(token, room.token)) return sendJson(res, 403, { error: 'bad-token' })
         if (room.offer) return sendJson(res, 409, { error: 'offer-exists' })
         if (room.posted > 0) return sendJson(res, 409, { error: 'late-offer' })
         let body
@@ -682,7 +776,7 @@ async function handleRequest(req, res) {
       }
 
       if (sub === 'chunk' && req.method === 'POST') {
-        if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
+        if (!safeEqual(token, room.token)) return sendJson(res, 403, { error: 'bad-token' })
         let body
         try {
           body = await readBody(req, BODY_MAX)
@@ -695,17 +789,18 @@ async function handleRequest(req, res) {
         // 背压：发送方领先太多时让其稍后重试
         // 背压：经典模式按滞留分片数；可续传模式按 未确认分片数(posted - through)
         const outstanding = room.resumable ? room.posted - room.through : room.buffer.size
+        const ip = room.senderIp || ''
         if (
           outstanding >= ROOM_CHUNKS_BUF ||
           room.bytes + body.length > ROOM_BYTES_MAX ||
-          globalBuffered + body.length > GLOBAL_BYTES_MAX
+          globalBuffered + body.length > GLOBAL_BYTES_MAX ||
+          (ipBytes.get(ip) || 0) + body.length > IP_BYTES_MAX
         ) {
           return sendJson(res, 429, { error: 'backpressure', retry: 1 })
         }
         const i = room.posted++
         room.buffer.set(i, body)
-        room.bytes += body.length
-        globalBuffered += body.length
+        bytesAdd(room, body.length)
         room.lastActive = Date.now()
         notifyChunk(room, i)
         return sendJson(res, 200, { index: i })
@@ -721,7 +816,7 @@ async function handleRequest(req, res) {
       }
 
       if (sub === 'done' && req.method === 'POST') {
-        if (token !== room.token) return sendJson(res, 403, { error: 'bad-token' })
+        if (!safeEqual(token, room.token)) return sendJson(res, 403, { error: 'bad-token' })
         await readBody(req, 1024).catch(() => {})
         if (!roomAlive(room)) return sendJson(res, 410, { error: 'gone' })
         room.senderDone = true

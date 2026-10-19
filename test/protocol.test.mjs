@@ -68,6 +68,29 @@ function rawRequest(pathname, { method = 'GET', headers = {}, body } = {}) {
   })
 }
 
+// 独立起一个临时 server（随机端口、仅回环）：配额/更新等 Node 专属测试用，
+// 避免把测试专用 env 常驻到主 server 上，也不影响 Rust 平价。
+async function startTestServer(extraEnv = {}) {
+  const port = 20000 + Math.floor(Math.random() * 20000)
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ...extraEnv },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let logs = ''
+  child.stdout.on('data', (d) => { logs += d })
+  child.stderr.on('data', (d) => { logs += d })
+  const base = `http://127.0.0.1:${port}`
+  const t0 = Date.now()
+  for (;;) {
+    if (Date.now() - t0 > 8000) {
+      child.kill('SIGKILL')
+      throw new Error('测试服务器未能在 8s 内启动:\n' + logs)
+    }
+    try { await fetch(base + '/'); return { child, base, port, logs: () => logs } } catch { await sleep(100) }
+  }
+}
+
 async function register(name) {
   const kp = X25519.genKey()
   const { json } = await jfetch('/api/presence', {
@@ -82,9 +105,24 @@ async function main() {
   // ---------- 启动真实服务器 ----------
   // 平价对照引擎：CIPHERLANE_TEST_SERVER 指向其他实现（如 Rust 版二进制）时对其跑同一套断言
   const ALT = (process.env.CIPHERLANE_TEST_SERVER || '').trim()
+
+  // /api/update 的计数上游：/new 返回 9.9.9（较新）、/old 返回 0.0.1（较旧）
+  let updateHits = 0
+  const updateUpstream = http.createServer((req, res) => {
+    updateHits++
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    res.end(req.url === '/old' ? '0.0.1\n' : '9.9.9\n')
+  })
+  await new Promise((r) => updateUpstream.listen(0, '127.0.0.1', r))
+  const UPDATE_BASE = `http://127.0.0.1:${updateUpstream.address().port}`
+  const UPDATE_URL = UPDATE_BASE + '/new'
+  const OLD_UPDATE_URL = UPDATE_BASE + '/old'
+
+  const serverEnv = { ...process.env, PORT: String(PORT) }
+  if (!ALT) serverEnv.CIPHERLANE_UPDATE_URL = UPDATE_URL // ALT 平价保持"未配置更新源"语义
   const child = ALT
-    ? spawn(ALT, [], { cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] })
-    : spawn(process.execPath, ['server.js'], { cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] })
+    ? spawn(ALT, [], { cwd: ROOT, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+    : spawn(process.execPath, ['server.js'], { cwd: ROOT, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] })
   let logs = ''
   child.stdout.on('data', (d) => { logs += d })
   child.stderr.on('data', (d) => { logs += d })
@@ -534,6 +572,123 @@ async function main() {
       ok('Host/Origin：域名 Host 403 / IP Host 200 / 跨站 Origin 403 / 同源放行 / 静态页不受限')
     }
 
+    // ---------- /api/update：上游只请求一次（缓存 + in-flight 去重）+ 语义化 newer ----------
+    if (!ALT) {
+      const hits0 = updateHits
+      const [u1, u2] = await Promise.all([jfetch('/api/update'), jfetch('/api/update')])
+      assert.strictEqual(u1.status, 200)
+      assert.strictEqual(u1.json.latest, '9.9.9')
+      assert.strictEqual(u1.json.newer, true, '9.9.9 应判定为更新')
+      assert.strictEqual(u1.json.source, UPDATE_URL)
+      assert.deepStrictEqual(u2.json, u1.json, '并发调用的结果应一致')
+      assert.strictEqual(updateHits - hits0, 1, '并发两次 /api/update 只应命中上游一次')
+      const u3 = await jfetch('/api/update')
+      assert.deepStrictEqual(u3.json, u1.json, '缓存命中结果应一致')
+      assert.strictEqual(updateHits - hits0, 1, '5min 缓存期内不应再请求上游')
+      // 旧版本不得判定为 newer（旧实现 latest !== VERSION 会误报）
+      const srv = await startTestServer({ CIPHERLANE_UPDATE_URL: OLD_UPDATE_URL })
+      try {
+        const old = await (await fetch(srv.base + '/api/update')).json()
+        assert.strictEqual(old.latest, '0.0.1')
+        assert.strictEqual(old.newer, false, '0.0.1 不应判定为更新（语义化比较）')
+      } finally {
+        srv.child.kill('SIGINT')
+      }
+      ok('/api/update：并发/缓存只请求上游一次、semver newer 正确、旧版本不误报')
+    }
+
+    // ---------- per-IP 配额：独立低阈值 server（CIPHERLANE_TEST_LIMITS=1 → 4 房 / 2MB） ----------
+    if (!ALT) {
+      const q = await startTestServer({ CIPHERLANE_TEST_LIMITS: '1', CIPHERLANE_UPDATE_URL: 'file:///etc/hostname' })
+      try {
+        const qrooms = []
+        for (let i = 0; i < 4; i++) {
+          const rr = await fetch(q.base + '/api/rooms', { method: 'POST' })
+          assert.strictEqual(rr.status, 200, '前 4 个房间应成功')
+          qrooms.push(await rr.json())
+        }
+        const over = await fetch(q.base + '/api/rooms', { method: 'POST' })
+        assert.strictEqual(over.status, 429, '第 5 个房间应 429')
+        assert.strictEqual((await over.json()).error, 'ip-quota')
+        const qpost = async (r, buf) => {
+          const res = await fetch(`${q.base}/api/rooms/${r.room}/chunk`, {
+            method: 'POST', headers: { 'X-Room-Token': r.token }, body: buf,
+          })
+          return { status: res.status, json: await res.json().catch(() => ({})) }
+        }
+        assert.strictEqual((await qpost(qrooms[0], Buffer.alloc(1024 * 1024))).status, 200)
+        assert.strictEqual((await qpost(qrooms[0], Buffer.alloc(1024 * 1024))).status, 200)
+        const bq = await qpost(qrooms[0], Buffer.alloc(1024 * 1024))
+        assert.strictEqual(bq.status, 429, '单 IP 2MB 字节配额：第 3MiB 应 429')
+        assert.strictEqual(bq.json.error, 'backpressure')
+        // 自清理：房间全删后配额回落，再建房应成功（速率 120/min 不受影响）
+        for (const rr of qrooms) {
+          const d = await fetch(`${q.base}/api/rooms/${rr.room}`, { method: 'DELETE', headers: { 'X-Room-Token': rr.token } })
+          assert.strictEqual(d.status, 200)
+        }
+        const freshRes = await fetch(q.base + '/api/rooms', { method: 'POST' })
+        assert.strictEqual(freshRes.status, 200, 'DELETE 后房间配额应回落')
+        const fresh = await freshRes.json()
+        // destroy/take/advance 三条释放路径都必须把 ipBytes 同步减回去，否则下面会提前 429
+        assert.strictEqual((await qpost(fresh, Buffer.alloc(1024 * 1024))).status, 200)
+        assert.strictEqual((await fetch(`${q.base}/api/rooms/${fresh.room}/chunk?i=0`)).status, 200)
+        assert.strictEqual((await qpost(fresh, Buffer.alloc(1024 * 1024))).status, 200, 'takeChunk 后 ipBytes 应已释放')
+        assert.strictEqual((await fetch(`${q.base}/api/rooms/${fresh.room}/chunk?i=1`, { headers: { 'X-Resume': '1' } })).status, 200)
+        const prog = await fetch(`${q.base}/api/rooms/${fresh.room}/progress`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ through: 2 }),
+        })
+        assert.strictEqual(prog.status, 200)
+        assert.strictEqual((await qpost(fresh, Buffer.alloc(1024 * 1024))).status, 200, 'advanceThrough 后 ipBytes 应已释放')
+        assert.strictEqual((await qpost(fresh, Buffer.alloc(1024 * 1024))).status, 200)
+        assert.strictEqual((await qpost(fresh, Buffer.alloc(1024 * 1024))).status, 429, '重新累计到 2MB 后应再次 429')
+        // 非法 update URL（file://）→ 400，错误不缓存
+        const bad = await fetch(q.base + '/api/update')
+        assert.strictEqual(bad.status, 400, 'file:// 更新源应 400')
+        assert.strictEqual((await bad.json()).error, 'bad-update-url')
+        ok('per-IP 配额：4 房上限→第 5 个 429 ip-quota / 2MB 字节上限→backpressure / destroy·take·advance 均释放 / 非法 update URL 400')
+      } finally {
+        q.child.kill('SIGINT')
+      }
+    }
+
+    // ---------- 建房速率：滑动 60s 内第 121 次建房 → 429 ip-quota ----------
+    if (!ALT) {
+      const rs = await startTestServer({ CIPHERLANE_TEST_LIMITS: '1' })
+      try {
+        for (let i = 0; i < 120; i++) {
+          const c = await fetch(rs.base + '/api/rooms', { method: 'POST' })
+          assert.strictEqual(c.status, 200, `第 ${i + 1} 次建房应成功`)
+          const { room, token } = await c.json()
+          const d = await fetch(`${rs.base}/api/rooms/${room}`, { method: 'DELETE', headers: { 'X-Room-Token': token } })
+          assert.strictEqual(d.status, 200)
+        }
+        const over = await fetch(rs.base + '/api/rooms', { method: 'POST' })
+        assert.strictEqual(over.status, 429, '第 121 次建房应 429')
+        const overJson = await over.json()
+        assert.strictEqual(overJson.error, 'ip-quota')
+        assert(overJson.retry >= 1, '应给出 retry 秒数')
+        ok('建房限流：60s 内第 121 次建房 → 429 ip-quota（滑动窗口，retry 有值）')
+      } finally {
+        rs.child.kill('SIGINT')
+      }
+    }
+
+    // ---------- 设备名净化：C0/C1 控制字符入库前剔除（防终端转义注入） ----------
+    if (!ALT) {
+      const kp = X25519.genKey()
+      const dirty = 'evil\u001b[31m\u0000line\nname\u009b'
+      const reg = await jfetch('/api/presence', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: dirty, pub: b64u(kp.pk) }),
+      })
+      assert.strictEqual(reg.status, 200)
+      const me = (await jfetch('/api/devices')).json.devices.find((d) => d.ip === IP)
+      assert(me, '设备应在线')
+      assert.strictEqual(me.name, 'evil[31mlinename', '控制字符应被移除后再 trim/slice')
+      assert(!/[\u0000-\u001f\u007f-\u009f]/.test(me.name), '不应残留控制字符')
+      ok('设备名净化：ESC/NUL/换行/C1 被剔除，/api/devices 返回干净名称')
+    }
+
     // ---------- 面板端点 ----------
     {
       let r = await jfetch('/api/version')
@@ -544,10 +699,10 @@ async function main() {
       assert.strictEqual(r.status, 403, '空令牌应 403')
       r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'x'.repeat(24) }) })
       assert.strictEqual(r.status, 403, '错令牌应 403')
-      // update：未配置源时如实返回
+      // update：主 server 已配置计数上游（ALT 平价不配 env，保持"无源如实返回"）
       r = await jfetch('/api/update')
       assert.strictEqual(r.status, 200)
-      assert.strictEqual(r.json.source, null)
+      assert.strictEqual(r.json.source, ALT ? null : UPDATE_URL)
       // panel 静态页可达
       const html = await fetch(S + '/panel')
       assert.ok(html.ok && (await html.text()).includes('控制面板'))
@@ -589,6 +744,7 @@ async function main() {
 console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')
+    try { updateUpstream.close() } catch {}
   }
 }
 
