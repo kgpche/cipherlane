@@ -15,7 +15,8 @@
   "homepage": "https://github.com/kgpche/cipherlane#readme",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/aesgcm.test.mjs && node test/sha256.test.mjs && node test/x25519.test.mjs && node test/qrcode.test.mjs && node test/avatar.test.mjs && node test/protocol.test.mjs && node test/cli.test.mjs && node test/browser.test.mjs"
+    "check": "node scripts/check-consistency.mjs",
+    "test": "node scripts/check-consistency.mjs && node test/aesgcm.test.mjs && node test/sha256.test.mjs && node test/x25519.test.mjs && node test/qrcode.test.mjs && node test/avatar.test.mjs && node test/protocol.test.mjs && node test/cli.test.mjs && node test/browser.test.mjs"
   },
   "engines": {
     "node": ">=18"

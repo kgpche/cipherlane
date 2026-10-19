@@ -1,11 +1,21 @@
 name: CI
+
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+# 同一 ref 的新运行取消旧运行（PR 反复推送时不堆积）
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -15,4 +25,41 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm test
+      # 一致性检查（版本号 / SEA 资产 ↔ server.js / 测试文件存在）
+      - name: Consistency check
+        run: npm run check
+      # 浏览器套件需要 Chrome：ubuntu-latest 自带 /usr/bin/google-chrome；
+      # Node 18/20 无全局 WebSocket，browser.test.mjs 会自动跳过并以 0 退出。
+      - name: Tests
+        run: npm test
+
+  # Rust 版服务器的编译与协议平价（Linux deb 的发布产物即 Rust 二进制）
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # 两个 bin（server + tray）先做 glibc 编译，确保 Cargo.lock 与源码可构建
+      - name: Build Rust binaries (glibc)
+        run: cargo build --locked --release --manifest-path cipherlane-rs/Cargo.toml
+      # musl 静态 server 是 deb 内实际分发的产物
+      - name: Build static server (musl)
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --locked --release --target x86_64-unknown-linux-musl \
+            --bin cipherlane --manifest-path cipherlane-rs/Cargo.toml
+      # 用现有平价钩子：同一套 protocol 断言跑 Rust 二进制（协议兼容验收）
+      - name: Protocol parity (Rust server)
+        run: CIPHERLANE_TEST_SERVER="$PWD/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane" node test/protocol.test.mjs
