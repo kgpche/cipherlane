@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -67,6 +67,7 @@ node server.js            # 或 npm start；默认端口 7777（PORT= 可改）�
 ```bash
 node cli.mjs devices --server http://192.168.1.117:7777        # 查看在线设备
 node cli.mjs send big.zip --to 192.168.1.50 --server http://... # 定向直发（无需传链接）
+node cli.mjs send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # 核对目标指纹（防调包）
 node cli.mjs listen --yes -o ~/downloads --server http://...    # 常驻接收端（可被直发）
 node cli.mjs send big.zip --server http://...                   # 链接模式：打印接收链接
 node cli.mjs send a.zip dir/ --server http://...                 # 批量：多路径与目录递归（浏览器互通）
@@ -104,7 +105,9 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 | `POST /api/offers/:id/accept\|reject` | 接受 / 拒绝（拒绝后房间保留 2 分钟供发送方观测） |
 | `POST /api/rooms/:id/done` / `ack` | 发送完毕 / 接收确认（ack 附密钥凭证，发送方本地校验）；房间空闲 15 分钟自动回收 |
 
-限额：单房间 64 分片 / 64 MB 背压，全局 256 MB，单设备待处理邀请 ≤ 8（TTL 5 分钟），设备表 ≤ 256。
+限额：单房间 64 分片 / 64 MB 背压，全局 256 MB，单 IP 64 房 / 96 MB 滞留密文 / 120 建房每分钟，单设备待处理邀请 ≤ 8（TTL 5 分钟），设备表 ≤ 256。
+
+**协议 v2（v0.5.0+）**：每个分片以 `AAD = cipherlane/chunk/v2|<房间号>|<序号>` 绑定位置，重排、重放或错位分片会被 GCM 拒绝；接收端在完成时校验明文总长度（文本/每个文件/总量），不一致即失败且不发送 ack。v0.5.0 发送的传输**不能被 v0.4.x 接收端解密**（两端需同时升级）；新接收端仍兼容旧发送端（先试 v2、失败回退 v1）。
 
 ## 安全模型
 
@@ -115,15 +118,15 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 | 运行服务器的人（设备直发） | 房间密钥由 X25519 协商派生，服务器只见公钥与密文，事后翻日志无法解密 |
 | 偷走设备 secret | 无效：领取邀请需 **secret 与来源 IP 同时匹配**，换台机器即 401 |
 | 链接被无关者拿到 | 房间号不可枚举；分片顺序一次性消费，一人取走他人即 410 |
-| 传输中被篡改 | GCM 认证标签逐分片校验；邀请预览验签失败自动拒绝 |
-| 冒充发送方投毒 | 投递分片需持有随机 room token（仅发送方内存中有） |
+| 传输中被篡改 | GCM 认证标签逐分片校验，AAD 绑定房间与分片序号；完成后校验明文总长度；邀请预览验签失败自动拒绝 |
+| 冒充发送方投毒 | 投递分片需持有随机 room token（仅发送方持有；HTTP 明文链路上可被嗅探，故传输仍依赖 GCM 认证） |
 | 伪造接收确认 | ack 携带密钥凭证 SHA256(key‖标签‖房间号)，无密钥者伪造的 ack 发送方一辨即明 |
 | 小阶点 / 无效公钥攻击 | X25519 共享密钥全零即拒绝（RFC 7748 要求） |
-| 房间滥用占内存 | 见上文限额，空闲自动回收 |
+| 房间/内存滥用 | 单房间 64MB、全局 256MB、单 IP 64 房/96MB/120 建房每分钟，超限 429，空闲自动回收 |
 
 **已知边界（如实说明）**：
 
-- **设备直发无法自动防服务器主动 MITM**：设备公钥由服务器分发，恶意服务器理论上可调包公钥冒充接收方。防线是**公钥指纹**（TOFU）：设备卡/名片显示 8 位指纹，公钥变化会持续标"⚠ 公钥已变化"——双方口头比对指纹可识破调包，但系统不会替你比对；名片上的 ↻ 可随时重置身份密钥。极高安全需求请用链接模式
+- **设备直发无法自动防服务器主动 MITM**：设备公钥由服务器分发，恶意服务器理论上可调包公钥冒充接收方。防线是**公钥指纹**（TOFU）：设备卡/名片显示 **128bit（32 hex）** 指纹，公钥变化会持续标"⚠ 公钥已变化"；设备直发与收到的邀请在公钥变化时都会强制二次确认，CLI 用 `--verify <指纹前缀>` 可强制校验——双方口头比对指纹可识破调包，但系统不会替你比对；名片上的 ↻ 可随时重置身份密钥。极高安全需求请用链接模式
 - **页面本身经明文 HTTP 下发**：端到端加密只防被动嗅探；路径上的主动攻击者理论上可替换下发的 JS（与浏览器打开任何 http 站点同级的风险）。不可信网络请配合 VPN 使用
 - 设备名称与在线状态对服务器及局域网内打开页面的用户可见——这是"设备发现"的固有代价
 - 服务默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不绑 VPN/tun、虚拟网卡等非信任网段；deb 服务模板同样按此默认，确有全网卡需求时用 systemd drop-in 覆盖 `HOST=0.0.0.0`
@@ -226,6 +229,22 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v0.5.0**（2026-10-19，安全强化）
+- **协议 v2**：AES-GCM 分片加入 AAD 位置绑定（房间号 + 分片序号），重排/重放/错位分片被
+  GCM 拒绝；接收端完成时校验明文总长度（文本/每个文件/总量），不一致不 ack。v0.5.0 发送端
+  与 v0.4.x 接收端不兼容（需双端同时升级）；新接收端仍兼容旧发送端
+- **TOFU 指纹升级为 128bit（32 hex）**，设备直发与收到的邀请在公钥变化时强制二次确认；
+  CLI 展示指纹并支持 `--verify <前缀>` 强制校验，同时过滤远端字符串的控制字符（防终端注入）
+- **服务端加固**：`/api/*` 校验 Host/Origin（防 CSRF/DNS rebinding）；per-IP 房间/字节/建房
+  速率配额（64 房 / 96MB / 120 次每分钟）；常量时间令牌比较；`/api/update` 5 分钟缓存 +
+  语义化版本比较；设备名控制字符过滤；SIGTERM 优雅停机
+- **性能/可靠性**：静态资源 ETag/304 回源校验（HTML 仍 no-store）；413 真实可达；分片 head
+  仅在按序时推进；FSA 流式保存真正启用并支持刷新续传；房间销毁期间到达的写请求回 410
+  （修全局内存计数泄漏）；Rust 版背压计数竞态与房间销毁泄漏修复
+- **打包**：Linux deb 改用 musl 静态托盘（不再依赖 GLIBC_2.39）；systemd 默认仅绑回环+LAN
+- **工程**：CI 增加 Rust 构建与协议平价、版本/SEA 资产一致性检查；仓库移除误入库的
+  800MB Rust 构建产物
 
 **v0.4.3**（2026-10-15，热修）
 - 修复：自定义 `display`（flex/grid）会压过浏览器默认的 `[hidden]{display:none}`，

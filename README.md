@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.4.3-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.0-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -68,6 +68,7 @@ Machines without a browser can use the CLI (fully interoperable with the web UI)
 ```bash
 node cli.mjs devices --server http://192.168.1.117:7777        # list online devices
 node cli.mjs send big.zip --to 192.168.1.50 --server http://... # direct send (no link needed)
+node cli.mjs send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # pin the target fingerprint
 node cli.mjs listen --yes -o ~/downloads --server http://...    # resident receiver (can be direct-sent to)
 node cli.mjs send big.zip --server http://...                   # link mode: prints a receive link
 node cli.mjs send a.zip dir/ --server http://...                 # batch: multiple paths + recursive directories
@@ -105,7 +106,9 @@ Sender browser/CLI                    LAN (plain HTTP, sniffable)             Re
 | `POST /api/offers/:id/accept\|reject` | Accept / reject (rejected rooms live 2 more minutes for the sender to observe) |
 | `POST /api/rooms/:id/done` / `ack` | Sender finished / receiver confirmed (ack carries a key proof verified locally by the sender); idle rooms are reclaimed after 15 min |
 
-Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, ≤ 8 pending offers per device (5 min TTL), ≤ 256 devices.
+Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, 64 rooms / 96 MB buffered / 120 creates per minute per IP, ≤ 8 pending offers per device (5 min TTL), ≤ 256 devices.
+
+**Protocol v2 (v0.5.0+)**: every chunk is bound to its position via `AAD = cipherlane/chunk/v2|<room>|<index>`, so reordered, replayed or misplaced chunks are rejected by GCM; receivers verify the total plaintext length at the end (text / each file / total) and never ack on mismatch. Transfers sent by v0.5.0 **cannot be decrypted by v0.4.x receivers** (upgrade both ends together); new receivers remain compatible with old senders (v2 first, fall back to v1).
 
 ## Security Model
 
@@ -116,15 +119,15 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, ≤ 8 pending of
 | The server operator (device direct) | Room key derived via X25519; the server sees only public keys and ciphertext — old logs stay useless |
 | Stolen device secret | Useless: claiming an invitation requires **both the secret and the matching source IP** — a different machine gets 401 |
 | Link obtained by a third party | Room ids are unenumerable; chunks are consumed one-shot — once someone pulls them, others get 410 |
-| Tampering in transit | GCM auth tags verified per chunk; invitations whose preview fails verification are auto-rejected |
-| Impersonating the sender | Posting chunks requires the random room token (held only in the sender's memory) |
+| Tampering in transit | GCM auth tags verified per chunk with AAD binding room + chunk index; total plaintext length is verified at the end; invitations whose preview fails verification are auto-rejected |
+| Impersonating the sender | Posting chunks requires the random room token (held by the sender only; sniffable on plain HTTP, so integrity still relies on GCM) |
 | Forged delivery confirmation | ack carries a key proof SHA256(key‖label‖room); sender verifies locally and flags proof-less acks |
 | Small-order / invalid public keys | X25519 all-zero shared secret is rejected (RFC 7748 requirement) |
-| Room abuse | Hard limits above; idle rooms reclaimed automatically |
+| Room / memory abuse | 64 MB per room, 256 MB global, 64 rooms / 96 MB / 120 creates per minute per IP; 429 beyond that; idle rooms reclaimed automatically |
 
 **Known boundaries (stated honestly)**:
 
-- **Device-direct mode cannot automatically stop an active MITM by the server**: device public keys are distributed by the server, so a malicious server could substitute keys and impersonate the receiver. The mitigation is **public-key fingerprints** (TOFU): device cards and your own card show an 8-hex fingerprint, and a changed key is flagged "⚠ key changed" persistently — comparing fingerprints out loud defeats substitution, but the system will not compare them for you; the ↻ button on your card resets the identity key at any time. For the highest assurance, use link mode
+- **Device-direct mode cannot automatically stop an active MITM by the server**: device public keys are distributed by the server, so a malicious server could substitute keys and impersonate the receiver. The mitigation is **public-key fingerprints** (TOFU): device cards and your own card show a **128-bit (32-hex)** fingerprint, and a changed key is flagged "⚠ key changed" persistently; both direct sends and incoming invitations require explicit confirmation when the key changes, and the CLI can pin it with `--verify <prefix>` — comparing fingerprints out loud defeats substitution, but the system will not compare them for you; the ↻ button on your card resets the identity key at any time. For the highest assurance, use link mode
 - **The page itself is served over plain HTTP**: E2EE protects against passive observers only; an active on-path attacker could in principle replace the served JavaScript (the same class of risk as opening any plain-http site). Use a VPN on untrusted networks
 - Device names and presence are visible to the server and to anyone who opens the page on the LAN — the inherent cost of device discovery
 - The server binds 127.0.0.1 + LAN (RFC1918) interfaces by default, not VPN/tun or virtual adapters; the deb service template follows the same default — override with a systemd drop-in setting `HOST=0.0.0.0` only if you really need all interfaces
@@ -227,6 +230,14 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v0.5.0** (2026-10-19, security hardening)
+- **Protocol v2**: AES-GCM chunks now use AAD binding (room id + chunk index); reordered, replayed or misplaced chunks are rejected, and receivers verify total plaintext length (text / each file / total) before acking. v0.5.0 senders are **not** compatible with v0.4.x receivers (upgrade both ends); new receivers remain compatible with old senders
+- **TOFU fingerprints upgraded to 128-bit (32 hex)**; direct sends and incoming invitations require explicit confirmation when a peer key changes; the CLI prints fingerprints, supports `--verify <prefix>`, and strips control characters from remote strings (anti terminal-injection)
+- **Server hardening**: Host/Origin validation for `/api/*` (anti-CSRF/DNS-rebinding); per-IP quotas for rooms/bytes/create-rate (64 rooms / 96 MB / 120 per minute); constant-time token comparison; `/api/update` 5-minute cache + semver comparison; device-name control-character filtering; graceful SIGTERM shutdown
+- **Performance/reliability**: static assets use ETag/304 revalidation (HTML stays no-store); 413 is now actually reachable; chunk head advances only in order; FSA streaming save is actually enabled and survives a refresh; writes arriving during room destruction return 410 (fixes a global memory-accounting leak); Rust backpressure-accounting race and destroy-leak fixed
+- **Packaging**: Linux deb ships a musl static tray (no GLIBC_2.39 dependency); systemd binds loopback+LAN by default
+- **Tooling**: CI builds Rust and runs protocol parity plus version/SEA-asset consistency; the accidentally committed 800 MB Rust build output is gone from the repo
 
 **v0.4.3** (2026-10-15, hotfix)
 - Fixed: custom `display` (flex/grid) rules override the browser's default `[hidden]{display:none}`, silently defeating the hidden attribute. A full audit found 6 elements affected: the confirmation modal overlay added in v0.4.1 **popped up full-screen on every refresh** (empty title and body), plus 5 long-standing cases (send-target row / QR box / receive-from row / file card / action button groups) rendering as stray empty boxes. A one-line defensive reset `[hidden]{display:none!important}` fixes all of them
