@@ -75,7 +75,24 @@ chmod +x "$BUILD/cipherlane-linux-x64"
 $POSTJECT "$BUILD/cipherlane-linux-x64" NODE_SEA_BLOB "$BUILD/sea-prep.blob" --sentinel-fuse $FUSE >/dev/null
 DEBROOT=$BUILD/deb-root
 rm -rf "$DEBROOT"
-mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system"
+mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system" "$DEBROOT/usr/share/applications" "$DEBROOT/usr/share/icons/hicolor/scalable/apps"
+# 桌面集成:应用列表显示"cipherlane 密道",点击即在终端窗口运行服务器(显示地址与二维码)
+cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane.svg"
+cat > "$DEBROOT/usr/share/applications/cipherlane.desktop" << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=cipherlane 密道
+Comment=局域网端到端加密传输
+Comment[en]=LAN end-to-end encrypted transfer
+GenericName=文件传输
+Exec=/usr/bin/cipherlane
+Icon=cipherlane
+Terminal=true
+Categories=Network;FileTransfer;Utility;
+Keywords=lan;transfer;encrypt;airdrop;密道;传输;加密;
+StartupNotify=true
+X-GNOME-UsesNotifications=false
+EOF
 cp "$BUILD/cipherlane-linux-x64" "$DEBROOT/usr/bin/cipherlane"
 chmod 755 "$DEBROOT/usr/bin/cipherlane"
 cat > "$DEBROOT/usr/lib/systemd/system/cipherlane.service" << 'EOF'
