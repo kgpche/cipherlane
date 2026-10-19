@@ -99,10 +99,19 @@ PORT=${CIPHERLANE_PORT:-7777}
 URL="http://127.0.0.1:$PORT"
 probe() { (curl -sf "$URL/api/version" || wget -qO- "$URL/api/version") >/dev/null 2>&1; }
 if ! probe; then
+  # 日志写用户态 XDG 目录：/var/log 普通用户无权创建,曾导致服务器静默不启动
+  LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/cipherlane"
+  mkdir -p "$LOGDIR"
   TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)
-  CIPHERLANE_SHUTDOWN_TOKEN="$TOKEN" nohup /usr/bin/cipherlane >/var/log/cipherlane-app.log 2>&1 &
+  PORT="$PORT" CIPHERLANE_SHUTDOWN_TOKEN="$TOKEN" nohup /usr/bin/cipherlane >>"$LOGDIR/app.log" 2>&1 &
   for i in $(seq 1 50); do probe && break; sleep 0.2; done
-  exec xdg-open "$URL/panel#$TOKEN"
+  if probe; then
+    exec xdg-open "$URL/panel#$TOKEN"
+  fi
+  # 启动失败（多半是端口被旧实例占用）：明示原因,不再静默打开死页
+  MSG="密道启动失败。常见原因：端口 $PORT 被旧实例占用（fuser -k $PORT/tcp 后重试）。日志：$LOGDIR/app.log"
+  if command -v zenity >/dev/null 2>&1; then zenity --error --title cipherlane --text "$MSG" 2>/dev/null; fi
+  exit 1
 fi
 exec xdg-open "$URL/panel"
 EOF
