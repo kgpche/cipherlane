@@ -225,8 +225,10 @@ async function fetchT(url, opts, ms) {
     if (opts.signal) opts.signal.removeEventListener('abort', follow)
   }
 }
-async function api(path, opts) {
-  const r = await fetch(path, opts)
+// 统一 API 超时：服务端卡住时不再无限挂起（心跳/轮询会不断叠加连接）。
+// 默认 10s，调用方可传第三参覆盖（如长轮询 35s）。
+async function api(path, opts = {}, ms = 10_000) {
+  const r = await fetchT(path, opts, ms)
   if (!r.ok) {
     const e = new Error((await r.json().catch(() => ({}))).error || r.status)
     e.status = r.status
@@ -234,23 +236,35 @@ async function api(path, opts) {
   }
   return r
 }
-async function postChunk(room, token, bytes, signal) {
+// seq = 分片全局序号（0=元信息，数据片从 1 连续）。X-Chunk-Seq 用于幂等重投：
+// 超时/429 重试复用同一 seq，服务端可识别"已收下但响应丢失"的重复投递；409 = 服务端
+// 计数与客户端不一致（out-of-order），必须明确报错让用户重发，绝不能隐式重排。
+async function postChunk(room, token, bytes, seq, signal) {
   for (;;) {
     let r
     try {
       r = await fetchT(`/api/rooms/${room}/chunk`, {
         method: 'POST',
-        headers: { 'X-Room-Token': token },
+        headers: {
+          'X-Room-Token': token,
+          ...(seq === undefined || seq === null ? {} : { 'X-Chunk-Seq': String(seq) }),
+        },
         body: bytes,
         signal,
       }, 30_000)
     } catch (e) {
       if (signal && signal.aborted) throw new Error('已取消')
-      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投
+      if (e && e.name === 'TimeoutError') { await sleep(500); continue } // 连接停滞:重连重投(同一 seq)
       throw e
     }
+    if (r.status === 409) {
+      // out-of-order:服务端已收序号与本次不一致。绝不隐式重排(会让后续分片全部错位)。
+      let detail = ''
+      try { detail = (await r.json()).error || '' } catch {}
+      throw new Error('服务器分片计数不同步，请重新发送' + (detail ? `（${detail}）` : ''))
+    }
     if (r.status === 429) {
-      await sleep(250) // 背压：接收方还没跟上
+      await sleep(250) // 背压：接收方还没跟上（重投同一 seq）
       continue
     }
     if (!r.ok) throw new Error('发送失败 ' + r.status)
@@ -316,10 +330,10 @@ const progressPost = (() => {
   const dead = new Set()
   return (room, through) => {
     if (dead.has(room)) return
-    fetch(`/api/rooms/${room}/progress`, {
+    fetchT(`/api/rooms/${room}/progress`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ through }),
-    }).then((r) => { if (r.status === 404 || r.status === 409) dead.add(room) }).catch(() => {})
+    }, 10_000).then((r) => { if (r.status === 404 || r.status === 409) dead.add(room) }).catch(() => {})
   }
 })()
 
@@ -411,7 +425,12 @@ const my = {
 let selectedIp = null       // 设备直发的目标
 let deviceCache = []        // 最近一次设备列表
 
+// 心跳防重入：上一次请求未完成（服务端卡住）时跳过本次 5s tick，避免每 5s 叠加一条
+// 挂起连接、最终耗尽浏览器同源连接池（≤6 条）导致整页所有请求排队。
+let heartbeatInFlight = false
 async function heartbeat() {
+  if (heartbeatInFlight) return
+  heartbeatInFlight = true
   try {
     const r = await api('/api/presence', {
       method: 'POST',
@@ -425,24 +444,28 @@ async function heartbeat() {
     my.ip = j.ip
     my.secret = j.secret
     store.set('cipherlane-secret', j.secret)
-  } catch { /* 网络抖动，下个心跳重试 */ }
+  } catch { /* 网络抖动，下个心跳重试 */ } finally { heartbeatInFlight = false }
 }
 
+// 设备列表刷新：同样防重入（5s 心跳 + showView 都会触发），并带超时
+let devicesInFlight = false
 async function refreshDevices() {
+  if (devicesInFlight) return
+  devicesInFlight = true
   try {
-    const j = await (await fetch('/api/devices')).json()
+    const j = await (await fetchT('/api/devices', {}, 10_000)).json()
     deviceCache = j.devices || []
     renderDevices()
-  } catch {}
+  } catch {} finally { devicesInFlight = false }
 }
 
 let deviceFilter = '' // 设备搜索:名称 / IP 子串,空 = 全部
 
+let deviceSig = '' // 已渲染设备列表签名：相同则跳过 DOM 重建（5s 心跳不再清空卡片/丢焦点）
+
 function renderDevices() {
   const wrap = $('#devices-wrap')
   const box = $('#devices')
-  const scrollLeft = box.scrollLeft // 心跳刷新/选中重渲染不打断横滑位置
-  box.innerHTML = ''
   // 按名称本地化排序(zh 拼序,中英混排稳定):首见顺序无规律,设备多了找不到了
   const collator = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' })
   const all = deviceCache.filter((d) => d.ip !== my.ip)
@@ -451,22 +474,41 @@ function renderDevices() {
     ? all.filter((d) => (d.name || '').toLowerCase().includes(kw) || d.ip.includes(kw))
     : all
   ).sort((a, b) => collator.compare(a.name || '', b.name || '') || (a.ip < b.ip ? -1 : 1))
-  // 搜索框只在设备多时出现(>6 台),少设备时它是噪音
-  $('#device-search').hidden = all.length <= 6
-  $('#devices-count').textContent = others.length
-    ? kw ? `· ${others.length}/${all.length} 台` : `· ${others.length} 台在线`
-    : ''
   if (selectedIp && !all.some((d) => d.ip === selectedIp)) selectedIp = null
-  const empty = $('#devices-empty')
-  empty.hidden = all.length > 0 && others.length > 0
-  if (all.length > 0 && others.length === 0) empty.textContent = `没有匹配「${deviceFilter.trim()}」的设备`
-  else empty.textContent = '同一局域网的设备打开本页后会出现在这里；点击选中即可直发，无需传递链接。'
   // 公钥变更检测（TOFU）：首见公钥记档（对全部设备，含被过滤的）；之后不一致则持续警示且不覆盖记录
   const known = knownPubs.load()
   let dirty = false
   for (const d of all) {
     if (!known[d.ip] || known[d.ip] === d.pub) { if (known[d.ip] !== d.pub) { known[d.ip] = d.pub; dirty = true } }
   }
+  if (dirty) knownPubs.save(known)
+  // 差量渲染签名：覆盖一切影响 DOM 的输入（排序后设备的 ip/name/pub、公钥变化标记、
+  // 选中项、搜索词）。搜索框显隐/计数/空态均由这些派生，签名相同 = DOM 已最新。
+  const sig = [
+    my.ip || '', // 自身 IP 变化会改变“排除自己”的过滤结果
+    selectedIp || '',
+    deviceFilter,
+    all.length,
+    others.length,
+    others.map((d) => `${d.ip}\u0000${d.name || ''}\u0000${d.pub}\u0000${known[d.ip] && known[d.ip] !== d.pub ? '1' : '0'}`).join('\n'),
+  ].join('\u0001')
+  if (sig === deviceSig && box.childElementCount) {
+    // 数据未变：不重建，键盘焦点/横滑位置/悬停状态全部保留；仅补一次布局相关的横滑提示
+    requestAnimationFrame(() => wrap.classList.toggle('scrollable', box.scrollWidth > box.clientWidth + 8))
+    return
+  }
+  deviceSig = sig
+  const scrollLeft = box.scrollLeft // 心跳刷新/选中重渲染不打断横滑位置
+  box.innerHTML = ''
+  // 搜索框只在设备多时出现(>6 台),少设备时它是噪音
+  $('#device-search').hidden = all.length <= 6
+  $('#devices-count').textContent = others.length
+    ? kw ? `· ${others.length}/${all.length} 台` : `· ${others.length} 台在线`
+    : ''
+  const empty = $('#devices-empty')
+  empty.hidden = all.length > 0 && others.length > 0
+  if (all.length > 0 && others.length === 0) empty.textContent = `没有匹配「${deviceFilter.trim()}」的设备`
+  else empty.textContent = '同一局域网的设备打开本页后会出现在这里；点击选中即可直发，无需传递链接。'
   for (const d of others) {
     const changed = known[d.ip] && known[d.ip] !== d.pub
     const card = document.createElement('button')
@@ -493,7 +535,6 @@ function renderDevices() {
     }
     box.appendChild(card)
   }
-  if (dirty) knownPubs.save(known)
   box.scrollLeft = scrollLeft
   requestAnimationFrame(() => wrap.classList.toggle('scrollable', box.scrollWidth > box.clientWidth + 8))
   updateModeHint()
@@ -632,24 +673,39 @@ async function acceptOffer(o) {
   receiveInto(o.room, o._key, from)
 }
 
+// 邀请对账：以服务端返回的完整列表为准，删除本端已不存在（过期/被拒/已接受）的条目。
+// 返回是否有变化（pollOffers 据此重渲染；也被浏览器回归测试直接调用）。
+function reconcileOffers(list) {
+  const valid = (Array.isArray(list) ? list : []).filter((o) => o && o.id)
+  const alive = new Set(valid.map((o) => o.id))
+  let changed = false
+  for (const id of [...incomingOffers.keys()]) {
+    if (!alive.has(id)) { incomingOffers.delete(id); changed = true }
+  }
+  for (const o of valid) {
+    if (!incomingOffers.has(o.id)) {
+      incomingOffers.set(o.id, o)
+      changed = true
+      notifyNewOffer('📮 密道 · 收到传输请求', `${(o.from && o.from.name) || '未知设备'}（${(o.from && o.from.ip) || '?'}）想发给你内容`)
+    }
+  }
+  // 邀请清空 = 没有待处理请求：停止标题闪烁（否则会一直闪到切走标签页）
+  if (incomingOffers.size === 0) notifyNewOffer.stop()
+  if (changed && !$('#view-landing').hidden) renderIncoming()
+  return changed
+}
+
 // 长轮询本机邀请（任意视图期间都保持监听，回到首页即可看到）
 async function pollOffers() {
   for (;;) {
     if (!my.secret) { await sleep(1000); continue }
     try {
-      const r = await fetch('/api/offers', { headers: { 'X-Device-Secret': my.secret } })
+      // 长轮询：服务端 25s 到期返回空列表；超时给 35s 余量，避免连接无限挂起
+      const r = await fetchT('/api/offers', { headers: { 'X-Device-Secret': my.secret } }, 35_000)
       if (r.status === 401) { my.secret = null; await heartbeat(); continue }
       if (!r.ok) { await sleep(2000); continue }
       const j = await r.json()
-      let changed = false
-      for (const o of j.offers || []) {
-        if (!incomingOffers.has(o.id)) {
-          incomingOffers.set(o.id, o)
-          changed = true
-          notifyNewOffer('📮 密道 · 收到传输请求', `${(o.from && o.from.name) || '未知设备'}（${(o.from && o.from.ip) || '?'}）想发给你内容`)
-        }
-      }
-      if (changed && !$('#view-landing').hidden) renderIncoming()
+      reconcileOffers(j.offers || [])
     } catch { await sleep(2000) }
   }
 }
@@ -662,7 +718,7 @@ const notifyNewOffer = (() => {
     if (flashTimer) { clearInterval(flashTimer); flashTimer = null; document.title = origTitle }
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) stopFlash() })
-  return (title, body) => {
+  const notify = (title, body) => {
     try {
       if ('Notification' in window && Notification.permission === 'granted') {
         const n = new Notification(title, { body, tag: 'cipherlane-offer' })
@@ -677,6 +733,9 @@ const notifyNewOffer = (() => {
       }, 900)
     }
   }
+  // 邀请清空时由 reconcileOffers 调用，恢复原标题并停掉闪烁定时器
+  notify.stop = stopFlash
+  return notify
 })()
 // 首次点击时申请通知权限（局域网 http 无 Notification API 时静默跳过）
 document.addEventListener('click', function askOnce() {
@@ -830,9 +889,12 @@ async function startSend(kind, payload, target) {
 
   // 状态轮询：对方是否接受 / 接收进度 / 是否收完（终态一律走 finish，防止消息被后续轮询覆盖）
   sendState.stopPoll = (() => {
+    let busy = false // 防重入：上一次轮询未返回时跳过本次 tick（1.2s 间隔 < 10s 超时）
     const timer = setInterval(async () => {
+      if (busy) return
+      busy = true
       try {
-        const r = await fetch(`/api/rooms/${room}/state`)
+        const r = await fetchT(`/api/rooms/${room}/state`, {}, 10_000)
         if (r.status === 404) return finish(false, '❌ 传输已中断（房间过期或被回收）')
         const st = await r.json()
         if (st.acked) {
@@ -849,7 +911,7 @@ async function startSend(kind, payload, target) {
         setBar('bar-pulled', size ? got / size : 1)
         $('#pulled-meta').textContent =
           '对方已接收 ' + fmtBytes(got) + '（' + Math.round((size ? got / size : 1) * 100) + '%）'
-      } catch {}
+      } catch {} finally { busy = false }
     }, 1200)
     return () => clearInterval(timer)
   })()
@@ -860,7 +922,7 @@ async function startSend(kind, payload, target) {
       if (ctl.signal.aborted) return
       let st
       try {
-        const r = await fetch(`/api/rooms/${room}/state`)
+        const r = await fetchT(`/api/rooms/${room}/state`, {}, 10_000)
         if (r.status === 404) return finish(false, '❌ 对方超时未接受，邀请已过期')
         st = await r.json()
       } catch { await sleep(1000); continue }
@@ -876,7 +938,7 @@ async function startSend(kind, payload, target) {
     const meta = isBatch
       ? { v: 2, type: 'batch', files: manifest, count, size }
       : { v: 2, type: isText ? 'text' : 'file', name, mime, size, count }
-    await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta)), chunkAAD(room, 0)), ctl.signal)
+    await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta)), chunkAAD(room, 0)), 0, ctl.signal)
 
     // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
     const speed = makeSpeed()
@@ -888,7 +950,8 @@ async function startSend(kind, payload, target) {
         const n = manifest[f].count
         for (let i = 0; i < n; i++) {
           const pt = new Uint8Array(await file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size)).arrayBuffer())
-          await postChunk(room, token, await sealRPC(key, pt, chunkAAD(room, ci++)), ctl.signal)
+          const idx = ci++ // AAD 与 X-Chunk-Seq 用同一个全局序号（跨文件连续）
+          await postChunk(room, token, await sealRPC(key, pt, chunkAAD(room, idx)), idx, ctl.signal)
           sent += pt.length
           setBar('bar-sent', size ? sent / size : 1)
           const sp = speed(sent)
@@ -898,7 +961,7 @@ async function startSend(kind, payload, target) {
       }
       if (size === 0) setBar('bar-sent', 1)
     } else if (isText) {
-      await postChunk(room, token, await sealRPC(key, enc.encode(payload), chunkAAD(room, 1)), ctl.signal)
+      await postChunk(room, token, await sealRPC(key, enc.encode(payload), chunkAAD(room, 1)), 1, ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
     } else {
@@ -911,7 +974,7 @@ async function startSend(kind, payload, target) {
         nextEnc = nextOff < size
           ? sealRPC(key, new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()), chunkAAD(room, idx + 1))
           : null
-        await postChunk(room, token, await encThis, ctl.signal)
+        await postChunk(room, token, await encThis, idx, ctl.signal)
         off = Math.min(nextOff, size)
         setBar('bar-sent', off / size)
         const sp = speed(off)
@@ -929,9 +992,18 @@ async function startSend(kind, payload, target) {
 }
 
 // ---------- 接收（文本 / 文件 两套独立布局） ----------
+// 接收互斥：同一时刻只允许一路接收。hashchange/粘贴新链接开新一路时先 abort 旧一路，
+// 避免两条流水线同时改写同一套 DOM（#recv-text/#fc-name 等 id 全局唯一）。
+let activeReceiveCtl = null
+function abortActiveReceive() {
+  if (activeReceiveCtl) { activeReceiveCtl.abort(); activeReceiveCtl = null }
+}
 
 // 统一入口：链接模式（fragment 密钥）与设备直发（X25519 派生密钥）共用
 async function receiveInto(room, key, fromInfo, fromLink = false) {
+  abortActiveReceive()
+  const ctl = new AbortController()
+  activeReceiveCtl = ctl
   showView('recv')
   $('#recv-text-layout').hidden = true
   $('#recv-file-layout').hidden = true
@@ -944,37 +1016,48 @@ async function receiveInto(room, key, fromInfo, fromLink = false) {
     if (rfFp) { rfFp.textContent = '#' + fromInfo.fp; rfFp.title = '发送方公钥指纹' }
   }
 
-  const ctl = new AbortController()
-  const back = () => { ctl.abort(); showView('landing') }
+  const back = () => {
+    ctl.abort()
+    if (activeReceiveCtl === ctl) activeReceiveCtl = null
+    showView('landing')
+  }
   $('#recv-text-back').onclick = back
   $('#recv-file-back').onclick = back
 
-  let meta, useAAD
   try {
-    // 0 号分片 = 加密元信息。协议 v2 先按 AAD 解，失败回退 v1（旧发送端/旧夹具）
-    const packed = await getChunk(room, 0, ctl.signal)
-    let pt0
+    let meta, useAAD
     try {
-      pt0 = await unsealWith(key, packed, chunkAAD(room, 0))
-    } catch {
-      pt0 = await unsealWith(key, packed)
+      // 0 号分片 = 加密元信息。协议 v2 先按 AAD 解，失败回退 v1（旧发送端/旧夹具）
+      const packed = await getChunk(room, 0, ctl.signal)
+      let pt0
+      try {
+        pt0 = await unsealWith(key, packed, chunkAAD(room, 0))
+      } catch {
+        pt0 = await unsealWith(key, packed)
+      }
+      meta = JSON.parse(dec.decode(pt0))
+    } catch (e) {
+      if (ctl.signal.aborted) return
+      if (activeReceiveCtl === ctl) activeReceiveCtl = null // 元信息阶段失败:本路无后台传输，直接释放
+      $('#recv-title').textContent = '📥 接收'
+      $('#recv-file-layout').hidden = false
+      setStatus('recv-file-status', '❌ ' + e.message, 'err')
+      return
     }
-    meta = JSON.parse(dec.decode(pt0))
-  } catch (e) {
-    if (ctl.signal.aborted) return
-    $('#recv-title').textContent = '📥 接收'
-    $('#recv-file-layout').hidden = false
-    setStatus('recv-file-status', '❌ ' + e.message, 'err')
-    return
-  }
-  // 后续分片路径由 meta.v 决定：v2 必须带 AAD；v1（旧发送端）走无 AAD 旧路径
-  useAAD = meta.v === 2
+    // 后续分片路径由 meta.v 决定：v2 必须带 AAD；v1（旧发送端）走无 AAD 旧路径
+    useAAD = meta.v === 2
 
-  if (meta.type === 'text') return receiveText(room, key, meta, ctl, useAAD)
-  if (meta.type === 'batch') return receiveBatch(room, key, meta, ctl, useAAD)
-  // 断点续传仅链接模式(设备直发的会话密钥不落盘);fromLink 由入口传入
-  const rec = fromLink ? await resumeDB.get(room) : null
-  return receiveFile(room, key, meta, ctl, rec, useAAD)
+    if (meta.type === 'text') return await receiveText(room, key, meta, ctl, useAAD)
+    if (meta.type === 'batch') return await receiveBatch(room, key, meta, ctl, useAAD)
+    // 断点续传仅链接模式(设备直发的会话密钥不落盘);fromLink 由入口传入
+    const rec = fromLink ? await resumeDB.get(room) : null
+    return await receiveFile(room, key, meta, ctl, rec, useAAD)
+  } finally {
+    // 注意：批量/文件接收是“后台自动开始”（receiveBatch/receiveFile 不等待传输结束就返回），
+    // 这里不能无条件清空标记，否则下一路进来时 abort 不到仍在跑的旧流水线。只在被 abort
+    // （返回首页/被新一路接管）时清理；正常结束后保留最后一路 ctl，下一路会先 abort 它（幂等）。
+    if (ctl.signal.aborted && activeReceiveCtl === ctl) activeReceiveCtl = null
+  }
 }
 
 // 文本：解密即呈现，无进度条无保存动作
@@ -1003,7 +1086,7 @@ async function receiveText(room, key, meta, ctl, useAAD) {
       setTimeout(() => (copyBtn.textContent = '复制文本'), 1500)
     }
     setStatus('recv-text-status', '✅ 已解密接收', 'ok')
-    await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+    await fetchT(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }, 10_000).catch(() => {})
   } catch (e) {
     if (!ctl.signal.aborted) setStatus('recv-text-status', '❌ ' + e.message, 'err')
   }
@@ -1115,7 +1198,7 @@ async function doReceiveBatch(room, key, meta, signal, useAAD) {
   setStatus('recv-file-status',
     `✅ 已接收 ${meta.files.length} 个文件（${fmtBytes(meta.size || 0)}）` + (dir ? '，已写入所选目录' : '，已触发浏览器下载'),
     'ok')
-  await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+  await fetchT(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }, 10_000).catch(() => {})
 }
 
 async function receiveFile(room, key, meta, ctl, rec, useAAD) {
@@ -1146,7 +1229,7 @@ async function receiveFile(room, key, meta, ctl, rec, useAAD) {
   if (!meta.size && meta.count === 1) {
     saveEmpty(meta.name)
     setStatus('recv-file-status', '✅ 空文件已保存', 'ok')
-    await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+    await fetchT(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }, 10_000).catch(() => {})
     return
   }
 
@@ -1299,7 +1382,7 @@ async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
   await resumeDB.del(room)
   setBar('bar-recv', 1)
   setStatus('recv-file-status', `✅ 已保存 ${meta.name || 'received'}（${fmtBytes(meta.size)}）`, 'ok')
-  await fetch(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }).catch(() => {})
+  await fetchT(`/api/rooms/${room}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ proof: ackProofOf(key, room) }) }, 10_000).catch(() => {})
 }
 
 function saveEmpty(name) {
@@ -1314,7 +1397,7 @@ function saveEmpty(name) {
 async function startReceive() {
   const frag = location.hash.slice(1)
   const m = /^([0-9A-Za-z]{10})\.([A-Za-z0-9_-]{43})$/.exec(frag)
-  if (!m) { showView('landing'); return }
+  if (!m) { abortActiveReceive(); showView('landing'); return }
   receiveInto(m[1], fromB64(m[2]), null, true)
 }
 
@@ -1410,7 +1493,7 @@ document.addEventListener('paste', (e) => {
 
 // 链接/QR 的公共来源：回环打开时升级为 LAN 地址（对方可达），由服务器 /api/version 提示
 let LAN_HINT = null
-;(async () => { try { LAN_HINT = (await (await fetch('/api/version')).json()).lan || null } catch {} })()
+;(async () => { try { LAN_HINT = (await (await fetchT('/api/version', {}, 5_000)).json()).lan || null } catch {} })()
 function publicOrigin() {
   const h = location.hostname
   const loop = h === '127.0.0.1' || h === 'localhost' || h === '::1'
@@ -1423,9 +1506,11 @@ if (location.hash.length > 1) {
 } else {
   showView('landing')
 }
-// 同标签页粘贴新接收链接时（仅 hash 变化不重载文档）重新进入接收
+// 同标签页粘贴新接收链接时（仅 hash 变化不重载文档）重新进入接收；hash 被清空 =
+// 用户退出了这次接收 → 同时中止仍在跑的那一路，避免后台流水线继续写隐藏视图
 window.addEventListener('hashchange', () => {
   if (location.hash.length > 1) startReceive()
+  else if (activeReceiveCtl) { abortActiveReceive(); showView('landing') }
 })
 // 心跳 + 设备列表刷新 + 邀请监听（所有模式下常驻）
 heartbeat().then(refreshDevices)

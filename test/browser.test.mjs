@@ -7,6 +7,7 @@
 //   4) 服务器中途下线：建立失败可退，返回按钮可用
 //   5) 文件传输全链路：真实 Worker 加密 + 接收方文件卡与完成状态
 //   6) FSA 流式保存 + 续传断点一致性：isActive 属性误调用回归 / fs 模式 done 落盘
+//   7) 可靠性回归：设备列表差量渲染 / 邀请对账 / X-Chunk-Seq 幂等序号
 //
 // 无浏览器环境（未装 Chrome/Chromium 且未设 CHROME_BIN）打印“跳过”并以 0 退出，
 // 不阻断 npm test；CI 的 ubuntu 镜像自带 /usr/bin/google-chrome 可真实执行。
@@ -572,21 +573,24 @@ async function main() {
         }
         const chunks = []
         for (let off = 0; off < size; off += CHUNK) chunks.push(plain.subarray(off, Math.min(off + CHUNK, size)))
-        const post = async (bytes) => {
+        // seq = 分片全局序号（X-Chunk-Seq 幂等序号；meta=0，数据从 1 连续）
+        const post = async (seq, bytes) => {
           for (;;) {
             const r = await fetch('/api/rooms/' + room + '/chunk', {
-              method: 'POST', headers: { 'X-Room-Token': token }, body: bytes,
+              method: 'POST',
+              headers: { 'X-Room-Token': token, 'X-Chunk-Seq': String(seq) },
+              body: bytes,
             })
             if (r.status === 429) { await new Promise((res) => setTimeout(res, 100)); continue }
             if (!r.ok) throw new Error('post chunk ' + r.status)
             return
           }
         }
-        await post(await seal(enc.encode(JSON.stringify(meta))))
-        for (let i = 0; i < 9; i++) await post(await seal(chunks[i])) // 只投前 9 片:接收方会在第 8 片写出持久化检查点后停住
+        await post(0, await seal(enc.encode(JSON.stringify(meta))))
+        for (let i = 0; i < 9; i++) await post(i + 1, await seal(chunks[i])) // 只投前 9 片:接收方会在第 8 片写出持久化检查点后停住
         const dig = [...new Uint8Array(await crypto.subtle.digest('SHA-256', plain))]
           .map((b) => b.toString(16).padStart(2, '0')).join('')
-        window.__fsa = { room, token, rest: chunks.slice(9), post, seal }
+        window.__fsa = { room, token, rest: chunks.slice(9), nextSeq: 10, post, seal }
         return { link: publicOrigin() + '/#' + room + '.' + toB64(key), room, size, dig }
       })()`)
       const frag = setup.link.slice(setup.link.indexOf('#'))
@@ -653,7 +657,7 @@ async function main() {
       if (!recAfter || recAfter.mode !== 'fs' || recAfter.done < 8) throw new Error('刷新后 FSA 断点记录丢失: ' + JSON.stringify(recAfter))
       // 发送方补齐剩余分片并置 done,再点"继续接收并保存"
       await evalJs(c, sidA, `(async () => {
-        for (const chunk of window.__fsa.rest) await window.__fsa.post(await window.__fsa.seal(chunk))
+        for (const chunk of window.__fsa.rest) await window.__fsa.post(window.__fsa.nextSeq++, await window.__fsa.seal(chunk))
         await fetch('/api/rooms/' + window.__fsa.room + '/done', { method: 'POST', headers: { 'X-Room-Token': window.__fsa.token } })
       })()`)
       await evalJsGesture(c, sidD, `document.querySelector('#start-recv').click()`)
@@ -673,6 +677,113 @@ async function main() {
       if (recGone) throw new Error('完成后 IDB 断点记录未清理')
       ok('FSA 刷新续传:保留 ' + recD.done + ' 片断点 → 续传后 SHA-256 与原文一致、断点记录已清理')
       await c.send('Target.closeTarget', { targetId: pgD2.tid }).catch(() => {})
+    }
+
+    // ---------- 12) 前端可靠性回归:差量渲染 / 邀请对账 / X-Chunk-Seq 幂等序号 ----------
+    {
+      await navigate(c, sidA, S + '/')
+      // 12a) 差量渲染:同一设备列表连续 renderDevices 两次，DOM 节点引用必须不变
+      const diff = await evalJs(c, sidA, `(() => {
+        window.__origRefresh = refreshDevices
+        window.__origDeviceCache = deviceCache
+        refreshDevices = () => {} // 隔离 5s 心跳的真实设备刷新
+        deviceCache = [
+          { ip: '10.88.0.1', id: 'diff1', name: '差量设备甲', pub: toB64(X25519.genKey().pk) },
+          { ip: '10.88.0.2', id: 'diff2', name: '差量设备乙', pub: toB64(X25519.genKey().pk) },
+        ]
+        selectedIp = null
+        deviceFilter = ''
+        renderDevices()
+        const before = [...document.querySelectorAll('#devices .device')]
+        const countText = document.querySelector('#devices-count').textContent
+        renderDevices()
+        const after = [...document.querySelectorAll('#devices .device')]
+        const sameNodes = before.length === 2 && after.length === 2 && before.every((el, i) => el === after[i])
+        selectedIp = '10.88.0.2'
+        renderDevices()
+        const sel = document.querySelector('#devices .device.selected')
+        const selectedOk = !!sel && sel.querySelector('.d-name').textContent === '差量设备乙'
+        deviceCache = window.__origDeviceCache || []
+        selectedIp = null
+        deviceFilter = ''
+        renderDevices()
+        refreshDevices = window.__origRefresh
+        delete window.__origRefresh
+        delete window.__origDeviceCache
+        return { sameNodes, countText, selectedOk }
+      })()`)
+      if (!diff.sameNodes) throw new Error('连续两次 renderDevices 的 DOM 节点引用应保持不变(差量渲染未生效)')
+      if (!diff.selectedOk) throw new Error('selectedIp 变化后差量渲染未重建成选中卡片')
+      if (!diff.countText.includes('2 台在线')) throw new Error('设备计数未更新: ' + diff.countText)
+      ok('设备列表差量渲染:签名相同不重建(节点引用不变),选中/计数变化正确重建')
+
+      // 12b) 邀请对账:以服务端列表为准删除已消失条目；清空后停止标题闪烁
+      const rec = await evalJs(c, sidA, `(async () => {
+        const baseTitle = document.title
+        const mk = (id, name, ip) => ({ id, room: 'Ab3xYz9kLm', pub: toB64(X25519.genKey().pk), hint: '', from: { ip, name } })
+        const keep = mk('recKeep01', '对账保留', '10.88.1.1')
+        const gone = mk('recGone02', '对账删除', '10.88.1.2')
+        incomingOffers.clear()
+        incomingOffers.set(keep.id, keep)
+        incomingOffers.set(gone.id, gone)
+        notifyNewOffer('📮 对账测试', 'x') // 先启动标题闪烁(真实场景:新邀请到达)
+        const changedKeep = reconcileOffers([keep])   // 服务端只剩 keep → 删除 gone
+        const keptOk = incomingOffers.size === 1 && incomingOffers.has(keep.id)
+        const changedNoop = reconcileOffers([keep])   // 原有条目不变 → 无变化
+        const changedEmpty = reconcileOffers([])      // 服务端已无邀请 → 全清
+        const emptyOk = incomingOffers.size === 0
+        await new Promise((r) => setTimeout(r, 1100)) // 闪烁若未停,标题会在此窗口内变化
+        const stopped = document.title === baseTitle
+        renderIncoming()
+        return { changedKeep, keptOk, changedNoop, changedEmpty, emptyOk, stopped, title: document.title, baseTitle }
+      })()`)
+      if (!rec.changedKeep || !rec.keptOk) throw new Error('reconcileOffers 保留语义错误: ' + JSON.stringify(rec))
+      if (rec.changedNoop) throw new Error('reconcileOffers 无变化时应返回 false')
+      if (!rec.changedEmpty || !rec.emptyOk) throw new Error('reconcileOffers([]) 应清空全部并返回 true')
+      if (!rec.stopped) throw new Error('邀请清空后标题闪烁未停止: ' + JSON.stringify(rec))
+      ok('邀请对账:保留未过期、删除已消失(返回 changed),清空后标题恢复')
+
+      // 12c) X-Chunk-Seq:meta=0、文本=1，是超时/429 幂等重投的前提
+      const seqText = 'X-Chunk-Seq 回归 ' + Date.now()
+      await navigate(c, sidA, S + '/')
+      await waitFor(c, sidA, `/^#[0-9a-f]{8,64}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '首页就绪')
+      await evalJs(c, sidA, `(() => {
+        window.__chunkSeqs = []
+        window.__origFetchReal = window.fetch
+        window.fetch = function (input, init) {
+          try {
+            const url = String(input)
+            if (init && init.method === 'POST' && url.includes('/api/rooms/') && url.includes('/chunk')) {
+              const h = init.headers || {}
+              window.__chunkSeqs.push(h['X-Chunk-Seq'] === undefined ? null : String(h['X-Chunk-Seq']))
+            }
+          } catch {}
+          return window.__origFetchReal.call(window, input, init)
+        }
+        return 'hooked'
+      })()`)
+      await evalJs(c, sidA, `document.querySelector('#text').value = ${JSON.stringify(seqText)}`)
+      await evalJs(c, sidA, `document.querySelector('#send-text').click()`)
+      await waitFor(c, sidA, `document.querySelector('#link').textContent.startsWith('http')`, 15000, '序号测试链接')
+      const seqLink = await evalJs(c, sidA, textOf('#link'))
+      const pgE = await newPage(c)
+      const sidE = pgE.sid
+      await navigate(c, sidE, seqLink)
+      await waitFor(c, sidE, `!document.querySelector('#recv-text').hidden`, 20000, '序号测试接收完成')
+      const seqs = await evalJs(c, sidA, `(() => {
+        const s = window.__chunkSeqs.slice()
+        window.fetch = window.__origFetchReal
+        delete window.__origFetchReal
+        return s
+      })()`)
+      const uniqSeqs = [...new Set(seqs)]
+      if (uniqSeqs.length !== 2 || uniqSeqs[0] !== '0' || uniqSeqs[1] !== '1') {
+        throw new Error('X-Chunk-Seq 应为 [0,1],实际 ' + JSON.stringify(seqs))
+      }
+      const seqGot = await evalJs(c, sidE, textOf('#recv-text'))
+      if (seqGot !== seqText) throw new Error('序号测试文本不一致')
+      await c.send('Target.closeTarget', { targetId: pgE.tid }).catch(() => {})
+      ok('X-Chunk-Seq:meta=0 / 文本=1 两片请求头序号正确且收端逐字一致')
     }
 
     // ---------- 5) 服务器中途下线:建立失败可退 ----------
