@@ -42,6 +42,19 @@ fn http_get_json(path: &str) -> Option<String> {
 fn open(url: &str) {
     Command::new("xdg-open").arg(url).spawn().ok();
 }
+fn http_post_json(path: &str, body: &str) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port())).ok()?;
+    let _ = write!(
+        s,
+        "POST {} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        body.len(),
+        body
+    );
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    Some(raw)
+}
 
 fn rand_token() -> String {
     let b: [u8; 18] = rand::thread_rng().gen();
@@ -109,18 +122,8 @@ impl CipherlaneTray {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // 也调 API（覆盖"进程在但 child 句柄丢失"的场景）
-        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port())) {
-            let body = format!("{{\"token\":\"{}\"}}", token);
-            let _ = write!(
-                s,
-                "POST /api/shutdown HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-        }
+        // 停机 API 兜底（覆盖"进程在但 child 句柄丢失/接管来的服务"场景）
+        let _ = http_post_json("/api/shutdown", &format!("{{\"token\":\"{}\"}}", token));
         self.token = None;
         self.running = false;
     }
@@ -231,17 +234,12 @@ impl Tray for CipherlaneTray {
             enabled: false,
             ..Default::default()
         }));
-        // 退出 = 关闭服务并退出托盘；服务为外部启动(无令牌)时如实标注
-        let (label, ext) = if self.token.is_some() {
-            ("退出（关闭服务并退出托盘）".to_string(), false)
-        } else {
-            ("退出托盘（服务为外部启动，不受影响）".to_string(), true)
-        };
+        // 退出 = 尽力关闭服务（持令牌或接管所得）并退出托盘
         items.push(MenuItem::Standard(StandardItem {
-            label,
-            activate: Box::new(move |t: &mut Self| {
-                if !ext {
-                    t.stop_server(); // 先停服务（kill 子进程 + API 兜底）再退出
+            label: if self.running { "退出（关闭服务并退出托盘）".into() } else { "退出托盘".into() },
+            activate: Box::new(|t: &mut Self| {
+                if t.running && t.token.is_some() {
+                    t.stop_server();
                 }
                 std::process::exit(0)
             }),
@@ -253,10 +251,28 @@ impl Tray for CipherlaneTray {
 
 fn main() {
     let running = server_up();
+    let mut token: Option<String> = None;
+    let mut note = String::new();
+    if running {
+        // 接管在跑的无令牌服务:换得停机令牌,从此"退出=关服务"
+        let t0 = rand_token();
+        match http_post_json("/api/adopt", &format!("{{\"token\":\"{}\"}}", t0)) {
+            Some(raw) if raw.contains("200") => {
+                token = Some(t0);
+                println!("已接管运行中的服务（令牌交接）");
+            }
+            Some(raw) if raw.contains("409") => {
+                note = "服务由其他管理者持有（如 systemd/另一托盘）".into();
+            }
+            _ => {
+                note = "接管失败：旧版本服务器？退出将仅退托盘".into();
+            }
+        }
+    }
     let tray = CipherlaneTray {
         running,
-        token: None,
-        note: if running { "外部启动的服务：停止请用控制面板或 systemctl".into() } else { String::new() },
+        token,
+        note,
         server: Arc::new(Mutex::new(None)),
     };
     // ubuntu:GNOME 下 org.kde.StatusNotifierWatcher 常未注册（AppIndicator 扩展例外注册 item），

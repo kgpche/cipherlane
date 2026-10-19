@@ -402,6 +402,18 @@ async function handleRequest(req, res) {
       return sendJson(res, 200, { ip, id: fresh.id, secret: fresh.secret })
     }
 
+    // POST /api/adopt —— 本机托盘接管（交接停机令牌），与 Rust 版语义一致
+    if (p === '/api/adopt' && req.method === 'POST') {
+      const ip = clientIp(req)
+      if (ip !== '127.0.0.1' && ip !== '::1') return sendJson(res, 403, { error: 'forbidden' })
+      const body = await readBody(req, 1024).then((b) => JSON.parse(b.toString('utf8') || '{}')).catch(() => ({}))
+      if (typeof body.token !== 'string' || body.token.length < 16) return sendJson(res, 400, { error: 'bad-token' })
+      if (process.env.CIPHERLANE_SHUTDOWN_TOKEN) return sendJson(res, 409, { error: 'already-managed' })
+      process.env.CIPHERLANE_SHUTDOWN_TOKEN = body.token
+      console.log('[panel] 已被本机托盘接管（令牌交接）')
+      return sendJson(res, 200, { ok: true })
+    }
+
     // GET /api/version —— 面板用：版本与运行状态
     if (p === '/api/version' && req.method === 'GET') {
       return sendJson(res, 200, { version: VERSION, rooms: rooms.size, startedAt: STARTED_AT, lan: lanAddresses()[0] || null })

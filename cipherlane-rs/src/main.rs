@@ -560,6 +560,31 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         return json_resp(req, 200, serde_json::json!({ "ip": ip, "id": id, "secret": secret }).to_string());
     }
 
+    // ---- POST /api/adopt：本机托盘接管（交接停机令牌）----
+    // 场景：服务先于托盘启动（无令牌运行）。托盘经回环调用本端点换得令牌，
+    // 从此"退出=关服务"。仅接受 127.0.0.1/::1 来源；已有令牌的服务拒绝接管（防第二个托盘抢权）。
+    if path == "/api/adopt" && method == "POST" {
+        let local = ip == "127.0.0.1" || ip == "::1";
+        if !local {
+            return jerr(req, 403, "forbidden");
+        }
+        let body = read_body(&mut req, 1024).unwrap_or_default();
+        let new_token = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|j| j.get("token").and_then(|v| v.as_str().map(String::from)))
+            .unwrap_or_default();
+        if new_token.len() < 16 {
+            return jerr(req, 400, "bad-token");
+        }
+        let current = std::env::var("CIPHERLANE_SHUTDOWN_TOKEN").unwrap_or_default();
+        if !current.is_empty() {
+            return jerr(req, 409, "already-managed");
+        }
+        std::env::set_var("CIPHERLANE_SHUTDOWN_TOKEN", new_token.clone());
+        println!("[panel] 已被本机托盘接管（令牌交接）");
+        return json_resp(req, 200, serde_json::json!({ "ok": true }).to_string());
+    }
+
     // ---- GET /api/version ----
     if path == "/api/version" && method == "GET" {
         let rooms = w.rooms.lock().unwrap().len();

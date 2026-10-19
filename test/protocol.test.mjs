@@ -420,6 +420,25 @@ async function main() {
       ok('面板端点：version / shutdown 令牌双闸 403 / update 无源如实 / panel 页可达')
     }
 
+
+    // ---------- adopt 托盘接管 ----------
+    {
+      // 无令牌服务：回环 adopt 成功；错令牌 400
+      let r = await jfetch('/api/adopt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'short' }) })
+      assert.strictEqual(r.status, 400, '短令牌应 400')
+      const tok = 'a'.repeat(24)
+      // 注：本测试服务器无 CIPHERLANE_SHUTDOWN_TOKEN → 可接管；接管后即持令牌（顺带验证 shutdown 链路升级）
+      r = await jfetch('/api/adopt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: tok }) })
+      assert.strictEqual(r.status, 200, '回环 adopt 应 200: ' + JSON.stringify(r.json))
+      // 再次 adopt（已有令牌）→ 409
+      r = await jfetch('/api/adopt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'b'.repeat(24) }) })
+      assert.strictEqual(r.status, 409, '已有管理者应 409')
+      // 接管后令牌可用于 shutdown 校验链（空令牌仍 403；不真关停避免杀测试服务器）
+      r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+      assert.strictEqual(r.status, 403)
+      ok('adopt：回环接管 200 / 短令牌 400 / 二次接管 409 / shutdown 空令牌仍 403')
+    }
+
 console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
     child.kill('SIGINT')
