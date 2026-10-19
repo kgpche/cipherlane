@@ -81,7 +81,7 @@ cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/ciphe
 cat > "$DEBROOT/usr/share/applications/cipherlane.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
-Name=cipherlane 密道
+Name=cipherlane
 Comment=局域网端到端加密传输
 Comment[en]=LAN end-to-end encrypted transfer
 GenericName=文件传输
