@@ -139,7 +139,7 @@ cipherlane-cli recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接�
 - 房间号在 HTTP 请求中明文过线：可完整嗅探的网络上攻击者可拉取分片（拿到密文、无法解密）——可续传模式下分片只读，抢拉不再饿死接收方；但伪造进度上报可释放缓存造成断流（可用性攻击，与既往同级的已知边界）。保密性不受影响
 - 同一 IP 多个**不同浏览器**同时在线时，设备条目以后注册者为准（同浏览器多标签已通过共享 secret 解决）
 
-**技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 Node 原生实现逐字节一致（有测试保证；Node 仅作为测试运行器）。
+**技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与原生 Rust 实现逐字节一致（由 Rust 测试保证）。
 
 ## 打包与部署（多平台分发）
 
@@ -199,11 +199,12 @@ IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标�
 
 ```
 cipherlane/
-├── cipherlane-rs/          # 全部产品：Rust 服务器 + CLI + Linux 托盘（单一实现）
+├── cipherlane-rs/          # 全部产品 + Rust 测试套件
 │   ├── Cargo.toml          # 版本号 + 三个 bin（cipherlane / cipherlane-cli / cipherlane-tray）
-│   └── src/
-│       ├── main.rs         # 中继服务器（房间/在线/邀请）+ 编译期内嵌网页前端
-│       └── bin/            # cli.rs（cipherlane-cli）· tray.rs（cipherlane-tray，仅 Linux）
+│   ├── src/
+│   │   ├── main.rs         # 中继服务器（房间/在线/邀请）+ 编译期内嵌网页前端
+│   │   └── bin/            # cli.rs（cipherlane-cli）· tray.rs（cipherlane-tray，仅 Linux）
+│   └── tests/              # Rust 套件：crypto / protocol / cli / browser / consistency
 ├── public/                 # 浏览器前端（原生 JS；纯 JS 加密用于明文 HTTP 降级路径）
 │   ├── index.html          # 单页应用（设备网格 · 几何头像 · 邀请卡片 · 双接收布局）
 │   ├── app.js              # 收发逻辑 + 双加密路径 + X25519 身份
@@ -212,40 +213,36 @@ cipherlane/
 │   ├── x25519.js           # 纯 JS X25519（设备直发密钥协商）
 │   ├── avatar.js           # 设备几何头像（Material 扁平风，由 IP 确定性生成）
 │   └── style.css
-├── scripts/                # 一致性检查（版本号 / include_bytes ↔ public / 无 Node 残留）
 ├── build/package.sh        # 一键打包：.deb / Windows zip / macOS 通用包
 ├── logo/                   # Logo：盾上密径（主图 + favicon 小尺寸母版）
-├── docs/screenshots/       # README 截图
-└── test/                   # 八套测试（Node 仅作测试运行器）
+└── docs/screenshots/       # README 截图
 ```
 
 ## 测试
 
-测试驱动真实 Rust 二进制（服务器 + CLI）与真实无头 Chrome（浏览器套件）。**Node ≥ 18 仅作为测试运行器**，构建/运行产品都不需要它。
+包括浏览器套件在内，全部测试都由 `cargo test` 运行；**仓库没有任何 Node 依赖**。浏览器前端是原生 JS（浏览器自己的语言），由 Rust 测试通过 CDP 驱动真实无头 Chrome 验证。
 
 ```bash
-cargo build --release --manifest-path cipherlane-rs/Cargo.toml   # 或: npm run build
-npm test                   # 自动先构建（pretest）；或逐个: node test/<name>.test.mjs
-cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust 单元测试（或: npm run test:cargo）
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml                    # release 构建
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml                    # 全部套件
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test protocol    # 单个套件：crypto / protocol / cli / browser / consistency
 ```
 
-- **aesgcm**：S-box 标准向量、GHASH 交叉验证、0B~1MiB 与 node 原生逐字节比对（含 AAD 与篡改拒绝）
-- **sha256**：FIPS 180-4 向量 + 500 组随机交叉
-- **x25519**：RFC 7748 向量 + 200 组随机 vs node ECDH 双向、小阶点拒绝
-- **qrcode**：RS 代数自检、定位图形/时序/格式信息结构断言
-- **avatar**：确定性、相邻 IP 差异、色板与明度约束
+- **crypto**：迁移 FIPS 197 / FIPS 180-4 / RFC 7748 标准向量与随机交叉（AES-256-GCM 含 AAD、SHA-256、X25519、二维码、头像）；期望值由 RustCrypto 计算
 - **protocol**：驱动真实 Rust 服务器二进制，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/ETag/Host 校验/链接模式全链路（CI 另对 musl 发布二进制直跑）
 - **cli**：真实子进程端到端——`cipherlane-cli` ↔ Rust 服务器：单文件/目录递归批量（嵌套·中文·空文件·隐藏项跳过）/多路径混合/文本/SIGKILL 续传，字节级比对
-- **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
+- **browser**：Rust CDP 客户端驱动真实无头 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无 Chrome 时自动跳过
+- **consistency**：README 徽章 ↔ `Cargo.toml` 版本、`include_bytes!` ↔ `public/`、必需 bin 与测试目标，以及对产品代码/构建脚本/CI/README 命令块的零 Node 守卫
 
 ## 更新日志
 
 **v1.0.0**（2026-10-20，单一实现）
-- **产品彻底去 Node**：服务器、CLI、托盘合并为同一套 Rust 实现；Node 版中继/CLI 与 Node 单文件可执行打包链全部移除，Node 仅作为 JS 前端测试的运行器保留
+- **产品与测试彻底去 Node**：服务器、CLI、托盘与全部测试合并为同一套 Rust 实现；Node 版中继/CLI、Node 单文件可执行打包链与 Node 测试运行器全部移除；浏览器前端保持原生 JS，由 Rust 测试通过 CDP 驱动 Chrome 验证
+- **测试也 Rust 化**：crypto / protocol / cli / browser / consistency 五套全部由 `cargo test` 运行，浏览器套件是 Rust CDP 客户端驱动真实 Chrome；仓库不再有 Node
 - **原生 Rust CLI** 完整替代 Node CLI：子命令与选项不变（`devices` / `send` / `send-text` / `recv` / `listen`；`--to`、`--verify`、`--name`、`--server`、`-o`、`--yes`），支持协议 v2 AAD 与 v1 回退、链接模式断点续传、批量/目录递归、128bit TOFU 指纹与控制字符净化
 - **三平台 Rust 原生产物**：Linux deb（musl 静态 server/tray/cli，≈1.3MB）、Windows x64 zip（`cipherlane.exe` + `cipherlane-cli.exe`，静态 CRT）、macOS 通用 tar.gz（`lipo` 合并 arm64+x64）——不再有 Node、二进制注入等步骤
 - **发布自动化**：推送 `v*` 标签即由 GitHub 官方 runner 三平台原生构建，并用官方 `gh` CLI 发布产物与统一 SHA256SUMS；手动触发只构建 artifact 不发布
-- **CI**：Rust 三 bin 构建 + `cargo test` + musl 协议平价 + deb 打包冒烟，外加 Node 18/20/22 上的完整 JS 套件；一致性检查改为校验版本、`include_bytes!` 资源与“产品链路不再出现 Node 实现”
+- **CI**：Rust 三 bin 构建 + `cargo test`（crypto / protocol / CLI / browser / consistency）+ musl 协议平价 + deb 打包冒烟；一致性守卫本身也是 Rust 测试，校验版本、`include_bytes!` 资源与零 Node 残留
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）
@@ -317,7 +314,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust 单元�
 - 纯 JS AES-256-GCM 性能：AES 核心 T-table 化（S 盒 + MixColumns 合一查表，
   单 worker 9.3 → 22 MB/s，×4 池约 80–90 MB/s，接近千兆线速）；
   GHASH 4-bit → 8-bit 窗口表；同密钥流式分片复用密钥缓存（rk32/H/表一次构建）
-- 字节级不变：与 node:crypto 逐字节一致的既有验证全数通过；新增 8-bit 表
+- 字节级不变：与 native crypto 逐字节一致的既有验证全数通过；新增 8-bit 表
   ×参考实现 100 组交叉验证；浏览器降级路径场景继续真跑互通
 - 取舍说明：T-table 存在 cache 计时侧信道（需同机攻击者持续探测）；本项目
   威胁模型为网络攻击者，明文 http 降级路径上可接受
@@ -363,7 +360,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust 单元�
 
 **v0.2.0**（2026-10-12）
 - 设备直发：一个 IP = 一台终端（名称 / 几何头像 / X25519 身份），选设备即发、邀请卡片、接受/拒绝
-- 纯 JS X25519 + SHA-256（RFC 7748 / FIPS 180-4，与 node 原生互通有测试）
+- 纯 JS X25519 + SHA-256（RFC 7748 / FIPS 180-4，与原生实现互通有测试）
 - 接收端文本 / 文件两套独立布局；页面任意位置 Ctrl+V 粘贴即发
 - 发送视图终态修复（完成后"返回首页"、进度 100%、拒绝消息不被覆盖）
 - CLI：`devices` / `--to` 定向发送 / `listen` 常驻接收
@@ -374,7 +371,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust 单元�
 
 ## 路线图
 
-- [x] 单一实现：Rust 服务器 + 原生 CLI + Linux 托盘，三平台 Rust 产物，Node 仅作测试运行器 —— v1.0.0
+- [x] 单一实现：Rust 服务器 + 原生 CLI + Linux 托盘，三平台 Rust 产物，Node 彻底移除（产品 + 测试）—— v1.0.0
 - [x] 纯 JS AES 路径性能优化（AES T-table + 8-bit 窗口 GHASH + 同密钥缓存，单 worker 9.3→22 MB/s）—— v0.3.1
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [x] 多文件 / 目录传输（manifest 单房间顺序流，文件夹选择/目录递归，浏览器 ↔ CLI 互通）—— v0.3.0

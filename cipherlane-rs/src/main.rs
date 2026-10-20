@@ -1,6 +1,6 @@
 // cipherlane · 密道 —— Rust 重构版服务器
 //
-// 线协议与 Node 版(server.js)逐字节兼容；验收 = test/protocol.test.mjs 对本实现全绿。
+// 线协议为唯一实现；验收 = cargo test --test protocol（Rust 集成测试）对本实现全绿。
 // 架构：tiny_http 同步模型 + 每地址 256 工作线程；长轮询以 Condvar 挂起
 // （LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）。
 // 零知识：服务器只存转 AES-256-GCM 密文分片，永不做任何加解密。
@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
 
-// ---------- 限制（与 server.js 一致） ----------
+// ---------- 限制（与 v0.x Node 版一致） ----------
 const ROOMS_MAX: usize = 128;
 const BODY_MAX: usize = 1536 * 1024;
 const ROOM_CHUNKS_BUF: u64 = 64;
@@ -386,7 +386,7 @@ fn parse_strict_digits(raw: &str) -> Option<u64> {
     }
     Some(v)
 }
-// Host 头归一化：去端口 / 去 IPv6 方括号 / 小写 / 去尾点（对齐 server.js hostnameOf）
+// Host 头归一化：去端口 / 去 IPv6 方括号 / 小写 / 去尾点（对齐 v0.x Node 版 hostnameOf）
 fn hostname_of(host_header: &str) -> String {
     let h = host_header.trim().to_ascii_lowercase();
     if h.is_empty() {

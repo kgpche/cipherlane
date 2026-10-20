@@ -1,5 +1,5 @@
 #!/bin/sh
-# cipherlane v1.0 打包脚本 —— 三平台产物全部为 Rust 二进制，构建/打包不依赖 Node。
+# cipherlane v1.0 打包脚本 —— 三平台产物全部为 Rust 二进制，构建/打包无运行时依赖。
 #
 #   sh build/package.sh [版本号]       # 版本号默认取自 cipherlane-rs/Cargo.toml（唯一来源）
 #
@@ -284,7 +284,7 @@ cipherlane · 密道（Windows 版）
 使用：浏览器打开启动后打印的局域网地址；其他设备需在同一 WiFi/网段
 CLI：cipherlane-cli.exe devices --server http://127.0.0.1:7777
      cipherlane-cli.exe send big.zip --server http://127.0.0.1:7777
-说明：单文件静态 CRT，无需安装 Node 或 VC++ 运行库；Windows 10/11 x64。
+说明：单文件静态 CRT，无需安装任何运行库；Windows 10/11 x64。
 README
   ( cd "$STAGE" && make_zip "../dist/cipherlane_${VER}_windows_x64.zip" cipherlane.exe cipherlane-cli.exe README.txt )
   ARTIFACTS="cipherlane_${VER}_windows_x64.zip"

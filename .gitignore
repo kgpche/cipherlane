@@ -7,7 +7,6 @@ cipherlane-rs/target/
 
 # 会话/工具
 .zcode/
-node_modules/
 
 # 日志与临时
 *.log

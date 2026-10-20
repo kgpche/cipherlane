@@ -140,7 +140,7 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, 64 rooms / 96 MB
 - Room ids travel in plaintext HTTP requests: on fully sniffable networks an attacker can pull chunks (ciphertext they cannot decrypt) — in resumable rooms chunks are read-only, so stealing no longer starves the receiver; forging progress reports can still cut a transfer (availability-level, same class as before). Confidentiality is unaffected
 - Multiple **different browsers** on one IP: the device entry belongs to the last one to register (same-browser tabs share the secret and coexist)
 
-**How encryption works over plain http**: browsers only expose `crypto.subtle` in secure contexts. This project ships pure-JS implementations and degrades automatically: AES-256-GCM (`public/aesgcm.js`), SHA-256 (`public/sha256.js`), X25519 (`public/x25519.js`, BigInt + RFC 7748 Montgomery ladder). On localhost/https, AES uses native WebCrypto. The pure-JS output is byte-identical to the Node native implementation (verified by the test suite; Node is only the test runner).
+**How encryption works over plain http**: browsers only expose `crypto.subtle` in secure contexts. This project ships pure-JS implementations and degrades automatically: AES-256-GCM (`public/aesgcm.js`), SHA-256 (`public/sha256.js`), X25519 (`public/x25519.js`, BigInt + RFC 7748 Montgomery ladder). On localhost/https, AES uses native WebCrypto. The pure-JS output is byte-identical to the native Rust implementation (cross-checked by the Rust test suite).
 
 ## Packaging & Deployment
 
@@ -200,11 +200,12 @@ Encryption runs in a ×4 worker pool; a single worker does ~22 MB/s (after T-tab
 
 ```
 cipherlane/
-├── cipherlane-rs/          # the whole product: Rust server + CLI + Linux tray (single implementation)
+├── cipherlane-rs/          # the whole product + its Rust test suites
 │   ├── Cargo.toml          # version + the three bins (cipherlane / cipherlane-cli / cipherlane-tray)
-│   └── src/
-│       ├── main.rs         # relay server (rooms / presence / invitations) + embedded web UI
-│       └── bin/            # cli.rs (cipherlane-cli) · tray.rs (cipherlane-tray, Linux only)
+│   ├── src/
+│   │   ├── main.rs         # relay server (rooms / presence / invitations) + embedded web UI
+│   │   └── bin/            # cli.rs (cipherlane-cli) · tray.rs (cipherlane-tray, Linux only)
+│   └── tests/              # Rust suites: crypto / protocol / cli / browser / consistency
 ├── public/                 # browser frontend (vanilla JS; pure-JS crypto for plain-HTTP contexts)
 │   ├── index.html          # SPA (device grid · geometric avatars · invitation cards · dual receive layouts)
 │   ├── app.js              # send/receive logic + dual crypto paths + X25519 identity
@@ -213,40 +214,36 @@ cipherlane/
 │   ├── x25519.js           # pure-JS X25519 (device-direct key agreement)
 │   ├── avatar.js           # geometric avatars (Material-flat, deterministic from IP)
 │   └── style.css
-├── scripts/                # consistency checks (version / include_bytes ↔ public / no Node leftovers)
 ├── build/package.sh        # one-shot packaging: .deb / Windows zip / macOS universal
 ├── logo/                   # logo art (main + favicon master)
-├── docs/screenshots/       # README screenshots
-└── test/                   # eight suites (Node is only the test runner)
+└── docs/screenshots/       # README screenshots
 ```
 
 ## Tests
 
-The test suite drives the real Rust binaries (server + CLI) and a real headless Chrome for the browser suite. **Node ≥ 18 is only the test runner** — it is not needed to build or run the product.
+Everything — including the browser suite — runs under `cargo test`; the repository has **no Node dependency**. The browser frontend is plain JS (the browser's own language) and is verified by Rust tests that drive a real headless Chrome over CDP.
 
 ```bash
-cargo build --release --manifest-path cipherlane-rs/Cargo.toml   # or: npm run build
-npm test                   # auto-builds first (pretest); or run individually: node test/<name>.test.mjs
-cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust unit tests (or: npm run test:cargo)
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml                    # release build
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml                    # all suites
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test protocol    # one suite: crypto / protocol / cli / browser / consistency
 ```
 
-- **aesgcm**: FIPS-197 S-box vectors, GHASH cross-validation, byte-identical to node:crypto for 0B–1MiB (including AAD and tamper rejection)
-- **sha256**: FIPS 180-4 vectors + 500 random cross-checks
-- **x25519**: RFC 7748 vectors + 200 random pairs vs node ECDH (both directions), small-order rejection
-- **qrcode**: RS algebra self-checks, finder/timing/format structure assertions
-- **avatar**: determinism, neighbor-IP distinctness, palette & luminance constraints
-- **protocol**: runs the real Rust server binary; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/ETag/Host checks/link mode end to end (also run directly by CI against the musl release binary)
+- **crypto**: ported FIPS 197 / FIPS 180-4 / RFC 7748 vectors and random cross-checks (AES-256-GCM incl. AAD, SHA-256, X25519, QR code, avatars); expected values are computed with RustCrypto crates
+- **protocol**: spawns the real Rust server binary; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/ETag/Host checks/link mode end to end (CI also runs it against the musl release binary)
 - **cli**: real-subprocess end-to-end against `cipherlane-cli` + the Rust server — single file / recursive directory batch (nested · CJK names · empty files · hidden entries skipped) / mixed paths / text / SIGKILL-resume, byte-level comparison
-- **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
+- **browser**: a Rust CDP client drives a real headless Chrome (two-page send/receive, error paths, worker-pool assertion); auto-skips when no Chrome is available
+- **consistency**: README badges ↔ `Cargo.toml` version, `include_bytes!` ↔ `public/`, required bins and test targets, plus a zero-Node guard over product code, build scripts, CI workflows and README command blocks
 
 ## Changelog
 
 **v1.0.0** (2026-10-20, single implementation)
-- **Node is gone from the product**: server, CLI and tray are now one Rust implementation. The Node relay/CLI and the Node single-executable packaging path are removed; Node remains only the test runner for the JS frontend suite
+- **Node is gone from the repository**: server, CLI, tray and the entire test suite are Rust. The Node relay/CLI, the Node single-executable packaging path and the Node test runner are all removed; the browser frontend stays plain JS and is exercised by Rust tests through CDP
+- **Tests are Rust too**: all suites (`crypto` / `protocol` / `cli` / `browser` / `consistency`) run with `cargo test`; the browser suite is a Rust CDP client driving real headless Chrome, and the consistency guard enforces the zero-Node rule
 - **Native Rust CLI** replaces the Node CLI with the same command surface (`devices` / `send` / `send-text` / `recv` / `listen`; `--to`, `--verify`, `--name`, `--server`, `-o`, `--yes`), protocol v2 AAD + v1 fallback, link-mode resume, batch/directory sends, 128-bit TOFU fingerprints and control-character sanitisation
 - **Three-platform Rust artifacts built natively**: Linux deb (musl static server/tray/cli, ≈1.3 MB), Windows x64 zip (`cipherlane.exe` + `cipherlane-cli.exe`, static CRT), macOS universal tar.gz (`lipo` arm64+x64) — no Node and no binary-injection step anywhere
 - **Release automation**: pushing a `v*` tag builds every platform on GitHub-hosted runners and publishes the artifacts plus a unified SHA256SUMS with the official `gh` CLI; manual dispatch only builds artifacts
-- **CI**: Rust build (three bins) + `cargo test` + musl protocol parity + deb packaging smoke, plus the full JS suite on Node 18/20/22; the consistency check now validates version alignment, `include_bytes!` assets and that no Node implementation references remain
+- **CI**: Rust build (three bins) + `cargo test` (crypto / protocol / CLI / browser / consistency) + musl protocol parity + deb packaging smoke; the consistency guard is itself a Rust test validating version alignment, `include_bytes!` assets and zero Node remnants
 - **Docs**: README (en/zh) and the migration document rewritten for the Rust-only product
 
 **v0.5.1** (2026-10-19, reliability)
@@ -285,7 +282,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust unit tes
 
 **v0.3.1** (2026-10-13)
 - Pure-JS AES-256-GCM performance: AES core rewritten with T-tables (SubBytes + MixColumns fused into table lookups; single worker 9.3 → 22 MB/s, ×4 pool ≈ 80–90 MB/s, near gigabit line rate); GHASH moved from 4-bit to 8-bit windowed tables; streaming chunks with the same key reuse a key cache (rk32/H/tables built once)
-- Byte-exactness unchanged: all existing node:crypto comparisons pass; new 100-round cross-check of the 8-bit tables against the reference multiply; the browser fallback-path scenario keeps verifying interop for real
+- Byte-exactness unchanged: all existing native crypto comparisons pass; new 100-round cross-check of the 8-bit tables against the reference multiply; the browser fallback-path scenario keeps verifying interop for real
 - Trade-off note: T-tables have cache-timing side channels (require a co-located attacker continuously probing); this project's threat model is network attackers, acceptable on the plain-http fallback path
 
 **v0.3.0** (2026-10-13)
@@ -313,7 +310,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust unit tes
 
 **v0.2.0** (2026-10-12)
 - Device direct send: one IP = one device (name / geometric avatar / X25519 identity), pick-to-send, invitation cards, accept/reject
-- Pure-JS X25519 + SHA-256 (RFC 7748 / FIPS 180-4, interop-tested against node natives)
+- Pure-JS X25519 + SHA-256 (RFC 7748 / FIPS 180-4, interop-tested against native implementations)
 - Separate text/file receive layouts; Ctrl+V anywhere to send
 - Send-view terminal states fixed (return home on completion, 100% progress, rejection message no longer overwritten)
 - CLI: `devices` / `--to` direct send / `listen` resident receiver
@@ -324,7 +321,7 @@ cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust unit tes
 
 ## Roadmap
 
-- [x] Single implementation: Rust server + native CLI + Linux tray, three-platform Rust artifacts, Node reduced to the test runner — v1.0.0
+- [x] Single implementation: Rust server + native CLI + Linux tray, three-platform Rust artifacts, Node removed entirely (product + tests) — v1.0.0
 - [x] Pure-JS AES performance work (AES T-tables + 8-bit windowed GHASH + per-key caching; single worker 9.3 → 22 MB/s) — v0.3.1
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
 - [x] Multi-file / directory transfers (manifest + sequential chunks in one room; folder picker / recursive CLI; browser ↔ CLI interop) — v0.3.0

@@ -16,19 +16,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 测试全量：Node 仅作测试运行器（前端 JS 与 node:test 风格的套件），被测产品是 Rust 二进制。
+  # 全量 Rust 测试：crypto / protocol / cli / browser / consistency。
+  # 不再有语言版本矩阵——被测代码与测试代码都是 Rust，固定 stable 工具链即可；
+  # release 构建下测试，与发布二进制同优化档位。
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [18, 20, 22]
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -39,26 +34,22 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
-      # 测试默认调用 cipherlane-rs/target/release/{cipherlane,cipherlane-cli}，先构建。
-      - name: Build Rust binaries
+      - name: Build Rust binaries (release)
         run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
-      # 版本 / include_bytes 内嵌资源 / 测试文件 / 已去 Node 的一致性检查
-      - name: Consistency check
-        run: npm run check
-      # 浏览器套件需要 Chrome：ubuntu-latest 自带 /usr/bin/google-chrome；
-      # Node 18/20 无全局 WebSocket，browser.test.mjs 会自动跳过并以 0 退出。
-      - name: Tests (Node is only the test runner)
-        run: npm test
+      # 一致性守卫先跑：版本徽章 / include_bytes ↔ public / 无外部运行时残留，失败信息精确到文件行号
+      - name: Consistency guard
+        run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml --test consistency
+      # 浏览器套件由 Rust CDP 客户端驱动真实 Chrome：ubuntu-latest 自带 google-chrome；
+      # 无 Chrome 时测试内部打印跳过（不失败）。
+      - name: Full test suite
+        run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml
 
-  # Rust 侧：三 bin 构建、单元测试、musl 静态产物（Linux deb 实际内容）、协议平价、deb 打包冒烟
-  rust:
+  # 发布形态验证：musl 静态产物（deb 实际内容）、协议平价、deb 打包冒烟
+  dist:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -66,20 +57,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             cipherlane-rs/target
-          key: ${{ runner.os }}-cargo-rust-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-dist-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-rust-
-      - name: Build all binaries (release)
-        run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
-      - name: Rust unit tests
-        run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml
+            ${{ runner.os }}-cargo-dist-
       - name: Build static musl binaries (deb payload)
         run: |
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml
-      # 用测试内置的 SERVER_BIN 钩子，对 musl 发布二进制跑完整协议断言
-      - name: Protocol suite against musl Rust server
-        run: CIPHERLANE_SERVER_BIN="$PWD/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane" node test/protocol.test.mjs
+      # 同一套协议断言对 musl 发布二进制再跑一遍（CIPHERLANE_SERVER_BIN 覆盖被测路径）
+      - name: Protocol suite against musl binary
+        run: |
+          CIPHERLANE_SERVER_BIN="$PWD/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane" \
+            cargo test --release --manifest-path cipherlane-rs/Cargo.toml --test protocol
       # 打包链路冒烟：确认 deb 结构可产出（CI 不发布）
       - name: Package Linux deb (smoke)
         run: sh build/package.sh
@@ -89,3 +78,4 @@ jobs:
           deb=$(ls build/dist/cipherlane_*_amd64.deb | head -n 1)
           dpkg-deb -c "$deb" | grep -E 'usr/bin/(cipherlane|cipherlane-cli|cipherlane-tray)$'
           dpkg-deb -c "$deb" | grep -E 'systemd/system/cipherlane.service$'
+          dpkg-deb -c "$deb" | grep -E 'applications/cipherlane.desktop$'

@@ -1,6 +1,6 @@
 // cipherlane-cli —— Rust 版命令行（v1.0：去 Node，唯一 CLI 实现）
 //
-// 与 public/app.js / 原 cli.mjs 的 v0.5.1 行为逐字节互操作：
+// 与 public/app.js / v0.5.1 的行为逐字节互操作：
 //   - X25519 房间密钥 = SHA256(shared ‖ senderPub ‖ receiverPub ‖ "cipherlane/device/v1\0"+room)
 //   - AES-256-GCM 线上格式 IV(12) ‖ 密文 ‖ TAG(16)
 //   - 协议 v2 分片位置绑定：AAD = "cipherlane/chunk/v2|" + room + "|" + index
@@ -180,7 +180,7 @@ fn clean(raw: &str, max: usize) -> String {
     out
 }
 
-// 接收文件名净化（对齐 cli.mjs 的 safeName）：取最后一段，
+// 接收文件名净化（对齐 v0.x CLI 的 safeName）：取最后一段，
 // 非 [\w.\- CJK 空格] 的连续串替换为 '_'，剥掉前导点/空白。
 fn safe_name(raw: &str) -> String {
     let base = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or("");
@@ -326,7 +326,7 @@ fn ack_proof_hex(key: &[u8; 32], room: &str) -> String {
     hexstr(&h.finalize())
 }
 
-// 指纹 = SHA256(原始 32B 公钥) 前 16 字节 → 32 hex（与 app.js/cli.mjs 一致）
+// 指纹 = SHA256(原始 32B 公钥) 前 16 字节 → 32 hex（与浏览器 app.js 及 v0.x CLI 一致）
 fn fp_hex(raw_pub: &[u8]) -> String {
     hexstr(&Sha256::digest(raw_pub)[..16])
 }
