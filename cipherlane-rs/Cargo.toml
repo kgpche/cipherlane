@@ -36,6 +36,10 @@ path = "src/bin/tray.rs"
 name = "cipherlane-cli"
 path = "src/bin/cli.rs"
 
+# 测试基建：Rust 测试通过 CDP 驱动真实 Chrome（浏览器/前端 JS 断言），不再依赖 Node。
+[dev-dependencies]
+tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+
 [profile.release]
 opt-level = "z"
 lto = true
