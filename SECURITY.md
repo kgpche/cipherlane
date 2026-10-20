@@ -16,7 +16,7 @@ Use GitHub's private vulnerability reporting instead:
 - 进入本仓库的 **Security** 标签页 → **Report a vulnerability**
 
 You can also start a private security advisory via
-`https://github.com/<owner>/cipherlane/security/advisories/new`.
+`https://github.com/kgpche/cipherlane/security/advisories/new`.
 
 We aim to respond within **72 hours** and will credit reporters in the
 advisory unless you prefer to remain anonymous.

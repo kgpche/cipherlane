@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2059-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -45,9 +45,9 @@ One LAN IP = one device: each device gets a **name** (editable), a **geometric a
 
 ## Screenshots
 
-| Device-direct home (online device grid + avatars) | Link mode, transfer done | Text receive (decrypt & display) |
+| Device-direct home (single-row devices + search + 32-hex fingerprint) | Link mode, transfer done (QR + ack proof) | Text receive (decrypt & display) |
 | :---: | :---: | :---: |
-| <img src="docs/screenshots/landing.png" width="280" alt="Landing device grid" /> | <img src="docs/screenshots/send-done.png" width="280" alt="Send done" /> | <img src="docs/screenshots/recv-text.png" width="280" alt="Text receive" /> |
+| <img src="docs/screenshots/landing.png" width="280" alt="Landing: single-row devices + search" /> | <img src="docs/screenshots/send-done.png" width="280" alt="Send done" /> | <img src="docs/screenshots/recv-text.png" width="280" alt="Text receive" /> |
 
 `Ctrl+V` anywhere on the page sends your clipboard: screenshots/files go straight out, text goes directly if a device is selected (or fills the input box otherwise).
 
@@ -227,6 +227,7 @@ Everything — including the browser suite — runs under `cargo test`; the repo
 cargo build --release --manifest-path cipherlane-rs/Cargo.toml                    # release build
 cargo test  --release --manifest-path cipherlane-rs/Cargo.toml                    # all suites
 cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test protocol    # one suite: crypto / protocol / cli / browser / consistency
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshots -- --ignored  # regenerate docs/screenshots (needs Chrome)
 ```
 
 - **crypto**: ported FIPS 197 / FIPS 180-4 / RFC 7748 vectors and random cross-checks (AES-256-GCM incl. AAD, SHA-256, X25519, QR code, avatars); expected values are computed with RustCrypto crates

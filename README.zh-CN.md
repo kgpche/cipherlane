@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2059-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -45,9 +45,9 @@
 
 ## 截图
 
-| 设备直发首页（在线设备网格 + 几何头像） | 链接模式发送完成 | 文本接收（解密即呈现） |
+| 设备直发首页（单行设备栏 + 搜索 + 32hex 指纹） | 链接模式发送完成（二维码 + ack 凭证） | 文本接收（解密即呈现） |
 | :---: | :---: | :---: |
-| <img src="docs/screenshots/landing.png" width="280" alt="首页设备网格" /> | <img src="docs/screenshots/send-done.png" width="280" alt="发送完成" /> | <img src="docs/screenshots/recv-text.png" width="280" alt="文本接收" /> |
+| <img src="docs/screenshots/landing.png" width="280" alt="首页：设备单行横滑 + 搜索" /> | <img src="docs/screenshots/send-done.png" width="280" alt="发送完成" /> | <img src="docs/screenshots/recv-text.png" width="280" alt="文本接收" /> |
 
 页面任意位置 `Ctrl+V` 即可粘贴发送：截图/文件直接发，文本已选设备则直发、未选则填入输入框。
 
@@ -226,6 +226,7 @@ cipherlane/
 cargo build --release --manifest-path cipherlane-rs/Cargo.toml                    # release 构建
 cargo test  --release --manifest-path cipherlane-rs/Cargo.toml                    # 全部套件
 cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test protocol    # 单个套件：crypto / protocol / cli / browser / consistency
+cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshots -- --ignored  # 重新生成 docs/screenshots（需 Chrome）
 ```
 
 - **crypto**：迁移 FIPS 197 / FIPS 180-4 / RFC 7748 标准向量与随机交叉（AES-256-GCM 含 AAD、SHA-256、X25519、二维码、头像）；期望值由 RustCrypto 计算
