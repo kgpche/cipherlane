@@ -34,9 +34,8 @@
   }
   function random32() {
     const out = new Uint8Array(32)
-    if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(out)
-    else if (typeof require === 'function') out.set(require('node:crypto').randomBytes(32))
-    else throw new Error('无可用随机源')
+    if (!globalThis.crypto || !globalThis.crypto.getRandomValues) throw new Error('无可用随机源（浏览器应提供 crypto.getRandomValues）')
+    globalThis.crypto.getRandomValues(out)
     return out
   }
 
@@ -121,7 +120,7 @@
   // sessionKey(shared, senderPub, receiverPub, roomId) → 32 字节房间密钥
   // 两侧参数顺序必须一致：均为（发送方公钥, 接收方公钥）
   function sessionKey(shared, senderPub, receiverPub, roomId) {
-    const SHA = global.SHA256 || (typeof require === 'function' ? require('./sha256.js') : null)
+    const SHA = global.SHA256
     if (!SHA) throw new Error('缺少 sha256.js')
     return SHA.hash(concatBuf([
       shared,

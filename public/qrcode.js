@@ -4,7 +4,7 @@
  * 减去 12 位模式+计数头，全部单块免交织）。
  * 覆盖典型接收链接（http://192.168.x.x:7777/#ROOM.KEY ≈ 60-85 字节）；
  * 超长输入 encode() 返回 null，调用方隐藏二维码即可。
- * 兼容：浏览器挂载全局 QRCode；Node 下 module.exports（CLI 终端码 / 测试用）。
+ * 浏览器挂载全局 QRCode（前端语言是 JS；v1.0 起产品不再有 Node 侧调用）。
  */
 (function (global) {
   'use strict'
@@ -336,119 +336,7 @@
     return asciiAdaptive(text, 2)
   }
 
-  // png(text, scale) → PNG Buffer（1-bit 灰度，像素级精确，仅 Node：惰性 require zlib）
-  // 用途：终端字体几何不可控时的保底扫码路径（图片查看器打开即扫）
-  function png(text, scale = 8) {
-    const qr = encode(text)
-    if (!qr) return null
-    const zlib = require('node:zlib')
-    const q = 4
-    const n = qr.size + 2 * q
-    const W = n * scale
-    const rowBytes = Math.ceil(W / 8)
-    const rows = []
-    for (let y = 0; y < W; y++) {
-      const r = Math.floor(y / scale) - q
-      const row = Buffer.alloc(1 + rowBytes) // filter 0
-      for (let bx = 0; bx < rowBytes; bx++) {
-        let b = 0
-        for (let bit = 0; bit < 8; bit++) {
-          const x = bx * 8 + bit
-          let dark = false
-          if (x < W) {
-            const c = Math.floor(x / scale) - q
-            dark = r >= 0 && c >= 0 && r < qr.size && c < qr.size && qr.modules[r * qr.size + c] === 1
-          }
-          b = (b << 1) | (dark ? 0 : 1) // 灰度 1-bit：0=黑，1=白
-        }
-        row[1 + bx] = b
-      }
-      rows.push(row)
-    }
-    const idat = zlib.deflateSync(Buffer.concat(rows), { level: 9 })
-    let CRC_T = null
-    const crc32 = (buf) => {
-      if (!CRC_T) {
-        CRC_T = new Uint32Array(256)
-        for (let k = 0; k < 256; k++) {
-          let c = k
-          for (let i = 0; i < 8; i++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-          CRC_T[k] = c
-        }
-      }
-      let c = 0xffffffff
-      for (const b of buf) c = CRC_T[(c ^ b) & 255] ^ (c >>> 8)
-      return (c ^ 0xffffffff) >>> 0
-    }
-    const chunk = (type, data) => {
-      const out = Buffer.alloc(12 + data.length)
-      out.writeUInt32BE(data.length, 0)
-      out.write(type, 4, 'ascii')
-      data.copy(out, 8)
-      out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length)
-      return out
-    }
-    const ihdr = Buffer.alloc(13)
-    ihdr.writeUInt32BE(W, 0)
-    ihdr.writeUInt32BE(W, 4)
-    ihdr[8] = 1 // bit depth
-    ihdr[9] = 0 // 灰度
-    return Buffer.concat([
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-      chunk('IHDR', ihdr),
-      chunk('IDAT', idat),
-      chunk('IEND', Buffer.alloc(0)),
-    ])
-  }
-
-  // measureCellRatio() → Promise<number>（仅 Node TTY）：CSI 16t 实测终端字符单元格
-  // 高宽比（像素），无响应/不支持时回落 2.0（多数终端标准）。120ms 超时。
-  function measureCellRatio() {
-    return new Promise((resolve) => {
-      const isNode = typeof process !== 'undefined' && process.versions && process.versions.node
-      if (!isNode || !process.stdout.isTTY || !process.stdin.isTTY) return resolve(2)
-      let done = false
-      const finish = (r) => {
-        if (done) return
-        done = true
-        clearTimeout(timer)
-        process.stdin.removeListener('data', on)
-        try { process.stdin.setRawMode(false) } catch {}
-        process.stdin.pause()
-        resolve(r)
-      }
-      const on = (d) => {
-        const m = /\x1b\[6;(\d+);(\d+)t/.exec(d.toString('latin1'))
-        if (m) {
-          const r = Number(m[1]) / Number(m[2])
-          // 部分终端的 16t 返回字形框（不含行距），比例异常低时不可信 → 回落默认
-          finish(r >= 1.35 && r <= 2.45 ? r : 2)
-        }
-      }
-      const timer = setTimeout(() => finish(2), 120)
-      try {
-        process.stdin.setRawMode(true)
-        process.stdin.resume()
-        process.stdin.on('data', on)
-        process.stdout.write('\x1b[16t')
-      } catch { finish(2) }
-    })
-  }
-
-  // probeCell() → Promise<string>：CSI 16t 原始应答文本（诊断终端上报的单元格尺寸）
-  function probeCell() {
-    return new Promise((resolve) => {
-      const isNode = typeof process !== 'undefined' && process.versions && process.versions.node
-      if (!isNode || !process.stdout.isTTY || !process.stdin.isTTY) return resolve('(非 TTY)')
-      let done = false
-      const finish = (s) => { if (done) return; done = true; clearTimeout(t); process.stdin.removeListener('data', on); try { process.stdin.setRawMode(false) } catch {}; process.stdin.pause(); resolve(s) }
-      const on = (d) => { const s = d.toString('latin1'); if (/\x1b\[6;/.test(s)) finish(s.replace(/\x1b/g, 'ESC')) }
-      const t = setTimeout(() => finish('(无应答：终端不支持 CSI 16t)'), 150)
-      try { process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data', on); process.stdout.write('\x1b[16t') } catch { finish('(错误)') }
-    })
-  }
-
-  const api = { encode, svg, ascii, asciiAdaptive, png, measureCellRatio, probeCell, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
+  const api = { encode, svg, ascii, asciiAdaptive, _test: { VERSIONS, codewords, rsEncode, gmul, genPoly } }
   if (typeof module !== 'undefined' && module.exports) module.exports = api
   else global.QRCode = api
 })(typeof self !== 'undefined' ? self : globalThis)

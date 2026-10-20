@@ -368,13 +368,12 @@
   // ============ 对外 API ============
   function randomIV() {
     const iv = new Uint8Array(12)
-    if (globalThis.crypto && globalThis.crypto.getRandomValues) globalThis.crypto.getRandomValues(iv)
-    else if (typeof require === 'function') iv.set(require('node:crypto').randomBytes(12)) // Node 18 无全局 webcrypto
-    else throw new Error('无可用随机源')
+    if (!globalThis.crypto || !globalThis.crypto.getRandomValues) throw new Error('无可用随机源（浏览器应提供 crypto.getRandomValues）')
+    globalThis.crypto.getRandomValues(iv)
     return iv
   }
 
-  // encrypt(key, iv, pt, aad?) → { ct, tag }（与 node aes-256-gcm + setAAD 逐字节一致）
+  // encrypt(key, iv, pt, aad?) → { ct, tag }（与 RustCrypto aes-256-gcm + AAD 逐字节一致，测试锁定）
   function encrypt(key, iv, pt, aad) {
     if (!(iv instanceof Uint8Array) || iv.length !== 12) throw new Error('iv 必须是 12 字节')
     const A = normAad(aad)
