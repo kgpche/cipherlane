@@ -245,6 +245,10 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **发布自动化**：推送 `v*` 标签即由 GitHub 官方 runner 三平台原生构建，并用官方 `gh` CLI 发布产物与统一 SHA256SUMS；手动触发只构建 artifact 不发布
 - **CI**：Rust 三 bin 构建 + `cargo test`（crypto / protocol / CLI / browser / consistency）+ musl 协议平价 + deb 打包冒烟（断言三 bin 与维护脚本齐全）；Windows/macOS 编译门禁前置到普通 push/PR，CI 强制要求 Chrome（`CIPHERLANE_REQUIRE_CHROME=1`，前端覆盖不许静默清零）；发版前校验 tag 与 Cargo.toml 版本一致；一致性守卫本身也是 Rust 测试，校验版本、`include_bytes!` 资源与零 Node 残留
 - **服务端连接层加固**（v1.0 收口）：vendor 补丁版 tiny_http——请求头 16KiB 预算、每连接 60s 读/写超时、并发连接上限 256（对齐旧 JS 运行时的默认防护，堵住 slowloris 面）；真·优雅停机（停止派发 → 250ms 排干在途请求 → exit 0，SIGTERM/面板停机同路径）；worker panic 隔离（catch_unwind）与锁毒化恢复，单请求异常不再级联；`/api/update` 支持 https（rustls，纯 Rust TLS）与 ≤3 次重定向、响应上限 64KiB、单飞等待有界；设备/建房/字节配额三处并发窗口收口（检查与入账同一临界区）；静态资源 Arc 化零拷贝回源
+- **TOFU 重信闭环**（前端修复）：设备公钥变化（如对方重置身份密钥）时"⚠ 公钥已变化"警示
+  常驻，但此前的"我已核对"确认只放行单次发送/接收、不回写新公钥——红条永不消除且每次都
+  重复弹确认。现在两条确认路径（直发/邀请接受）核对通过后即以新公钥为基准重信：红条消除、
+  后续不再打扰，再次变化仍会警示；配套 browser 回归 t16（含真实服务端邀请的接受路径）
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）

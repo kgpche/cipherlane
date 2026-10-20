@@ -1226,3 +1226,126 @@ fn t15_server_downtime_has_exit() {
     cdp.wait_for(&a, "!document.querySelector('#view-landing').hidden", 20000, "返回首页");
     ok("服务器中途下线:报\"建立密道失败\"且可返回(不卡死在无按钮视图)");
 }
+
+// =====================================================================================
+// 场景 16：TOFU 重信闭环（回归：公钥变化警示曾无消除路径——确认后不回写新公钥，
+// 红条永久化且每次直发/接受都重复弹确认）。覆盖两条显式确认路径：
+//   a) 直发：公钥变化 → 确认"我已核对" → 新公钥回写 → 红条消除 → 再次直发不再弹
+//   b) 邀请：真实服务端邀请（to 自己）→ 警示 → 确认接受 → 接受成功后回写新公钥
+// =====================================================================================
+#[test]
+fn t16_tofu_retrust_closes_the_loop() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let s = srv.url();
+    let a = cdp.new_page();
+    nav(&mut cdp, &a, &format!("{s}/"));
+    cdp.wait_for(
+        &a,
+        r#"document.querySelector('#me-fp') && /^#[0-9a-f]{32}$/.test(document.querySelector('#me-fp').textContent.trim())"#,
+        20000,
+        "首页心跳就绪",
+    );
+    // 幽灵设备不可达会让直发走失败分支（t05 语义），先打桩防 alert 阻塞主线程
+    cdp.eval(&a, "window.alert = () => {}");
+
+    // ---- a) 直发确认后重信 ----
+    cdp.eval(
+        &a,
+        r#"(() => {
+  refreshDevices = () => {} // 防轮询覆盖注入设备
+  const kp = X25519.genKey()
+  window.__tofuPub = toB64(kp.pk)
+  deviceCache.push({ ip: '10.99.0.16', id: 'tofu16', name: '重信设备', pub: window.__tofuPub })
+  const known = knownPubs.load()
+  known['10.99.0.16'] = toB64(X25519.genKey().pk) // 记录一把不同公钥 → 触发警示
+  knownPubs.save(known)
+  selectedIp = '10.99.0.16'
+  renderDevices()
+})()"#,
+    );
+    cdp.wait_for(&a, "document.querySelectorAll('.device.fp-changed').length === 1", 6000, "红条出现");
+    cdp.eval(&a, "document.querySelector('#text').value = '重信闭环'");
+    cdp.eval(&a, "document.querySelector('#send-text').click()");
+    cdp.wait_for(&a, "!document.querySelector('#modal-mask').hidden", 6000, "直发确认弹窗");
+    let title = text(&mut cdp, &a, "#modal-title");
+    if !title.contains("公钥已变化") {
+        panic!("直发确认弹窗应提示公钥变化,实际: {title}");
+    }
+    cdp.eval(&a, "document.querySelector('#modal-ok').click()");
+    cdp.wait_for(&a, "document.querySelector('#modal-mask').hidden", 6000, "确认后弹窗关闭");
+    // 确认后新公钥应回写为基准；红条随之消除
+    let remembered = eval_text(
+        &mut cdp,
+        &a,
+        "(() => { renderDevices(); return knownPubs.load()['10.99.0.16'] === window.__tofuPub && document.querySelectorAll('.device.fp-changed').length === 0 })()",
+    );
+    if remembered != "true" {
+        panic!("直发确认后应以新公钥重信并消除红条");
+    }
+    // 收尾第一轮（幽灵设备不可达 → 发送视图报错，返回首页）
+    cdp.eval(&a, "document.querySelector('#cancel-send').click()");
+    cdp.wait_for(&a, "!document.querySelector('#view-landing').hidden", 20000, "回到首页");
+    // 再次直发：公钥已匹配 → 不得再弹确认，直接进入发送流程
+    cdp.eval(&a, "document.querySelector('#text').value = '第二次不再确认'");
+    cdp.eval(&a, "document.querySelector('#send-text').click()");
+    sleep_ms(700);
+    if !eval_bool(&mut cdp, &a, "document.querySelector('#modal-mask').hidden && document.querySelector('#view-landing').hidden") {
+        panic!("重信后再次直发不应弹确认，应直接进入发送流程");
+    }
+    cdp.eval(&a, "document.querySelector('#cancel-send').click()");
+    cdp.wait_for(&a, "!document.querySelector('#view-landing').hidden", 20000, "回到首页(二)");
+    cdp.eval(&a, "selectedIp = null; deviceCache = deviceCache.filter((d) => d.ip !== '10.99.0.16'); renderDevices()");
+
+    // ---- b) 真实服务端邀请：确认接受后重信 ----
+    // 在服务器上建真实房间并给"自己"(127.0.0.1)投递邀请：accept API 会真正成功，
+    // 从而覆盖"接受成功后才回写"的分支（t04 式 fake 邀请 accept 必失败，测不到这里）
+    cdp.eval(
+        &a,
+        r#"(async () => {
+  const r = await (await fetch('/api/rooms', { method: 'POST' })).json()
+  window.__offerRoom = r.room
+  window.__offerToken = r.token
+  const kp = X25519.genKey()
+  window.__offerPub = toB64(kp.pk)
+  const key = X25519.sessionKey(X25519.dh(identity.sk, kp.pk), kp.pk, identity.pk, r.room)
+  const hint = await sealWith(key, enc.encode(JSON.stringify({ kind: 'text', size: 3 })))
+  const known = knownPubs.load()
+  known['127.0.0.1'] = toB64(X25519.genKey().pk) // 自身 IP 预置不同公钥 → 邀请触发警示
+  knownPubs.save(known)
+  const resp = await fetch('/api/rooms/' + r.room + '/offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Room-Token': r.token },
+    body: JSON.stringify({ to: '127.0.0.1', pub: toB64(kp.pk), hint: toB64(hint) }),
+  })
+  window.__offerPosted = resp.status
+})()"#,
+    );
+    cdp.wait_for(&a, "window.__offerPosted === 200", 10000, "邀请投递成功");
+    // 页面轮询拾取邀请 → 警示文案出现（from.ip=127.0.0.1 与预置记录不一致）
+    cdp.wait_for(
+        &a,
+        r#"[...document.querySelectorAll('.o-fp-warn')].some((x) => !x.hidden && x.textContent.includes('公钥已变化'))"#,
+        20000,
+        "邀请卡片 TOFU 警示",
+    );
+    cdp.wait_for(&a, "!document.querySelector('.o-accept').disabled", 20000, "预览解密完成");
+    cdp.eval(&a, "document.querySelector('.o-accept').click()");
+    cdp.wait_for(&a, "!document.querySelector('#modal-mask').hidden", 6000, "邀请确认弹窗");
+    cdp.eval(&a, "document.querySelector('#modal-ok').click()");
+    cdp.wait_for(&a, "document.querySelector('#modal-mask').hidden", 6000, "接受后弹窗关闭");
+    // 接受成功 → 新公钥回写。注意 remember 在 await api(accept) 之后才执行（模态关闭
+    // 早于它），必须轮询等待而不是立刻断言，否则套件负载下会抢跑
+    cdp.wait_for(
+        &a,
+        "knownPubs.load()['127.0.0.1'] === window.__offerPub",
+        10000,
+        "邀请接受成功后以新公钥重信",
+    );
+    // 清理：删房间让挂起的接收流程拿到 410 退出（alert 已打桩）
+    cdp.eval(
+        &a,
+        "fetch('/api/rooms/' + window.__offerRoom, { method: 'DELETE', headers: { 'X-Room-Token': window.__offerToken } })",
+    );
+    ok("TOFU 重信闭环:直发/邀请确认后回写新公钥、红条消除、不再重复确认");
+}

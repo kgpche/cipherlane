@@ -97,6 +97,14 @@ function fpOf(pubB64) {
 const knownPubs = {
   load() { try { return JSON.parse(store.get('cipherlane-pubs') || '{}') } catch { return {} } },
   save(m) { store.set('cipherlane-pubs', JSON.stringify(m)) },
+  // 人工核对后的重信（覆盖写）：以新公钥为基准，红条消除、后续不再重复弹确认。
+  // 只有"我已核对"的显式确认路径可调用；轮询/首见仍走 seenPub（只记不覆盖）。
+  remember(ip, pubB64) {
+    const known = this.load()
+    if (known[ip] === pubB64) return
+    known[ip] = pubB64
+    this.save(known)
+  },
 }
 // TOFU 记录：首次见即记录；已记录时返回是否与本次公钥一致（不覆盖旧记录）
 function seenPub(ip, pubB64) {
@@ -669,6 +677,9 @@ async function acceptOffer(o) {
     alert('接受失败：' + e.message)
     return
   }
+  // 已人工核对且接受成功：以本次邀请的公钥为新基准重信（取消/接受失败不记），
+  // 该设备的"⚠ 公钥已变化"红条随之消除
+  if (o._fpChanged) knownPubs.remember(o.from.ip, o.pub)
   const from = o.from ? { ...o.from, fp: fpOf(o.pub) } : null
   receiveInto(o.room, o._key, from)
 }
@@ -776,6 +787,8 @@ async function startSend(kind, payload, target) {
         danger: true,
       })
       if (!go) return
+      // 已人工核对：以本次发送实际使用的公钥为新基准重信，红条消除、下次不再重复确认
+      knownPubs.remember(target.ip, target.pub)
     } else if (!known[target.ip]) {
       seenPub(target.ip, target.pub)
     }
