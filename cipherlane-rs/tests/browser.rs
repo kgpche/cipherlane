@@ -98,15 +98,9 @@ fn nav(cdp: &mut Cdp, p: &Page, url: &str) {
     cdp.wait_for(p, &expr, 25000, &format!("页面加载 {url}"));
 }
 
-/// 启动 Chrome + Rust 服务器 + CDP 连接。无 Chrome 时打印跳过并返回 None。
+/// 启动 Chrome + Rust 服务器 + CDP 连接。无 Chrome 时按策略跳过或失败（见 chrome_or_note）。
 fn boot() -> Option<(Server, Chrome, Cdp)> {
-    let chrome = match common::launch_chrome() {
-        Some(c) => c,
-        None => {
-            eprintln!("  – 跳过：未找到 Chrome/Chromium（可用 CHROME_BIN 指定）");
-            return None;
-        }
-    };
+    let chrome = common::chrome_or_note("browser 套件")?;
     // HOST="" → 自动绑定 127.0.0.1 + 局域网网卡（与旧 .mjs 的 Node 服务端一致，LAN 链接可达）
     let srv = common::spawn_server(&[
         ("HOST", ""),

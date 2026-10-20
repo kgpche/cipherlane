@@ -26,9 +26,11 @@ impl Drop for Serial {
 }
 
 /// 测试二进制之间串行化（cargo 默认会并行跑多个 tests/*.rs）。退出时自动释放。
+/// 陈旧阈值（1h）远大于等待上限（29min）：慢 CI 上合法持锁 10 分钟以上的套件
+/// 不会被等待者误拆；等待者也必须在 29min 内 loud 失败而不是无限排队。
 pub fn serial() -> Serial {
     let path = std::env::temp_dir().join(LOCK_NAME);
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + Duration::from_secs(1740);
     loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut f) => {
@@ -38,7 +40,7 @@ pub fn serial() -> Serial {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if let Ok(meta) = std::fs::metadata(&path) {
                     if let Ok(modified) = meta.modified() {
-                        if modified.elapsed().map(|d| d > Duration::from_secs(600)).unwrap_or(false) {
+                        if modified.elapsed().map(|d| d > Duration::from_secs(3600)).unwrap_or(false) {
                             let _ = std::fs::remove_file(&path);
                             continue;
                         }
@@ -143,33 +145,45 @@ impl Drop for Server {
 }
 
 /// 启动被测服务器。extra_env 覆盖默认值；未显式给 HOST 时只绑回环。
+/// free_port 的 bind-后-drop 与真正监听之间存在被抢端口的窗口：子进程若秒退
+/// （几乎必为端口被抢）则立刻换端口重试，最多 3 次，全部失败才 panic。
 pub fn spawn_server(extra_env: &[(&str, &str)]) -> Server {
-    let port = free_port();
-    let log = unique_dir("cipherlane-srv").join("stdout.log");
-    let mut cmd = Command::new(server_bin());
-    cmd.env("PORT", port.to_string());
-    cmd.env("HOST", "127.0.0.1");
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.stdout(Stdio::from(std::fs::File::create(&log).expect("创建 server 日志失败")));
-    cmd.stderr(Stdio::null());
-    let child = cmd.spawn().expect("启动 cipherlane 服务器失败");
-    let mut srv = Server { child, port, stdout_path: log };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(r) = http(port, "GET", "/api/version", &[], None) {
-            if r.status == 200 {
-                return srv;
+    let mut last_log = String::new();
+    for attempt in 1..=3 {
+        let port = free_port();
+        let log = unique_dir("cipherlane-srv").join("stdout.log");
+        let mut cmd = Command::new(server_bin());
+        cmd.env("PORT", port.to_string());
+        cmd.env("HOST", "127.0.0.1");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.stdout(Stdio::from(std::fs::File::create(&log).expect("创建 server 日志失败")));
+        cmd.stderr(Stdio::null());
+        let child = cmd.spawn().expect("启动 cipherlane 服务器失败");
+        let mut srv = Server { child, port, stdout_path: log };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(r) = http(port, "GET", "/api/version", &[], None) {
+                if r.status == 200 {
+                    return srv;
+                }
             }
+            // 子进程已退出：bind 失败（多为端口被抢）——立即重试而非空等 10s
+            if let Ok(Some(_)) = srv.child.try_wait() {
+                last_log = srv.stdout();
+                break;
+            }
+            if Instant::now() > deadline {
+                let out = srv.stdout();
+                let _ = srv.stop();
+                panic!("服务器 10s 内未就绪: {out}");
+            }
+            std::thread::sleep(Duration::from_millis(30));
         }
-        if Instant::now() > deadline {
-            let out = srv.stdout();
-            let _ = srv.stop();
-            panic!("服务器 10s 内未就绪: {out}");
-        }
-        std::thread::sleep(Duration::from_millis(30));
+        eprintln!("  – 服务器第 {attempt} 次启动失败（端口 {port} 被抢？），重试：{}", last_log.trim());
     }
+    panic!("服务器 3 次启动均失败：{last_log}");
 }
 
 // ---------- 原始 HTTP ----------
@@ -314,8 +328,7 @@ impl Drop for Chrome {
 
 /// 启动 headless Chrome；无浏览器时返回 None（测试打印跳过并正常退出）。
 pub fn launch_chrome() -> Option<Chrome> {
-    let bin = find_chrome()?;
-    let profile = unique_dir("cipherlane-chrome");
+    let bin = find_chrome()?;    let profile = unique_dir("cipherlane-chrome");
     let mut child = Command::new(&bin)
         .args([
             "--headless=new",
@@ -371,6 +384,21 @@ pub fn launch_chrome() -> Option<Chrome> {
     Some(Chrome { child, ws_url, profile })
 }
 
+/// Chrome 必需策略：默认无浏览器时打印跳过（本地无 Chrome 不算失败）；
+/// CIPHERLANE_REQUIRE_CHROME=1（CI 应设置）时改为 panic，防止前端覆盖静默清零。
+pub fn chrome_or_note(group: &str) -> Option<Chrome> {
+    match launch_chrome() {
+        Some(c) => Some(c),
+        None => {
+            if std::env::var("CIPHERLANE_REQUIRE_CHROME").map(|v| v == "1").unwrap_or(false) {
+                panic!("CIPHERLANE_REQUIRE_CHROME=1 但未找到 Chrome/Chromium（可用 CHROME_BIN 指定）：{group} 前端覆盖缺失");
+            }
+            eprintln!("  – 跳过 {group}：未找到 Chrome/Chromium（可用 CHROME_BIN 指定）");
+            None
+        }
+    }
+}
+
 /// 极简同步 CDP 客户端（flatten session）：发送命令并等待同 id 响应，事件忽略。
 pub struct Cdp {
     ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
@@ -379,6 +407,9 @@ pub struct Cdp {
 
 impl Cdp {
     pub fn connect(ws_url: &str) -> Cdp {
+        // 有界重试：Chrome 输出 ws_url 后立刻退出等场景下，无限重试会让测试
+        // 永久挂死（cargo test 无默认超时）——60s 后 loud 失败
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match tungstenite::connect(ws_url) {
                 Ok((mut ws, _)) => {
@@ -388,7 +419,12 @@ impl Cdp {
                     }
                     return Cdp { ws, next_id: 0 };
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("60s 内无法连接 Chrome CDP（{ws_url}）——浏览器是否已退出？");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }

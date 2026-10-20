@@ -45,7 +45,7 @@ impl Prng {
 }
 
 fn boot() -> Option<(common::Chrome, common::Cdp, common::Page, common::Server)> {
-    let chrome = common::launch_chrome()?;
+    let chrome = common::chrome_or_note("crypto 套件")?;
     let server = common::spawn_server(&[]);
     let mut cdp = common::Cdp::connect(&chrome.ws_url);
     let page = cdp.new_page();
@@ -271,7 +271,7 @@ fn aesgcm_against_rustcrypto() {
 
     // 1d) AAD 红测证明：同一密文
     //     ① 用正确 AAD 可解；② 按旧实现（无 AAD）解必须失败；③ 错位 AAD 必须失败；
-    //     ④ 篡改 tag/ct 必须失败。
+    //     ④ 篡改 tag/ct 必须失败；⑤ 错误密钥必须失败（旧 .mjs 组 5 的直接断言）。
     let red = cdp.eval(
         &page,
         r###"(() => {
@@ -280,7 +280,7 @@ fn aesgcm_against_rustcrypto() {
           const r = AESGCM.encrypt(key, iv, pt, aad);
           const packed = new Uint8Array(12 + r.ct.length + 16);
           packed.set(iv, 0); packed.set(r.ct, 12); packed.set(r.tag, 12 + r.ct.length);
-          const res = { ok: false, noAadRejected: false, badAadRejected: false, badTagRejected: false, badCtRejected: false };
+          const res = { ok: false, noAadRejected: false, badAadRejected: false, badTagRejected: false, badCtRejected: false, wrongKeyRejected: false };
           try { res.ok = __hex(AESGCM.open(key, packed, aad)) === __hex(pt); } catch {}
           // 旧实现（无 AAD 路径）会把这些密文当合法数据 → 现在必须拒绝（红测）
           try { AESGCM.open(key, packed); res.noAadRejected = false; } catch { res.noAadRejected = true; }
@@ -291,6 +291,9 @@ fn aesgcm_against_rustcrypto() {
           try { AESGCM.open(key, t, aad); res.badTagRejected = false; } catch { res.badTagRejected = true; }
           const c = Uint8Array.from(packed); c[12] ^= 1;
           try { AESGCM.open(key, c, aad); res.badCtRejected = false; } catch { res.badCtRejected = true; }
+          // 错误密钥（逐位取反）必须拒绝
+          const k2 = Uint8Array.from(key); k2[0] ^= 1;
+          try { AESGCM.open(k2, packed, aad); res.wrongKeyRejected = false; } catch { res.wrongKeyRejected = true; }
           return res;
         })()"###,
     );
@@ -299,8 +302,9 @@ fn aesgcm_against_rustcrypto() {
     assert_true(&red, "badAadRejected", "AAD 错位必须拒绝（红测）");
     assert_true(&red, "badTagRejected", "tag 篡改必须拒绝");
     assert_true(&red, "badCtRejected", "密文篡改必须拒绝");
+    assert_true(&red, "wrongKeyRejected", "错误密钥必须拒绝");
 
-    // RustCrypto 侧同样证明：无 AAD / 错位 AAD 解不开
+    // RustCrypto 侧同样证明：无 AAD / 错位 AAD / 错误密钥解不开
     let key = common::random_bytes(32);
     let iv = common::random_bytes(12);
     let pt = b"red-test-plaintext";
@@ -312,7 +316,10 @@ fn aesgcm_against_rustcrypto() {
         rc_decrypt(&key, &iv, &ct, &tag, b"cipherlane/chunk/v2|Ab3xYz9kLm|8").is_err(),
         "错位 index 的 AAD 必须失败（旧实现红）"
     );
-    println!("  ✓ AAD 红测：旧无 AAD 路径/错位 AAD 均被拒（页面与 RustCrypto 两侧各证一次）");
+    let mut wrong_key = key.clone();
+    wrong_key[0] ^= 1;
+    assert!(rc_decrypt(&wrong_key, &iv, &ct, &tag, aad).is_err(), "错误密钥必须失败");
+    println!("  ✓ AAD 红测：旧无 AAD 路径/错位 AAD/错误密钥均被拒（页面与 RustCrypto 两侧各证一次）");
 }
 
 fn rand_u32() -> u32 {

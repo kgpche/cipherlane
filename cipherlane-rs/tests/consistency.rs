@@ -321,7 +321,8 @@ fn required_bins_declared_and_sources_exist() {
 #[test]
 fn rust_test_targets_exist() {
     let tests_dir = crate_root().join("tests");
-    for name in ["crypto", "protocol", "cli", "browser", "consistency"] {
+    // screenshots 是 #[ignore] 的文档维护工具，同样应存在（被误删不会被发现）
+    for name in ["crypto", "protocol", "cli", "browser", "consistency", "screenshots"] {
         let path = tests_dir.join(format!("{name}.rs"));
         assert!(
             path.is_file(),
