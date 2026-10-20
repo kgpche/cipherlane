@@ -12,10 +12,14 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # 测试全量：Node 仅作测试运行器（前端 JS 与 node:test 风格的套件），被测产品是 Rust 二进制。
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -25,41 +29,63 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # 一致性检查（版本号 / SEA 资产 ↔ server.js / 测试文件存在）
-      - name: Consistency check
-        run: npm run check
-      # 浏览器套件需要 Chrome：ubuntu-latest 自带 /usr/bin/google-chrome；
-      # Node 18/20 无全局 WebSocket，browser.test.mjs 会自动跳过并以 0 退出。
-      - name: Tests
-        run: npm test
-
-  # Rust 版服务器的编译与协议平价（Linux deb 的发布产物即 Rust 二进制）
-  rust:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
+            cipherlane-rs/target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
-      # 两个 bin（server + tray）先做 glibc 编译，确保 Cargo.lock 与源码可构建
-      - name: Build Rust binaries (glibc)
-        run: cargo build --locked --release --manifest-path cipherlane-rs/Cargo.toml
-      # musl 静态 server 是 deb 内实际分发的产物
-      - name: Build static server (musl)
+            ${{ runner.os }}-cargo-test-
+      # 测试默认调用 cipherlane-rs/target/release/{cipherlane,cipherlane-cli}，先构建。
+      - name: Build Rust binaries
+        run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
+      # 版本 / include_bytes 内嵌资源 / 测试文件 / 已去 Node 的一致性检查
+      - name: Consistency check
+        run: npm run check
+      # 浏览器套件需要 Chrome：ubuntu-latest 自带 /usr/bin/google-chrome；
+      # Node 18/20 无全局 WebSocket，browser.test.mjs 会自动跳过并以 0 退出。
+      - name: Tests (Node is only the test runner)
+        run: npm test
+
+  # Rust 侧：三 bin 构建、单元测试、musl 静态产物（Linux deb 实际内容）、协议平价、deb 打包冒烟
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cipherlane-rs/target
+          key: ${{ runner.os }}-cargo-rust-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rust-
+      - name: Build all binaries (release)
+        run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
+      - name: Rust unit tests
+        run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml
+      - name: Build static musl binaries (deb payload)
         run: |
           rustup target add x86_64-unknown-linux-musl
-          cargo build --locked --release --target x86_64-unknown-linux-musl \
-            --bin cipherlane --manifest-path cipherlane-rs/Cargo.toml
-      # 用现有平价钩子：同一套 protocol 断言跑 Rust 二进制（协议兼容验收）
-      - name: Protocol parity (Rust server)
-        run: CIPHERLANE_TEST_SERVER="$PWD/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane" node test/protocol.test.mjs
+          cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml
+      # 用测试内置的 SERVER_BIN 钩子，对 musl 发布二进制跑完整协议断言
+      - name: Protocol suite against musl Rust server
+        run: CIPHERLANE_SERVER_BIN="$PWD/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane" node test/protocol.test.mjs
+      # 打包链路冒烟：确认 deb 结构可产出（CI 不发布）
+      - name: Package Linux deb (smoke)
+        run: sh build/package.sh
+      - name: Inspect deb
+        run: |
+          ls -la build/dist
+          deb=$(ls build/dist/cipherlane_*_amd64.deb | head -n 1)
+          dpkg-deb -c "$deb" | grep -E 'usr/bin/(cipherlane|cipherlane-cli|cipherlane-tray)$'
+          dpkg-deb -c "$deb" | grep -E 'systemd/system/cipherlane.service$'

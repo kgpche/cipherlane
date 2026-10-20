@@ -1,100 +1,98 @@
 #!/bin/sh
-# cipherlane 多平台打包：一条命令产出 .deb(Rust musl 静态) / .exe(zip, Node SEA) / macOS(Node SEA)
-# Linux 已切换 Rust 实现（~0.9MB 静态单文件 + 系统托盘）；Windows/macOS 待交叉工具链后切换
+# cipherlane v1.0 打包脚本 —— 三平台产物全部为 Rust 二进制，构建/打包不依赖 Node。
 #
-#   sh build/package.sh [版本号]      # 默认取 package.json 的 version
+#   sh build/package.sh [版本号]       # 版本号默认取自 cipherlane-rs/Cargo.toml（唯一来源）
 #
-# 产物：build/dist/cipherlane_<ver>_amd64.deb          （Linux，内含 systemd 单元）
-#       build/dist/cipherlane_<ver>_windows_x64.zip    （Windows 单文件 exe）
-#       build/dist/cipherlane_<ver>_macos_universal.tar.gz（arm64+x64 双架构）
+# 按宿主平台自动产出（build/dist/）：
+#   Linux   → cipherlane_<ver>_amd64.deb
+#             musl 静态 server + tray + cli、systemd 单元、桌面入口、托盘自启
+#   macOS   → cipherlane_<ver>_macos_universal.tar.gz
+#             lipo 合并 x86_64 + arm64 的 server/cli，附 cipherlane.command 启动器
+#   Windows → cipherlane_<ver>_windows_x64.zip
+#             cipherlane.exe + cipherlane-cli.exe（静态 CRT，无 VC++ 运行库依赖）
 #
-# 依赖：node ≥22（生成 SEA blob）、curl、tar、zip/unzip、dpkg-deb；
-#      postject 已内置于 build/tools/（首次运行自动下载）。
-# 官方 Node 二进制会缓存到 build/，重复打包不重复下载。
-set -e
+# 依赖：cargo/rustup（stable）；Linux 另需 rustup musl target + dpkg-deb；
+#       macOS 需 Xcode 命令行工具（lipo）；Windows 在 Git Bash 中运行。
+# 每次运行都会刷新 build/dist/cipherlane-<ver>-SHA256SUMS.txt。
+set -eu
 cd "$(dirname "$0")/.."
-ROOT=$(pwd)
-BUILD=$ROOT/build
+
+BUILD=build
 DIST=$BUILD/dist
-NODE_VER=v22.22.1
-VER=${1:-$(node -p "require('./package.json').version")}
-FUSE=NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+MANIFEST=cipherlane-rs/Cargo.toml
+TARGET_DIR=cipherlane-rs/target
+ARTIFACTS=""   # 本次实际产出的文件（校验和只覆盖它们，避免把 dist 里旧版本/旧平台产物算进去）
+VER=${1:-$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$MANIFEST" | head -n 1)}
+[ -n "$VER" ] || { echo "✗ 无法从 $MANIFEST 解析版本号"; exit 1; }
+OS=$(uname -s)
+ARCH=$(uname -m)
 
 mkdir -p "$DIST"
 
-# ---------- 0) postject（纯 JS 二进制注入器，零全局依赖；sha256 固定校验） ----------
-POSTJECT_SHA=d1447b53e87d49ddaf7fb3350c870afafa72760eca47f6d5cce4cefd537e7d92
-COMMANDER_SHA=b64948bf68db38c26002a1a4b63b8ecb9a80e497e308fdaccbb179cf05142f52
-sha_verify() { # $1=期望 sha256 $2=文件
-  echo "$1  $2" | sha256sum -c - >/dev/null || { echo "✗ 校验失败: $2（供应链完整性无法确认）"; exit 1; }
-}
-if [ ! -f "$BUILD/tools/postject/dist/cli.js" ]; then
-  echo ">> 下载 postject…"
-  mkdir -p "$BUILD/tools/postject/node_modules/commander"
-  curl -sL -o /tmp/postject.tgz https://registry.npmjs.org/postject/-/postject-1.0.0-alpha.6.tgz
-  sha_verify "$POSTJECT_SHA" /tmp/postject.tgz
-  tar xzf /tmp/postject.tgz -C "$BUILD/tools/postject" --strip-components=1
-  curl -sL -o /tmp/commander.tgz https://registry.npmjs.org/commander/-/commander-9.5.0.tgz
-  sha_verify "$COMMANDER_SHA" /tmp/commander.tgz
-  tar xzf /tmp/commander.tgz -C "$BUILD/tools/postject/node_modules/commander" --strip-components=1
-fi
-POSTJECT="node $BUILD/tools/postject/dist/cli.js"
+need() { command -v "$1" >/dev/null 2>&1 || { echo "✗ 缺少命令: $1"; exit 1; }; }
+cargo_build() { cargo build --release --manifest-path "$MANIFEST" "$@"; }
 
-# ---------- 1) 官方 Node 二进制（缓存；下载后经官方 SHASUMS256.txt 校验） ----------
-curl -sL -o "$BUILD/SHASUMS256.txt" "https://nodejs.org/dist/$NODE_VER/SHASUMS256.txt"
-verify_from_shasums() { # $1=SHASUMS 中的归档名 $2=本地文件
-  want=$(grep " $1\$" "$BUILD/SHASUMS256.txt" | awk '{print $1}')
-  [ -n "$want" ] || { echo "✗ SHASUMS256.txt 中找不到 $1"; exit 1; }
-  echo "$want  $2" | sha256sum -c - >/dev/null || { echo "✗ 校验失败: $2"; exit 1; }
-}
-fetch_node() { # $1=文件名 $2=URL $3=解压后内部路径 $4=SHASUMS 中的归档名
-  if [ ! -f "$BUILD/$1" ]; then
-    echo ">> 下载 $2 …"
-    curl -sL -o "$BUILD/$1.dl" "$2"
-    verify_from_shasums "$4" "$BUILD/$1.dl"
-    case "$2" in
-      *.tar.xz) tar xJf "$BUILD/$1.dl" -C "$BUILD" && mv "$BUILD/$3" "$BUILD/$1" ;;
-      *.tar.gz) tar xzf "$BUILD/$1.dl" -C "$BUILD" && mv "$BUILD/$3" "$BUILD/$1" ;;
-      *.zip)    unzip -o -q "$BUILD/$1.dl" "$3" -d "$BUILD/tmp-zip" && mv "$BUILD/tmp-zip/$3" "$BUILD/$1" && rm -rf "$BUILD/tmp-zip" ;;
-    esac
-    rm -f "$BUILD/$1.dl"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"
+  else echo "✗ 缺少 sha256sum/shasum" >&2; exit 1
   fi
 }
-fetch_node node-linux  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz node-$NODE_VER-linux-x64/bin/node node-$NODE_VER-linux-x64.tar.xz
-fetch_node node-win    https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-win-x64.zip      node-$NODE_VER-win-x64/node.exe    node-$NODE_VER-win-x64.zip
-fetch_node node-mac-a  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-arm64.tar.gz node-$NODE_VER-darwin-arm64/bin/node node-$NODE_VER-darwin-arm64.tar.gz
-fetch_node node-mac-x  https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-darwin-x64.tar.gz   node-$NODE_VER-darwin-x64/bin/node   node-$NODE_VER-darwin-x64.tar.gz
 
-# ---------- 1.5) Rust 构建：musl 静态服务器 + musl 静态托盘（Linux deb 产物） ----------
-# 托盘也走 musl target：gnu target 会动态链接构建机的 glibc（曾达 GLIBC_2.39），
-# Ubuntu 22.04 / Debian 12 等旧发行版上直接加载失败。
-if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; then
-  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane || exit 1
-  PATH="$HOME/.cargo/bin:$PATH" cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml --bin cipherlane-tray || exit 1
-  RUST_SRV="$ROOT/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane"
-  RUST_TRAY="$ROOT/cipherlane-rs/target/x86_64-unknown-linux-musl/release/cipherlane-tray"
-else
-  echo "!! 未安装 Rust 工具链，Linux deb 将回退 Node SEA 版（rustup.rs 安装后重打包可切换）"
-  RUST_SRV=""
-fi
+write_sums() {
+  ( cd "$DIST"
+    for f in $ARTIFACTS; do sha256_of "$f"; done > "cipherlane-$VER-SHA256SUMS.txt" )
+  echo ">> 校验和: $DIST/cipherlane-$VER-SHA256SUMS.txt"
+}
 
-# ---------- 2) SEA blob（跨平台共享；关 code cache 保证跨平台兼容） ----------
-echo ">> 生成 SEA blob…"
-node --experimental-sea-config sea-config.json
+# zip 三选一（Windows Git Bash 通常只有 powershell.exe）
+make_zip() { # $1=输出 zip；其余=要打包的文件（当前目录）
+  out=$1; shift
+  rm -f "$out"
+  if command -v zip >/dev/null 2>&1; then
+    zip -q -9 "$out" "$@"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -mx=9 "$out" "$@" >/dev/null
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    winout=$(cygpath -w "$out")
+    winpaths=""
+    for f in "$@"; do winpaths="$winpaths,'$(cygpath -w "$f")'"; done
+    powershell.exe -NoProfile -Command "Compress-Archive -Force -DestinationPath '$winout' -Path @(${winpaths#,})"
+  else
+    echo "✗ 无法创建 zip：缺少 zip / 7z / powershell.exe"
+    exit 1
+  fi
+}
 
-# ---------- 3) Linux：SEA 二进制 → .deb ----------
-echo ">> 打包 Linux .deb…"
-cp "$BUILD/node-linux" "$BUILD/cipherlane-linux-x64"
-chmod +x "$BUILD/cipherlane-linux-x64"
-$POSTJECT "$BUILD/cipherlane-linux-x64" NODE_SEA_BLOB "$BUILD/sea-prep.blob" --sentinel-fuse $FUSE >/dev/null
-DEBROOT=$BUILD/deb-root
-rm -rf "$DEBROOT"
-mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system" "$DEBROOT/usr/share/applications" "$DEBROOT/usr/share/icons/hicolor/scalable/apps"
-# 桌面集成:应用列表显示"cipherlane 密道",点击即在终端窗口运行服务器(显示地址与二维码)
-cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane.svg"
-cp logo/02-shield-lane-stopped.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane-stopped.svg"
-mkdir -p "$DEBROOT/usr/lib/cipherlane"
-cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'EOF'
+# ================= Linux：musl 静态二进制 + .deb =================
+package_linux() {
+  [ "$ARCH" = "x86_64" ] || { echo "✗ Linux 产物目前仅支持 x86_64（当前 $ARCH）"; exit 1; }
+  need cargo
+  need dpkg-deb
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+  fi
+  echo ">> 构建 Linux musl 静态二进制（server / tray / cli）…"
+  cargo_build --target x86_64-unknown-linux-musl
+  REL=$TARGET_DIR/x86_64-unknown-linux-musl/release
+  for b in cipherlane cipherlane-tray cipherlane-cli; do
+    [ -x "$REL/$b" ] || { echo "✗ 缺少产物: $REL/$b"; exit 1; }
+  done
+
+  DEBROOT=$BUILD/deb-root
+  rm -rf "$DEBROOT"
+  mkdir -p "$DEBROOT/DEBIAN" "$DEBROOT/usr/bin" "$DEBROOT/usr/lib/systemd/system" \
+    "$DEBROOT/usr/share/applications" "$DEBROOT/usr/share/icons/hicolor/scalable/apps"
+  cp "$REL/cipherlane" "$DEBROOT/usr/bin/cipherlane"
+  cp "$REL/cipherlane-cli" "$DEBROOT/usr/bin/cipherlane-cli"
+  cp "$REL/cipherlane-tray" "$DEBROOT/usr/bin/cipherlane-tray"
+  chmod 755 "$DEBROOT/usr/bin/cipherlane" "$DEBROOT/usr/bin/cipherlane-cli" "$DEBROOT/usr/bin/cipherlane-tray"
+  cp logo/02-shield-lane.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane.svg"
+  cp logo/02-shield-lane-stopped.svg "$DEBROOT/usr/share/icons/hicolor/scalable/apps/cipherlane-stopped.svg"
+
+  # 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板
+  mkdir -p "$DEBROOT/usr/lib/cipherlane"
+  cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'APP'
 #!/bin/sh
 # cipherlane 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板
 PORT=${CIPHERLANE_PORT:-7777}
@@ -110,15 +108,15 @@ if ! probe; then
   if probe; then
     exec xdg-open "$URL/panel#$TOKEN"
   fi
-  # 启动失败（多半是端口被旧实例占用）：明示原因,不再静默打开死页
   MSG="密道启动失败。常见原因：端口 $PORT 被旧实例占用（fuser -k $PORT/tcp 后重试）。日志：$LOGDIR/app.log"
   if command -v zenity >/dev/null 2>&1; then zenity --error --title cipherlane --text "$MSG" 2>/dev/null; fi
   exit 1
 fi
 exec xdg-open "$URL/panel"
-EOF
-chmod 755 "$DEBROOT/usr/lib/cipherlane/cipherlane-app"
-cat > "$DEBROOT/usr/share/applications/cipherlane.desktop" << 'EOF'
+APP
+  chmod 755 "$DEBROOT/usr/lib/cipherlane/cipherlane-app"
+
+  cat > "$DEBROOT/usr/share/applications/cipherlane.desktop" << 'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=cipherlane
@@ -132,11 +130,8 @@ Categories=Network;FileTransfer;Utility;
 Keywords=lan;transfer;encrypt;airdrop;密道;传输;加密;
 StartupNotify=true
 X-GNOME-UsesNotifications=false
-EOF
-if [ -n "$RUST_SRV" ]; then
-  cp "$RUST_SRV" "$DEBROOT/usr/bin/cipherlane"
-  cp "$RUST_TRAY" "$DEBROOT/usr/bin/cipherlane-tray"
-  chmod 755 "$DEBROOT/usr/bin/cipherlane" "$DEBROOT/usr/bin/cipherlane-tray"
+DESKTOP
+
   mkdir -p "$DEBROOT/etc/xdg/autostart"
   cat > "$DEBROOT/etc/xdg/autostart/cipherlane-tray.desktop" << 'AUTOSTART'
 [Desktop Entry]
@@ -148,11 +143,8 @@ Icon=cipherlane
 Terminal=false
 NoDisplay=true
 AUTOSTART
-else
-  cp "$BUILD/cipherlane-linux-x64" "$DEBROOT/usr/bin/cipherlane"
-  chmod 755 "$DEBROOT/usr/bin/cipherlane"
-fi
-cat > "$DEBROOT/usr/lib/systemd/system/cipherlane.service" << 'EOF'
+
+  cat > "$DEBROOT/usr/lib/systemd/system/cipherlane.service" << 'UNIT'
 [Unit]
 Description=cipherlane · 密道 —— 局域网端到端加密传输
 After=network.target
@@ -180,8 +172,9 @@ LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-cat > "$DEBROOT/DEBIAN/control" << EOF
+UNIT
+
+  cat > "$DEBROOT/DEBIAN/control" << CONTROL
 Package: cipherlane
 Version: $VER
 Section: net
@@ -189,12 +182,13 @@ Priority: optional
 Architecture: amd64
 Maintainer: kgpche <341253778+kgpche@users.noreply.github.com>
 Description: cipherlane · 密道 —— 局域网端到端加密传输
- 自包含单文件服务（内嵌 Node 运行时与全部前端资源），安装即用、无需 Node。
+ 自包含 Rust 静态二进制（内嵌全部前端资源），安装即用、无运行时依赖。
  安装后执行: sudo systemctl enable --now cipherlane
  然后浏览器打开 http://<本机IP>:7777
 Recommends: gnome-shell-extension-appindicator
-EOF
-cat > "$DEBROOT/DEBIAN/postinst" << 'POSTINST'
+CONTROL
+
+  cat > "$DEBROOT/DEBIAN/postinst" << 'POSTINST'
 #!/bin/sh
 systemctl daemon-reload 2>/dev/null || true
 # GNOME:启用 Ubuntu 自带的 appindicator 扩展,让系统托盘图标可见(无桌面会话时静默跳过)
@@ -206,37 +200,43 @@ echo "  cipherlane 已安装。应用列表点击 cipherlane,或等托盘图标(
 echo
 exit 0
 POSTINST
-chmod 755 "$DEBROOT/DEBIAN/postinst"
-dpkg-deb --build --root-owner-group "$DEBROOT" "$DIST/cipherlane_${VER}_amd64.deb" >/dev/null
+  chmod 755 "$DEBROOT/DEBIAN/postinst"
 
-# ---------- 4) Windows：SEA 注入 node.exe → cipherlane.exe（zip） ----------
-echo ">> 打包 Windows exe…"
-cp "$BUILD/node-win" "$BUILD/cipherlane.exe"
-$POSTJECT "$BUILD/cipherlane.exe" NODE_SEA_BLOB "$BUILD/sea-prep.blob" --sentinel-fuse $FUSE >/dev/null 2>&1
-rm -f "$DIST/cipherlane_${VER}_windows_x64.zip"
-(cd "$BUILD" && zip -q -9 "$DIST/cipherlane_${VER}_windows_x64.zip" cipherlane.exe)
+  rm -f "$DIST/cipherlane_${VER}_amd64.deb"
+  dpkg-deb --build --root-owner-group "$DEBROOT" "$DIST/cipherlane_${VER}_amd64.deb" >/dev/null
+  ARTIFACTS="cipherlane_${VER}_amd64.deb"
+  echo ">> 已产出: $DIST/cipherlane_${VER}_amd64.deb"
+}
 
-# ---------- 5) macOS：源码 + 双架构 node + 双击 .command（通用包） ----------
-echo ">> 打包 macOS 通用包…"
-PKG=$BUILD/macos-root/cipherlane
-rm -rf "$BUILD/macos-root"
-mkdir -p "$PKG/app"
-cp server.js package.json "$PKG/app/"
-cp -r public logo "$PKG/app/"
-# 内层 Node 运行时带项目前缀:拖出文件夹也能认出归属
-cp "$BUILD/node-mac-a" "$PKG/cipherlane-node-arm64"
-cp "$BUILD/node-mac-x" "$PKG/cipherlane-node-x64"
-chmod +x "$PKG/cipherlane-node-arm64" "$PKG/cipherlane-node-x64"
-cat > "$PKG/cipherlane.command" << 'EOF'
+# ================= macOS：universal2（server + cli） =================
+package_macos() {
+  need cargo
+  need lipo
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
+  fi
+  for t in x86_64-apple-darwin aarch64-apple-darwin; do
+    echo ">> 构建 macOS $t（server / cli）…"
+    cargo_build --target "$t" --bin cipherlane --bin cipherlane-cli
+  done
+  STAGE=$BUILD/macos-root/cipherlane
+  rm -rf "$BUILD/macos-root"
+  mkdir -p "$STAGE"
+  for b in cipherlane cipherlane-cli; do
+    lipo -create \
+      "$TARGET_DIR/x86_64-apple-darwin/release/$b" \
+      "$TARGET_DIR/aarch64-apple-darwin/release/$b" \
+      -output "$STAGE/$b"
+    chmod 755 "$STAGE/$b"
+  done
+  cat > "$STAGE/cipherlane.command" << 'CMD'
 #!/bin/sh
 # 双击启动密道服务器（Terminal 中显示地址与二维码，Ctrl+C 退出）
 cd "$(dirname "$0")"
-ARCH=$(uname -m)
-if [ "$ARCH" = "arm64" ]; then NODE=./cipherlane-node-arm64; else NODE=./cipherlane-node-x64; fi
-exec "$NODE" app/server.js "$@"
-EOF
-chmod +x "$PKG/cipherlane.command"
-cat > "$PKG/README.txt" << 'EOF'
+exec ./cipherlane "$@"
+CMD
+  chmod 755 "$STAGE/cipherlane.command"
+  cat > "$STAGE/README.txt" << 'README'
 cipherlane · 密道（macOS 版）
 ================================
 启动：双击 cipherlane.command
@@ -244,15 +244,62 @@ cipherlane · 密道（macOS 版）
       （或在终端执行 xattr -dr com.apple.quarantine . 解除隔离）
 使用：浏览器打开启动后打印的局域网地址，或手机扫终端里的二维码
 停止：终端 Ctrl+C
-内含 Apple Silicon (arm64) 与 Intel (x64) 双架构运行时，无需安装 Node。
+自带 Apple Silicon (arm64) 与 Intel (x64) 双架构 server 与 CLI（cipherlane-cli），无需安装运行时。
+
+CLI 示例：
+  ./cipherlane-cli devices --server http://127.0.0.1:7777
+  ./cipherlane-cli send big.zip --server http://127.0.0.1:7777
 
 如需制作 .dmg：在任意 Mac 上执行
   hdiutil create -volname cipherlane -srcfolder cipherlane -ov -format UDZO cipherlane.dmg
-EOF
-tar czf "$DIST/cipherlane_${VER}_macos_universal.tar.gz" -C "$BUILD/macos-root" cipherlane
+README
+  rm -f "$DIST/cipherlane_${VER}_macos_universal.tar.gz"
+  tar czf "$DIST/cipherlane_${VER}_macos_universal.tar.gz" -C "$BUILD/macos-root" cipherlane
+  ARTIFACTS="cipherlane_${VER}_macos_universal.tar.gz"
+  echo ">> 已产出: $DIST/cipherlane_${VER}_macos_universal.tar.gz"
+}
 
+# ================= Windows：x64 原生（server + cli） =================
+package_windows() {
+  need cargo
+  echo ">> 构建 Windows x64（server / cli，静态 CRT）…"
+  # 静态 CRT：产物不依赖 VC++ 运行库，解压即用（子 shell 内生效，不影响其他平台）
+  (
+    RUSTFLAGS="-C target-feature=+crt-static"
+    export RUSTFLAGS
+    cargo_build --bin cipherlane --bin cipherlane-cli
+  )
+  REL=$TARGET_DIR/release
+  for b in cipherlane.exe cipherlane-cli.exe; do
+    [ -f "$REL/$b" ] || { echo "✗ 缺少产物: $REL/$b"; exit 1; }
+  done
+  STAGE=$BUILD/win-root
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE"
+  cp "$REL/cipherlane.exe" "$REL/cipherlane-cli.exe" "$STAGE/"
+  cat > "$STAGE/README.txt" << 'README'
+cipherlane · 密道（Windows 版）
+================================
+启动：双击 cipherlane.exe（控制台显示局域网地址与二维码），Ctrl+C 退出
+使用：浏览器打开启动后打印的局域网地址；其他设备需在同一 WiFi/网段
+CLI：cipherlane-cli.exe devices --server http://127.0.0.1:7777
+     cipherlane-cli.exe send big.zip --server http://127.0.0.1:7777
+说明：单文件静态 CRT，无需安装 Node 或 VC++ 运行库；Windows 10/11 x64。
+README
+  ( cd "$STAGE" && make_zip "../dist/cipherlane_${VER}_windows_x64.zip" cipherlane.exe cipherlane-cli.exe README.txt )
+  ARTIFACTS="cipherlane_${VER}_windows_x64.zip"
+  echo ">> 已产出: $DIST/cipherlane_${VER}_windows_x64.zip"
+}
+
+# ================= 分发 =================
+case "$OS" in
+  Linux*)                       package_linux ;;
+  Darwin*)                      package_macos ;;
+  MINGW*|MSYS*|CYGWIN*)         package_windows ;;
+  *) echo "✗ 不支持的宿主平台: $OS"; exit 1 ;;
+esac
+
+write_sums
 echo
-echo "✓ 打包完成："
-# 发布校验和：随 Release 一起公布，供下载方验证完整性
-( cd "$DIST" && sha256sum cipherlane_* > "cipherlane-${VER}-SHA256SUMS.txt" )
-ls -la "$DIST"
+echo "✓ 打包完成（cipherlane $VER，$OS/$ARCH）"
+for f in $ARTIFACTS; do ls -la "$DIST/$f"; done

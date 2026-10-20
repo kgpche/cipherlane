@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-8%20suites%20passing-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -53,9 +53,12 @@ One LAN IP = one device: each device gets a **name** (editable), a **geometric a
 
 ## Quick Start
 
+Install the package for your platform (see [Packaging & Deployment](#packaging--deployment)), or build from source with a Rust toolchain:
+
 ```bash
-node server.js            # or: npm start. Default port 7777 (PORT= to change);
-                          # binds 127.0.0.1 + LAN (RFC1918) interfaces by default (HOST=0.0.0.0 for all interfaces)
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml
+./cipherlane-rs/target/release/cipherlane   # default port 7777 (PORT= to change);
+                                            # binds 127.0.0.1 + LAN (RFC1918) interfaces by default (HOST=0.0.0.0 for all interfaces)
 ```
 
 The server prints its LAN address (e.g. `http://192.168.1.117:7777`). On any device on the **same Wi-Fi**, open it in a browser:
@@ -63,16 +66,16 @@ The server prints its LAN address (e.g. `http://192.168.1.117:7777`). On any dev
 1. Set your name on the home page → the other side appears under "online devices"
 2. Select a device → drop a file / paste text → the other side gets an invitation card (with the decrypted file name and size) → accept to receive
 
-Machines without a browser can use the CLI (fully interoperable with the web UI):
+Machines without a browser can use the native CLI `cipherlane-cli` (fully interoperable with the web UI):
 
 ```bash
-node cli.mjs devices --server http://192.168.1.117:7777        # list online devices
-node cli.mjs send big.zip --to 192.168.1.50 --server http://... # direct send (no link needed)
-node cli.mjs send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # pin the target fingerprint
-node cli.mjs listen --yes -o ~/downloads --server http://...    # resident receiver (can be direct-sent to)
-node cli.mjs send big.zip --server http://...                   # link mode: prints a receive link
-node cli.mjs send a.zip dir/ --server http://...                 # batch: multiple paths + recursive directories
-node cli.mjs recv 'http://.../#ROOM.KEY' [-o output path]       # link-mode receive
+cipherlane-cli devices --server http://192.168.1.117:7777        # list online devices
+cipherlane-cli send big.zip --to 192.168.1.50 --server http://... # direct send (no link needed)
+cipherlane-cli send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # pin the target fingerprint
+cipherlane-cli listen --yes -o ~/downloads --server http://...    # resident receiver (can be direct-sent to)
+cipherlane-cli send big.zip --server http://...                   # link mode: prints a receive link
+cipherlane-cli send a.zip dir/ --server http://...                 # batch: multiple paths + recursive directories
+cipherlane-cli recv 'http://.../#ROOM.KEY' [-o output path]       # link-mode receive
 ```
 
 ## How It Works & Protocol
@@ -92,7 +95,7 @@ Sender browser/CLI                    LAN (plain HTTP, sniffable)             Re
 
 </details>
 
-**Protocol at a glance** (all endpoints in `server.js`; limits are defaults):
+**Protocol at a glance** (all endpoints in `cipherlane-rs/src/main.rs`; limits are defaults):
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -137,25 +140,25 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, 64 rooms / 96 MB
 - Room ids travel in plaintext HTTP requests: on fully sniffable networks an attacker can pull chunks (ciphertext they cannot decrypt) — in resumable rooms chunks are read-only, so stealing no longer starves the receiver; forging progress reports can still cut a transfer (availability-level, same class as before). Confidentiality is unaffected
 - Multiple **different browsers** on one IP: the device entry belongs to the last one to register (same-browser tabs share the secret and coexist)
 
-**How encryption works over plain http**: browsers only expose `crypto.subtle` in secure contexts. This project ships pure-JS implementations and degrades automatically: AES-256-GCM (`public/aesgcm.js`), SHA-256 (`public/sha256.js`), X25519 (`public/x25519.js`, BigInt + RFC 7748 Montgomery ladder). On localhost/https, AES uses native WebCrypto. The pure-JS output is byte-identical to node:crypto (verified by tests).
+**How encryption works over plain http**: browsers only expose `crypto.subtle` in secure contexts. This project ships pure-JS implementations and degrades automatically: AES-256-GCM (`public/aesgcm.js`), SHA-256 (`public/sha256.js`), X25519 (`public/x25519.js`, BigInt + RFC 7748 Montgomery ladder). On localhost/https, AES uses native WebCrypto. The pure-JS output is byte-identical to the Node native implementation (verified by the test suite; Node is only the test runner).
 
 ## Packaging & Deployment
 
-One command produces installers for three platforms (target machines **do not need Node**):
+One command per platform produces the release artifacts; target machines need **no runtime installed** (native Rust binaries, frontend embedded at compile time):
 
 ```bash
-sh build/package.sh            # artifacts in build/dist/
+sh build/package.sh            # artifacts in build/dist/ (run natively on Linux / macOS / Windows Git Bash)
 ```
 
 | Artifact | Platform | Install / use |
 | --- | --- | --- |
-| `cipherlane_<v>_amd64.deb` | Linux x64 (Ubuntu/Debian) | `sudo dpkg -i …deb && sudo systemctl enable --now cipherlane` (ships a systemd unit, starts on boot) |
-| `cipherlane_<v>_windows_x64.zip` | Windows x64 | Unzip and double-click `cipherlane.exe` (console shows address + QR code) |
-| `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | Unzip and double-click `cipherlane.command` (if Gatekeeper complains: right-click → Open) |
+| `cipherlane_<v>_amd64.deb` | Linux x64 (Ubuntu/Debian) | `sudo dpkg -i …deb && sudo systemctl enable --now cipherlane` (ships a systemd unit, desktop entry and tray autostart; installs `cipherlane`, `cipherlane-cli`, `cipherlane-tray`) |
+| `cipherlane_<v>_windows_x64.zip` | Windows x64 | Unzip and double-click `cipherlane.exe` (console shows address + QR code); `cipherlane-cli.exe` is the CLI |
+| `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | Unzip and double-click `cipherlane.command` (if Gatekeeper complains: right-click → Open); `cipherlane-cli` is the CLI |
 
-Built with **Rust on Linux** (static musl single file: server ≈0.95MB + tray, deb ≈1.1MB, no glibc/Node dependency) and Node **SEA (single executable applications)** on Windows/macOS, where the server and all frontend assets are embedded into official Node binaries (Windows zip ≈33MB, macOS dual-arch bundle ≈75MB). The build script caches official binaries and postject, verifies downloads against SHASUMS256. **Naming convention**: artifacts are `cipherlane_<version>_<platform>.<format>`, checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; the startup banner and page footer both carry the version — quote it when reporting issues.
+**All three platforms ship the same Rust implementation** — server, CLI and (on Linux) the system tray. The web UI is compiled into the server with `include_bytes!`, so one static binary serves everything; there is no Node dependency at build or run time. Linux uses static musl (server ≈0.95 MB, tray ≈2.3 MB, deb ≈1.3 MB); the Windows zip and macOS universal bundle are native release builds — actual sizes are printed by the release workflow. Every run writes `cipherlane-<version>-SHA256SUMS.txt`; tag builds publish a unified checksum alongside the three artifacts. **Naming convention**: artifacts are `cipherlane_<version>_<platform>.<format>`; the startup banner and page footer both carry the version — quote it when reporting issues.
 
-Source deployment stays zero-dependency: `node server.js` (Node ≥ 18).
+Source build (Rust toolchain only): `cargo build --release --manifest-path cipherlane-rs/Cargo.toml`.
 
 ## Browser Compatibility
 
@@ -165,7 +168,7 @@ Source deployment stays zero-dependency: `node server.js` (Node ≥ 18).
 | Streaming save (optional) | Chromium-based browsers support `showSaveFilePicker`; others fall back to in-memory download |
 | Paste-to-send (optional) | Any modern browser with clipboard events; on mobile, long-press paste into the text box |
 
-The CLI needs Node ≥ 18 (native X25519 and AES-GCM).
+The CLI is a native binary (`cipherlane-cli`); no runtime is required.
 
 ## FAQ
 
@@ -173,7 +176,7 @@ The CLI needs Node ≥ 18 (native X25519 and AES-GCM).
 Static assets are loaded into memory at server start, and the browser may reuse an old tab — **close and reopen the tab** or hard-refresh (Ctrl+Shift+R).
 
 **`EADDRINUSE: 7777` on startup?**
-The port is taken. Start with `PORT=7788 node server.js`, or stop the old process.
+The port is taken. Start with `PORT=7788 ./cipherlane` (source build) or set `PORT` in the systemd unit, or stop the old process.
 
 **My phone can't see devices / others can't see me?**
 All devices must be on the **same Wi-Fi/subnet**; check that the OS firewall allows the port (Windows asks once); make sure you opened the LAN address printed at startup, not `127.0.0.1` (loopback is local-only).
@@ -197,29 +200,34 @@ Encryption runs in a ×4 worker pool; a single worker does ~22 MB/s (after T-tab
 
 ```
 cipherlane/
-├── server.js           # zero-dependency relay: rooms + presence + invitations (Node builtins only)
-├── cli.mjs             # CLI: devices / direct send / listen / link send & receive
-├── sea-config.json     # SEA single-executable config (asset manifest)
-├── cipherlane-rs/      # Rust server + system tray (shipped in the Linux deb; protocol-parity tested)
-├── scripts/            # consistency checks (version / SEA assets ↔ server.js / test files)
-├── build/package.sh    # one-shot packaging: .deb / Windows exe / macOS universal
-├── logo/               # logo art (main + favicon master)
-├── docs/screenshots/   # README screenshots
-├── public/
-│   ├── index.html      # SPA (device grid · geometric avatars · invitation cards · dual receive layouts)
-│   ├── app.js          # send/receive logic + dual crypto paths + X25519 identity
-│   ├── aesgcm.js       # pure-JS AES-256-GCM (plain-http fallback path)
-│   ├── sha256.js       # pure-JS SHA-256 (KDF)
-│   ├── x25519.js       # pure-JS X25519 (device-direct key agreement)
-│   ├── avatar.js       # geometric avatars (Material-flat, deterministic from IP)
+├── cipherlane-rs/          # the whole product: Rust server + CLI + Linux tray (single implementation)
+│   ├── Cargo.toml          # version + the three bins (cipherlane / cipherlane-cli / cipherlane-tray)
+│   └── src/
+│       ├── main.rs         # relay server (rooms / presence / invitations) + embedded web UI
+│       └── bin/            # cli.rs (cipherlane-cli) · tray.rs (cipherlane-tray, Linux only)
+├── public/                 # browser frontend (vanilla JS; pure-JS crypto for plain-HTTP contexts)
+│   ├── index.html          # SPA (device grid · geometric avatars · invitation cards · dual receive layouts)
+│   ├── app.js              # send/receive logic + dual crypto paths + X25519 identity
+│   ├── aesgcm.js           # pure-JS AES-256-GCM (plain-http fallback path)
+│   ├── sha256.js           # pure-JS SHA-256 (KDF)
+│   ├── x25519.js           # pure-JS X25519 (device-direct key agreement)
+│   ├── avatar.js           # geometric avatars (Material-flat, deterministic from IP)
 │   └── style.css
-└── test/               # eight suites: aesgcm / sha256 / x25519 / qrcode / avatar / protocol / cli / browser
+├── scripts/                # consistency checks (version / include_bytes ↔ public / no Node leftovers)
+├── build/package.sh        # one-shot packaging: .deb / Windows zip / macOS universal
+├── logo/                   # logo art (main + favicon master)
+├── docs/screenshots/       # README screenshots
+└── test/                   # eight suites (Node is only the test runner)
 ```
 
 ## Tests
 
+The test suite drives the real Rust binaries (server + CLI) and a real headless Chrome for the browser suite. **Node ≥ 18 is only the test runner** — it is not needed to build or run the product.
+
 ```bash
-npm test    # or run individually: node test/<name>.test.mjs
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml   # or: npm run build
+npm test                   # auto-builds first (pretest); or run individually: node test/<name>.test.mjs
+cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust unit tests (or: npm run test:cargo)
 ```
 
 - **aesgcm**: FIPS-197 S-box vectors, GHASH cross-validation, byte-identical to node:crypto for 0B–1MiB (including AAD and tamper rejection)
@@ -227,11 +235,19 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **x25519**: RFC 7748 vectors + 200 random pairs vs node ECDH (both directions), small-order rejection
 - **qrcode**: RS algebra self-checks, finder/timing/format structure assertions
 - **avatar**: determinism, neighbor-IP distinctness, palette & luminance constraints
-- **protocol**: spawns a real server; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/bind surface/link mode end to end
-- **cli**: real-subprocess end-to-end — single file / recursive directory batch (nested · CJK names · empty files · hidden entries skipped) / mixed paths / text, byte-level comparison
+- **protocol**: runs the real Rust server binary; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/ETag/Host checks/link mode end to end (also run directly by CI against the musl release binary)
+- **cli**: real-subprocess end-to-end against `cipherlane-cli` + the Rust server — single file / recursive directory batch (nested · CJK names · empty files · hidden entries skipped) / mixed paths / text / SIGKILL-resume, byte-level comparison
 - **browser**: CDP-driven real-Chrome smoke tests (two-page send/receive, error paths, worker-pool assertion); auto-skips when no browser is available
 
 ## Changelog
+
+**v1.0.0** (2026-10-20, single implementation)
+- **Node is gone from the product**: server, CLI and tray are now one Rust implementation. The Node relay/CLI and the Node single-executable packaging path are removed; Node remains only the test runner for the JS frontend suite
+- **Native Rust CLI** replaces the Node CLI with the same command surface (`devices` / `send` / `send-text` / `recv` / `listen`; `--to`, `--verify`, `--name`, `--server`, `-o`, `--yes`), protocol v2 AAD + v1 fallback, link-mode resume, batch/directory sends, 128-bit TOFU fingerprints and control-character sanitisation
+- **Three-platform Rust artifacts built natively**: Linux deb (musl static server/tray/cli, ≈1.3 MB), Windows x64 zip (`cipherlane.exe` + `cipherlane-cli.exe`, static CRT), macOS universal tar.gz (`lipo` arm64+x64) — no Node and no binary-injection step anywhere
+- **Release automation**: pushing a `v*` tag builds every platform on GitHub-hosted runners and publishes the artifacts plus a unified SHA256SUMS with the official `gh` CLI; manual dispatch only builds artifacts
+- **CI**: Rust build (three bins) + `cargo test` + musl protocol parity + deb packaging smoke, plus the full JS suite on Node 18/20/22; the consistency check now validates version alignment, `include_bytes!` assets and that no Node implementation references remain
+- **Docs**: README (en/zh) and the migration document rewritten for the Rust-only product
 
 **v0.5.1** (2026-10-19, reliability)
 - **Idempotent chunk delivery**: optional `X-Chunk-Seq` header; browser/CLI timeout and backpressure retries reuse the same sequence, so the server accepts each chunk exactly once — no duplicate or misaligned chunks when a response is lost. Implemented identically in the Node and Rust servers
@@ -244,7 +260,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 - **Server hardening**: Host/Origin validation for `/api/*` (anti-CSRF/DNS-rebinding); per-IP quotas for rooms/bytes/create-rate (64 rooms / 96 MB / 120 per minute); constant-time token comparison; `/api/update` 5-minute cache + semver comparison; device-name control-character filtering; graceful SIGTERM shutdown
 - **Performance/reliability**: static assets use ETag/304 revalidation (HTML stays no-store); 413 is now actually reachable; chunk head advances only in order; FSA streaming save is actually enabled and survives a refresh; writes arriving during room destruction return 410 (fixes a global memory-accounting leak); Rust backpressure-accounting race and destroy-leak fixed
 - **Packaging**: Linux deb ships a musl static tray (no GLIBC_2.39 dependency); systemd binds loopback+LAN by default
-- **Tooling**: CI builds Rust and runs protocol parity plus version/SEA-asset consistency; the accidentally committed 800 MB Rust build output is gone from the repo
+- **Tooling**: CI builds Rust and runs protocol parity plus version/embedded-asset consistency; the accidentally committed 800 MB Rust build output is gone from the repo
 
 **v0.4.3** (2026-10-15, hotfix)
 - Fixed: custom `display` (flex/grid) rules override the browser's default `[hidden]{display:none}`, silently defeating the hidden attribute. A full audit found 6 elements affected: the confirmation modal overlay added in v0.4.1 **popped up full-screen on every refresh** (empty title and body), plus 5 long-standing cases (send-target row / QR box / receive-from row / file card / action button groups) rendering as stray empty boxes. A one-line defensive reset `[hidden]{display:none!important}` fixes all of them
@@ -257,7 +273,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 **v0.4.1** (2026-10-15)
 - Device bar redesigned: wrapping grid → **single horizontal row + name/IP search** (search box appears above 6 devices, Enter selects the match) — with 15 devices the send area returns above the fold (measured 413px, down from ~1300px); desktop wheel scrolls horizontally on the row; heartbeat re-renders no longer reset scroll position; devices sorted by name (zh collation)
 - Fixes: fixed 128px card width clipped the fingerprint tail (now content-driven, zero clipping by pixel assertion); returning to the landing page after receiving didn't refresh (late offers now render, devices refresh immediately, the stale `#ROOM.KEY` fragment is cleared from the address bar)
-- Naming convention completed: checksums `cipherlane-<version>-SHA256SUMS.txt`, macOS inner runtimes `cipherlane-node-<arch>`; startup banner and page footer carry the version (package.json embedded into SEA so packaged binaries can read it)
+- Naming convention completed: checksums `cipherlane-<version>-SHA256SUMS.txt`; startup banner and page footer carry the version (embedded at compile time so packaged binaries can read it)
 
 **v0.4.0** (2026-10-13)
 - Resume support (link mode; server stays zero-persistence, privacy model unchanged): chunks switch from consume-on-read to replayable — with `X-Resume` the room's GETs become read-only, and a new `POST /progress` endpoint frees buffers per the receiver's persisted position; backpressure window and memory bounds unchanged
@@ -308,6 +324,7 @@ npm test    # or run individually: node test/<name>.test.mjs
 
 ## Roadmap
 
+- [x] Single implementation: Rust server + native CLI + Linux tray, three-platform Rust artifacts, Node reduced to the test runner — v1.0.0
 - [x] Pure-JS AES performance work (AES T-tables + 8-bit windowed GHASH + per-key caching; single worker 9.3 → 22 MB/s) — v0.3.1
 - [x] QR codes for receive links (scan with a phone) — v0.2.1
 - [x] Multi-file / directory transfers (manifest + sequential chunks in one room; folder picker / recursive CLI; browser ↔ CLI interop) — v0.3.0

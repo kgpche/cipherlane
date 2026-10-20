@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-0.5.1-37d4a0) ![node](https://img.shields.io/badge/node-%E2%89%A518-4285f4) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-8%E5%A5%97%E5%85%A8%E8%BF%87-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -53,8 +53,11 @@
 
 ## 快速开始
 
+安装对应平台的发行包（见[打包与部署](#打包与部署多平台分发)），或直接用 Rust 工具链从源码构建：
+
 ```bash
-node server.js            # 或 npm start；默认端口 7777（PORT= 可改），默认只绑 127.0.0.1 与局域网网卡（HOST=0.0.0.0 恢复全网卡）
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml
+./cipherlane-rs/target/release/cipherlane   # 默认端口 7777（PORT= 可改），默认只绑 127.0.0.1 与局域网网卡（HOST=0.0.0.0 恢复全网卡）
 ```
 
 启动后打印局域网地址（如 `http://192.168.1.117:7777`）。其他设备连**同一 WiFi** 用浏览器打开：
@@ -62,16 +65,16 @@ node server.js            # 或 npm start；默认端口 7777（PORT= 可改）�
 1. 首页改好你的名字 → 对方出现在"在线设备"里
 2. 点选设备 → 拖入文件 / 粘贴文本 → 对方页面弹出邀请卡片（含解密后的文件名与大小）→ 接受即收
 
-无浏览器的机器用 CLI（与浏览器完全互通）：
+无浏览器的机器用原生 CLI `cipherlane-cli`（与浏览器完全互通）：
 
 ```bash
-node cli.mjs devices --server http://192.168.1.117:7777        # 查看在线设备
-node cli.mjs send big.zip --to 192.168.1.50 --server http://... # 定向直发（无需传链接）
-node cli.mjs send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # 核对目标指纹（防调包）
-node cli.mjs listen --yes -o ~/downloads --server http://...    # 常驻接收端（可被直发）
-node cli.mjs send big.zip --server http://...                   # 链接模式：打印接收链接
-node cli.mjs send a.zip dir/ --server http://...                 # 批量：多路径与目录递归（浏览器互通）
-node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模式接收
+cipherlane-cli devices --server http://192.168.1.117:7777        # 查看在线设备
+cipherlane-cli send big.zip --to 192.168.1.50 --server http://... # 定向直发（无需传链接）
+cipherlane-cli send big.zip --to 192.168.1.50 --verify 3f2a9c1b --server http://... # 核对目标指纹（防调包）
+cipherlane-cli listen --yes -o ~/downloads --server http://...    # 常驻接收端（可被直发）
+cipherlane-cli send big.zip --server http://...                   # 链接模式：打印接收链接
+cipherlane-cli send a.zip dir/ --server http://...                 # 批量：多路径与目录递归（浏览器互通）
+cipherlane-cli recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模式接收
 ```
 
 ## 工作原理与协议
@@ -91,7 +94,7 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 
 </details>
 
-**协议一览**（全部端点见 `server.js`，限额为默认值）：
+**协议一览**（全部端点见 `cipherlane-rs/src/main.rs`，限额为默认值）：
 
 | 端点 | 作用 |
 | --- | --- |
@@ -136,25 +139,25 @@ node cli.mjs recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接模
 - 房间号在 HTTP 请求中明文过线：可完整嗅探的网络上攻击者可拉取分片（拿到密文、无法解密）——可续传模式下分片只读，抢拉不再饿死接收方；但伪造进度上报可释放缓存造成断流（可用性攻击，与既往同级的已知边界）。保密性不受影响
 - 同一 IP 多个**不同浏览器**同时在线时，设备条目以后注册者为准（同浏览器多标签已通过共享 secret 解决）
 
-**技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 node:crypto 原生逐字节一致（有测试）。
+**技术上如何做到 http 下也能加密**：浏览器 `crypto.subtle` 只在安全上下文存在。本项目自带纯 JS 实现，非安全上下文自动降级：AES-256-GCM（`public/aesgcm.js`）、SHA-256（`public/sha256.js`）、X25519（`public/x25519.js`，BigInt + RFC 7748 Montgomery 阶梯）；localhost/https 下 AES 走原生 WebCrypto。纯 JS 与 Node 原生实现逐字节一致（有测试保证；Node 仅作为测试运行器）。
 
 ## 打包与部署（多平台分发）
 
-一条命令产出三个平台的安装/分发物（目标机器**无需安装 Node**）：
+每个平台一条命令产出发行物；目标机器**无需安装任何运行时**（原生 Rust 二进制，前端在编译期内嵌）：
 
 ```bash
-sh build/package.sh            # 产物在 build/dist/
+sh build/package.sh            # 产物在 build/dist/（在 Linux / macOS / Windows Git Bash 中各自原生运行）
 ```
 
 | 产物 | 平台 | 安装/使用 |
 | --- | --- | --- |
-| `cipherlane_<v>_amd64.deb` | Linux x64（Ubuntu/Debian） | `sudo dpkg -i …deb && sudo systemctl enable --now cipherlane`（自带 systemd 单元，开机自启） |
-| `cipherlane_<v>_windows_x64.zip` | Windows x64 | 解压后双击 `cipherlane.exe`（控制台显示地址与二维码） |
-| `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | 解压后双击 `cipherlane.command`（首次若被 Gatekeeper 拦截：右键→打开） |
+| `cipherlane_<v>_amd64.deb` | Linux x64（Ubuntu/Debian） | `sudo dpkg -i …deb && sudo systemctl enable --now cipherlane`（自带 systemd 单元、桌面入口、托盘自启；安装 `cipherlane` / `cipherlane-cli` / `cipherlane-tray`） |
+| `cipherlane_<v>_windows_x64.zip` | Windows x64 | 解压后双击 `cipherlane.exe`（控制台显示地址与二维码）；`cipherlane-cli.exe` 为命令行 |
+| `cipherlane_<v>_macos_universal.tar.gz` | macOS arm64 + x64 | 解压后双击 `cipherlane.command`（首次若被 Gatekeeper 拦截：右键→打开）；`cipherlane-cli` 为命令行 |
 
-技术：**Linux deb 使用 Rust 静态单文件**（musl 服务器 ≈0.95MB + 系统托盘，deb ≈1.1MB，无 glibc/Node 依赖）；Windows/macOS 使用 Node **SEA（单文件可执行）**——服务器与全部前端资源内嵌进官方 Node 二进制（Windows zip ≈33MB，macOS 双架构包 ≈75MB）。打包脚本自动缓存官方二进制与 postject 工具，下载经 SHASUMS256 校验。**命名规范**：产物统一 `cipherlane_<版本>_<平台>.<格式>`，校验和为 `cipherlane-<版本>-SHA256SUMS.txt`，macOS 内层运行时为 `cipherlane-node-<架构>`；启动横幅与页面 footer 均带版本号，报问题时直接引用。
+**三平台是同一套 Rust 实现**——服务器、CLI 与（Linux）系统托盘；网页前端经 `include_bytes!` 编译进服务器，一个静态二进制即提供全部功能，构建与运行都不依赖 Node。Linux 为 musl 静态产物（服务器 ≈0.95MB、托盘 ≈2.3MB、deb ≈1.3MB）；Windows zip 与 macOS 通用包为原生 release 构建，具体体积由发布工作流实测输出。每次打包都会生成 `cipherlane-<版本>-SHA256SUMS.txt`；打 tag 发布时工作流会汇总统一校验和并随三平台产物一起上传。**命名规范**：产物统一 `cipherlane_<版本>_<平台>.<格式>`；启动横幅与页面 footer 均带版本号，报问题时直接引用。
 
-纯源码部署仍然零依赖：`node server.js` 即可（Node ≥ 18）。
+纯源码构建只需 Rust 工具链：`cargo build --release --manifest-path cipherlane-rs/Cargo.toml`。
 
 ## 浏览器兼容性
 
@@ -164,7 +167,7 @@ sh build/package.sh            # 产物在 build/dist/
 | 流式保存（可选） | Chromium 系支持 `showSaveFilePicker`；其他浏览器自动回退内存模式下载 |
 | 粘贴发送（可选） | 支持剪贴板事件的现代浏览器；移动端长按粘贴进文本框即可 |
 
-CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
+CLI 为原生二进制（`cipherlane-cli`），无需任何运行时。
 
 ## FAQ
 
@@ -172,7 +175,7 @@ CLI 需要 Node ≥ 18（原生 X25519 与 AES-GCM）。
 静态资源在服务器启动时读入内存，浏览器也可能复用旧标签页——**关掉标签重开**或强制刷新（Ctrl+Shift+R）。
 
 **启动报 `EADDRINUSE: 7777`？**
-端口被占用。`PORT=7788 node server.js` 换端口，或找到占用的旧进程停掉。
+端口被占用。`PORT=7788 ./cipherlane` 换端口（源码构建），或改 systemd 单元里的 `PORT`，或找到占用的旧进程停掉。
 
 **手机上看不到设备 / 别人看不到我？**
 必须连**同一个 WiFi / 网段**；首次使用注意系统防火墙是否放行了端口（Windows 会弹一次询问）；确认打开的是启动时打印的局域网地址而不是 `127.0.0.1`（回环只有本机能访问）。
@@ -196,29 +199,34 @@ IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标�
 
 ```
 cipherlane/
-├── server.js           # 零依赖中继服务器：房间 + 设备在线 + 邀请（Node 内置模块 only）
-├── cli.mjs             # 命令行：devices / 定向发送 / listen 常驻接收 / 链接收发
-├── sea-config.json     # SEA 单文件可执行配置（资源内嵌清单）
-├── cipherlane-rs/      # Rust 版服务器 + 系统托盘（Linux deb 实际产物，协议与 Node 版平价）
-├── scripts/            # 一致性检查（版本号 / SEA 资产 ↔ server.js / 测试文件）
-├── build/package.sh    # 一键打包：.deb / Windows exe / macOS 通用包
-├── logo/               # Logo：盾上密径（主图 + favicon 小尺寸母版）
-├── docs/screenshots/   # README 截图
-├── public/
-│   ├── index.html      # 单页应用（设备网格 · 几何头像 · 邀请卡片 · 双接收布局）
-│   ├── app.js          # 收发逻辑 + 双加密路径 + X25519 身份
-│   ├── aesgcm.js       # 纯 JS AES-256-GCM（http 降级路径）
-│   ├── sha256.js       # 纯 JS SHA-256（密钥派生 KDF）
-│   ├── x25519.js       # 纯 JS X25519（设备直发密钥协商）
-│   ├── avatar.js       # 设备几何头像（Material 扁平风，由 IP 确定性生成）
+├── cipherlane-rs/          # 全部产品：Rust 服务器 + CLI + Linux 托盘（单一实现）
+│   ├── Cargo.toml          # 版本号 + 三个 bin（cipherlane / cipherlane-cli / cipherlane-tray）
+│   └── src/
+│       ├── main.rs         # 中继服务器（房间/在线/邀请）+ 编译期内嵌网页前端
+│       └── bin/            # cli.rs（cipherlane-cli）· tray.rs（cipherlane-tray，仅 Linux）
+├── public/                 # 浏览器前端（原生 JS；纯 JS 加密用于明文 HTTP 降级路径）
+│   ├── index.html          # 单页应用（设备网格 · 几何头像 · 邀请卡片 · 双接收布局）
+│   ├── app.js              # 收发逻辑 + 双加密路径 + X25519 身份
+│   ├── aesgcm.js           # 纯 JS AES-256-GCM（http 降级路径）
+│   ├── sha256.js           # 纯 JS SHA-256（密钥派生 KDF）
+│   ├── x25519.js           # 纯 JS X25519（设备直发密钥协商）
+│   ├── avatar.js           # 设备几何头像（Material 扁平风，由 IP 确定性生成）
 │   └── style.css
-└── test/               # 八套：aesgcm / sha256 / x25519 / qrcode / avatar / protocol / cli / browser
+├── scripts/                # 一致性检查（版本号 / include_bytes ↔ public / 无 Node 残留）
+├── build/package.sh        # 一键打包：.deb / Windows zip / macOS 通用包
+├── logo/                   # Logo：盾上密径（主图 + favicon 小尺寸母版）
+├── docs/screenshots/       # README 截图
+└── test/                   # 八套测试（Node 仅作测试运行器）
 ```
 
 ## 测试
 
+测试驱动真实 Rust 二进制（服务器 + CLI）与真实无头 Chrome（浏览器套件）。**Node ≥ 18 仅作为测试运行器**，构建/运行产品都不需要它。
+
 ```bash
-npm test    # 或逐个: node test/<name>.test.mjs
+cargo build --release --manifest-path cipherlane-rs/Cargo.toml   # 或: npm run build
+npm test                   # 自动先构建（pretest）；或逐个: node test/<name>.test.mjs
+cargo test --release --manifest-path cipherlane-rs/Cargo.toml    # Rust 单元测试（或: npm run test:cargo）
 ```
 
 - **aesgcm**：S-box 标准向量、GHASH 交叉验证、0B~1MiB 与 node 原生逐字节比对（含 AAD 与篡改拒绝）
@@ -226,11 +234,19 @@ npm test    # 或逐个: node test/<name>.test.mjs
 - **x25519**：RFC 7748 向量 + 200 组随机 vs node ECDH 双向、小阶点拒绝
 - **qrcode**：RS 代数自检、定位图形/时序/格式信息结构断言
 - **avatar**：确定性、相邻 IP 差异、色板与明度约束
-- **protocol**：起真实 server，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/绑定面/链接模式全链路
-- **cli**：真实子进程端到端——单文件/目录递归批量（嵌套·中文·空文件·隐藏项跳过）/多路径混合/文本，字节级比对
+- **protocol**：驱动真实 Rust 服务器二进制，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/ETag/Host 校验/链接模式全链路（CI 另对 musl 发布二进制直跑）
+- **cli**：真实子进程端到端——`cipherlane-cli` ↔ Rust 服务器：单文件/目录递归批量（嵌套·中文·空文件·隐藏项跳过）/多路径混合/文本/SIGKILL 续传，字节级比对
 - **browser**：CDP 驱动真实 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无浏览器环境自动跳过
 
 ## 更新日志
+
+**v1.0.0**（2026-10-20，单一实现）
+- **产品彻底去 Node**：服务器、CLI、托盘合并为同一套 Rust 实现；Node 版中继/CLI 与 Node 单文件可执行打包链全部移除，Node 仅作为 JS 前端测试的运行器保留
+- **原生 Rust CLI** 完整替代 Node CLI：子命令与选项不变（`devices` / `send` / `send-text` / `recv` / `listen`；`--to`、`--verify`、`--name`、`--server`、`-o`、`--yes`），支持协议 v2 AAD 与 v1 回退、链接模式断点续传、批量/目录递归、128bit TOFU 指纹与控制字符净化
+- **三平台 Rust 原生产物**：Linux deb（musl 静态 server/tray/cli，≈1.3MB）、Windows x64 zip（`cipherlane.exe` + `cipherlane-cli.exe`，静态 CRT）、macOS 通用 tar.gz（`lipo` 合并 arm64+x64）——不再有 Node、二进制注入等步骤
+- **发布自动化**：推送 `v*` 标签即由 GitHub 官方 runner 三平台原生构建，并用官方 `gh` CLI 发布产物与统一 SHA256SUMS；手动触发只构建 artifact 不发布
+- **CI**：Rust 三 bin 构建 + `cargo test` + musl 协议平价 + deb 打包冒烟，外加 Node 18/20/22 上的完整 JS 套件；一致性检查改为校验版本、`include_bytes!` 资源与“产品链路不再出现 Node 实现”
+- **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）
 - **分片投递幂等**：新增可选 `X-Chunk-Seq` 头；浏览器/CLI 的超时与背压重投复用同一序号，
@@ -252,7 +268,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
   仅在按序时推进；FSA 流式保存真正启用并支持刷新续传；房间销毁期间到达的写请求回 410
   （修全局内存计数泄漏）；Rust 版背压计数竞态与房间销毁泄漏修复
 - **打包**：Linux deb 改用 musl 静态托盘（不再依赖 GLIBC_2.39）；systemd 默认仅绑回环+LAN
-- **工程**：CI 增加 Rust 构建与协议平价、版本/SEA 资产一致性检查；仓库移除误入库的
+- **工程**：CI 增加 Rust 构建与协议平价、版本/内嵌资源一致性检查；仓库移除误入库的
   800MB Rust 构建产物
 
 **v0.4.3**（2026-10-15，热修）
@@ -279,9 +295,8 @@ npm test    # 或逐个: node test/<name>.test.mjs
   悬停转横滑，心跳重渲染不打断横滑位置；设备按名称本地化排序（zh 拼序）
 - 修复：卡片定宽 128px 裁掉指纹尾巴（改内容自适应，像素级断言零裁切）；
   接收后返回首页不刷新（延迟邀请补画 + 设备即时刷新 + 地址栏残留接收链接清除）
-- 命名规范补全：校验和 `cipherlane-<版本>-SHA256SUMS.txt`、macOS 内层
-  `cipherlane-node-<架构>`；启动横幅与页面 footer 带版本号（SEA 内嵌
-  package.json，打包二进制可读）
+- 命名规范补全：校验和 `cipherlane-<版本>-SHA256SUMS.txt`；启动横幅与页面 footer
+  带版本号（版本号编译期内嵌，打包二进制可读）
 
 **v0.4.0**（2026-10-13）
 - 断点续传（链接模式，服务端零持久化，隐私模型不变）：
@@ -359,6 +374,7 @@ npm test    # 或逐个: node test/<name>.test.mjs
 
 ## 路线图
 
+- [x] 单一实现：Rust 服务器 + 原生 CLI + Linux 托盘，三平台 Rust 产物，Node 仅作测试运行器 —— v1.0.0
 - [x] 纯 JS AES 路径性能优化（AES T-table + 8-bit 窗口 GHASH + 同密钥缓存，单 worker 9.3→22 MB/s）—— v0.3.1
 - [x] 二维码展示接收链接（手机扫码）——v0.2.1
 - [x] 多文件 / 目录传输（manifest 单房间顺序流，文件夹选择/目录递归，浏览器 ↔ CLI 互通）—— v0.3.0
