@@ -5,9 +5,10 @@
 // （LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）。
 // 零知识：服务器只存转 AES-256-GCM 密文分片，永不做任何加解密。
 use rand::Rng;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
@@ -30,6 +31,12 @@ const DEVICE_NAME_MAX: usize = 32;
 const OFFER_TTL_MS: u128 = 5 * 60 * 1000;
 const OFFERS_MAX: usize = 8;
 const REJECT_GRACE_MS: u128 = 2 * 60 * 1000;
+// per-IP 配额：防止单个局域网 IP 耗尽全站房间/内存（CIPHERLANE_TEST_LIMITS=1 仅供测试降阈值）
+const PER_IP_ROOMS: usize = 64;
+const PER_IP_BYTES: usize = 96 * 1024 * 1024;
+const ROOM_CREATE_PER_MIN: usize = 120;
+const UPDATE_CACHE_MS: u128 = 5 * 60 * 1000;
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 // 工作线程：每监听地址 128 个、128KB 小栈。足以承载 LAN 规模的长轮询并发
 // （每接收方 ≤4 挂起 × 30 设备 ≈ 120）；小栈把虚拟内存从 2MB/线程压到 128KB，
 // 避免 256×2MB=1.6GB VIRT 被 system monitor 误读为"内存泄漏"（实际 RSS ~5MB）。
@@ -49,9 +56,19 @@ fn now_ms() -> u128 {
 struct StaticFile {
     data: Vec<u8>,
     ctype: &'static str,
+    etag: String,
+}
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 fn static_routes() -> Vec<(&'static str, StaticFile)> {
-    let sf = |data: &'static [u8], t: &'static str| StaticFile { data: data.to_vec(), ctype: t };
+    let sf = |data: &'static [u8], t: &'static str| {
+        let data = data.to_vec();
+        let etag = format!("\"{}\"", sha256_hex(&data));
+        StaticFile { data, ctype: t, etag }
+    };
     let mut v: Vec<(&'static str, StaticFile)> = vec![
         ("/", sf(include_bytes!("../../public/index.html"), "text/html; charset=utf-8")),
         ("/app.js", sf(include_bytes!("../../public/app.js"), "text/javascript; charset=utf-8")),
@@ -72,6 +89,8 @@ fn static_routes() -> Vec<(&'static str, StaticFile)> {
         if e.0 == "/" {
             let s = String::from_utf8_lossy(&e.1.data).replace("__VERSION__", VERSION);
             e.1.data = s.into_bytes();
+            // ETag 必须基于替换版本号后的最终字节（与 Node 的读取顺序一致）
+            e.1.etag = format!("\"{}\"", sha256_hex(&e.1.data));
         }
     }
     v
@@ -107,6 +126,7 @@ struct RoomInner {
 }
 struct Room {
     id: String,
+    sender_ip: String,
     created_at: u128,
     last_active: Mutex<u128>,
     inner: Mutex<RoomInner>,
@@ -126,10 +146,58 @@ struct World {
     devices: Mutex<HashMap<String, Arc<Device>>>,
     offers_by_id: Mutex<HashMap<String, String>>,
     global_buffered: Mutex<usize>,
+    // ip → 当前滞留密文字节（与 global_buffered 同点增减）
+    ip_bytes: Mutex<HashMap<String, usize>>,
+    // ip → 最近 60s 建房时间戳（滑动窗口限流）
+    ip_creates: Mutex<HashMap<String, Vec<u128>>>,
     longpoll_count: Mutex<HashMap<String, i32>>,
     offers_mutex: Mutex<()>,
     offers_cond: Condvar,
     started_at: u128,
+}
+// 运行期可调限额：CIPHERLANE_TEST_LIMITS=1 时降为测试阈值（速率保持 120/min）
+struct Limits {
+    ip_rooms_max: usize,
+    ip_bytes_max: usize,
+}
+// /api/update 的 5min 成功缓存 + 并发去重（in-flight 共享同一上游结果）
+#[derive(Default)]
+struct UpdateState {
+    cache: Option<(u128, String)>,
+    inflight: bool,
+    last_result: Option<String>,
+}
+// 密文字节记账（room.bytes / global_buffered / ip_bytes 必须在同一处成对增减）
+struct ByteAccount<'a> {
+    global: &'a Mutex<usize>,
+    ip_bytes: &'a Mutex<HashMap<String, usize>>,
+    ip: &'a str,
+}
+impl ByteAccount<'_> {
+    fn add(&self, inner: &mut RoomInner, n: usize) {
+        inner.bytes = inner.bytes.saturating_add(n);
+        counter_add(self.global, n);
+        let mut m = self.ip_bytes.lock().unwrap();
+        let cur = m.get(self.ip).copied().unwrap_or(0);
+        m.insert(self.ip.to_string(), cur.saturating_add(n));
+    }
+    fn del(&self, inner: &mut RoomInner, n: usize) {
+        if n == 0 {
+            return;
+        }
+        inner.bytes = inner.bytes.saturating_sub(n);
+        counter_sub(self.global, n);
+        ip_bytes_sub(self.ip_bytes, self.ip, n);
+    }
+}
+fn ip_bytes_sub(map: &Mutex<HashMap<String, usize>>, ip: &str, n: usize) {
+    let mut m = map.lock().unwrap();
+    let left = m.get(ip).copied().unwrap_or(0).saturating_sub(n);
+    if left > 0 {
+        m.insert(ip.to_string(), left);
+    } else {
+        m.remove(ip);
+    }
 }
 
 // ---------- 工具 ----------
@@ -185,8 +253,31 @@ fn json_resp(mut res: tiny_http::Request, code: u16, body: String) {
             .with_header(h("X-Content-Type-Options", "nosniff")),
     );
 }
-fn jerr(res: tiny_http::Request, code: u16, err: &str) {
-    json_resp(res, code, format!("{{\"error\":\"{}\"}}", err));
+fn jerr(mut res: tiny_http::Request, code: u16, err: &str) {
+    // tiny_http 无法从响应侧强制关闭 keep-alive 连接（Connection 头会被剥离）。很多拒绝
+    // 路径（Host/Origin 闸门、token 403 等）在读取请求体之前就返回，连接上残留的 body
+    // 会被当成下一个请求解析成 400。因此这里先排空请求体再响应：已知 Content-Length
+    // 时精确读取（限量 BODY_MAX+1KiB），未知长度时最多读同样上限；超大 body 不排空，
+    // 避免被慢速攻击者占住 worker。
+    let cap = BODY_MAX + 1024;
+    match res.body_length() {
+        Some(n) if n <= cap => {
+            let mut buf = vec![0u8; n];
+            let _ = res.as_reader().read_exact(&mut buf);
+        }
+        None => {
+            let mut sink = Vec::new();
+            let _ = res.as_reader().take(cap as u64).read_to_end(&mut sink);
+        }
+        Some(_) => { /* 声明的 body 超大：不排空，交给客户端/连接超时处理 */ }
+    }
+    let _ = res.respond(
+        Response::from_string(format!("{{\"error\":\"{}\"}}", err))
+            .with_status_code(code)
+            .with_header(h("Content-Type", "application/json; charset=utf-8"))
+            .with_header(h("Cache-Control", "no-store"))
+            .with_header(h("X-Content-Type-Options", "nosniff")),
+    );
 }
 fn read_body(req: &mut tiny_http::Request, cap: usize) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
@@ -247,6 +338,146 @@ fn parse_chunk_seq(raw: &[u8]) -> Option<u64> {
         }
     }
     Some(v)
+}
+
+// ---------- 安全 / 兼容工具 ----------
+// 常量时间比较：长度不同直接 false；长度相同按字节 OR 累积差异（不提前返回，避免计时侧信道）
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+// 设备名：先剔除 C0/C1 控制字符（防终端转义注入），再 trim/slice，空名回落默认值
+fn clean_device_name(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|c| {
+            let n = *c as u32;
+            !(n <= 0x1f || (0x7f..=0x9f).contains(&n))
+        })
+        .collect();
+    let s: String = filtered.trim().chars().take(DEVICE_NAME_MAX).collect();
+    if s.is_empty() {
+        "未命名设备".into()
+    } else {
+        s
+    }
+}
+// GET ?i= 的严格十进制解析（不接受符号/空白/空串；上限对齐 Number.isSafeInteger）
+fn parse_strict_digits(raw: &str) -> Option<u64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in raw.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        if v > CHUNK_SEQ_MAX {
+            return None;
+        }
+    }
+    Some(v)
+}
+// Host 头归一化：去端口 / 去 IPv6 方括号 / 小写 / 去尾点（对齐 server.js hostnameOf）
+fn hostname_of(host_header: &str) -> String {
+    let h = host_header.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return String::new();
+    }
+    if h.parse::<IpAddr>().is_ok() {
+        return h;
+    }
+    let mut out: String;
+    if let Some(rest) = h.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => out = rest[..end].to_string(),
+            None => return String::new(),
+        }
+    } else if let Some((pre, _)) = h.split_once(':') {
+        out = pre.to_string();
+    } else {
+        out = h.clone();
+    }
+    if out.ends_with('.') {
+        out.pop();
+    }
+    out
+}
+fn host_allowed(host_header: &str, allowed: &HashSet<String>) -> bool {
+    let h = hostname_of(host_header);
+    !h.is_empty() && (allowed.contains(&h) || h.parse::<IpAddr>().is_ok())
+}
+// Origin/Referer 若存在，其 host 也必须在白名单内；缺失（CLI/同源 GET 被裁剪）直接放行
+fn origin_allowed(value: &str, allowed: &HashSet<String>) -> bool {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    match raw.split_once("://") {
+        Some((_, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let hostport = authority.rsplit('@').next().unwrap_or(authority);
+            host_allowed(hostport, allowed)
+        }
+        None => false,
+    }
+}
+fn etag_matches(header: &str, etag: &str) -> bool {
+    let h = header.trim();
+    if h == "*" {
+        return true;
+    }
+    h.split(',').any(|t| t.trim() == etag)
+}
+// 语义化版本比较：仅按数字段（0.4.3 > 0.4.2；非法值一律不视为更新）
+fn semver_parts(v: &str) -> Option<Vec<u64>> {
+    let t = v.trim();
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let bytes = t.as_bytes();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    loop {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return if parts.is_empty() { None } else { Some(parts) };
+        }
+        let n: u64 = std::str::from_utf8(&bytes[start..i]).ok()?.parse().ok()?;
+        parts.push(n);
+        if i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            i += 1;
+        } else {
+            return Some(parts);
+        }
+    }
+}
+fn semver_newer(latest: &str, current: &str) -> bool {
+    let (a, b) = match (semver_parts(latest), semver_parts(current)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+fn update_scheme(url: &str) -> Option<String> {
+    url.split_once("://").map(|(s, _)| s.to_ascii_lowercase())
 }
 
 // ---------- 连接活性检测（Linux）----------
@@ -340,18 +571,24 @@ fn pending_offers_for(world: &World, ip: &str) -> Vec<serde_json::Value> {
     }
     list
 }
-fn take_chunk(inner: &mut RoomInner, counter: &Mutex<usize>, i: u64) -> Option<Arc<Vec<u8>>> {
+fn take_chunk(inner: &mut RoomInner, acct: &ByteAccount, i: u64) -> Option<Arc<Vec<u8>>> {
     let c = inner.buffer.remove(&i)?;
-    inner.bytes = inner.bytes.saturating_sub(c.len());
-    counter_sub(counter, c.len());
-    inner.head = i + 1;
+    acct.del(inner, c.len());
+    // head 只在按序取走时推进：越序 GET 不得把低序号分片变成不可达垃圾。
+    // 推进时跳过“已投递但 buffer 缺失（= 已被越序取走）”的序号。
+    if i == inner.head {
+        inner.head = i + 1;
+        while inner.head < inner.posted && !inner.buffer.contains_key(&inner.head) {
+            inner.head += 1;
+        }
+    }
     if inner.head > inner.pulled {
         inner.pulled = inner.head;
     }
     inner.receiver_seen = true;
     Some(c)
 }
-fn advance_through(inner: &mut RoomInner, counter: &Mutex<usize>, through: u64) -> bool {
+fn advance_through(inner: &mut RoomInner, acct: &ByteAccount, through: u64) -> bool {
     if through > inner.posted {
         return false;
     }
@@ -367,22 +604,20 @@ fn advance_through(inner: &mut RoomInner, counter: &Mutex<usize>, through: u64) 
             true
         }
     });
-    inner.bytes = inner.bytes.saturating_sub(freed);
-    counter_sub(counter, freed);
+    acct.del(inner, freed);
     inner.through = through;
     if inner.through > inner.pulled {
         inner.pulled = inner.through;
     }
     true
 }
-// 插入分片并记账：inner.bytes 与 global_buffered 的加值都在调用方持有的 inner 锁内完成，
-// 与所有减法路径串行，杜绝"减法先于加法"的瞬时回绕。
-fn insert_chunk(inner: &mut RoomInner, counter: &Mutex<usize>, i: u64, body: Vec<u8>) -> usize {
+// 插入分片并记账：inner.bytes / global_buffered / ip_bytes 的加值都在调用方持有的
+// inner 锁内完成，与所有减法路径串行，杜绝“减法先于加法”的瞬时回绕。
+fn insert_chunk(inner: &mut RoomInner, acct: &ByteAccount, i: u64, body: Vec<u8>) -> usize {
     let arc = Arc::new(body);
     let added = arc.len();
     inner.buffer.insert(i, arc);
-    inner.bytes = inner.bytes.saturating_add(added);
-    counter_add(counter, added);
+    acct.add(inner, added);
     added
 }
 fn destroy_room(world: &World, room: &Arc<Room>) {
@@ -397,7 +632,9 @@ fn destroy_room(world: &World, room: &Arc<Room>) {
         let mut inner = room.inner.lock().unwrap();
         let bytes = std::mem::take(&mut inner.bytes);
         inner.buffer.clear();
+        // 与 global_buffered / ip_bytes 在同一临界区成对释放
         counter_sub(&world.global_buffered, bytes);
+        ip_bytes_sub(&world.ip_bytes, &room.sender_ip, bytes);
         inner.dead = true;
         if let Some(o) = &inner.offer {
             world.offers_by_id.lock().unwrap().remove(&o.id);
@@ -406,6 +643,19 @@ fn destroy_room(world: &World, room: &Arc<Room>) {
     }
     room.cond.notify_all();
     println!("[room] - {}", room.id);
+}
+// 滑动 60s 建房速率：返回 0 = 已记账允许；>0 = 需等待的秒数
+fn create_rate_wait(world: &World, ip: &str, now: u128) -> u64 {
+    let mut m = world.ip_creates.lock().unwrap();
+    let ts = m.entry(ip.to_string()).or_default();
+    ts.retain(|t| now.saturating_sub(*t) < 60_000);
+    if ts.len() >= ROOM_CREATE_PER_MIN {
+        let elapsed = now.saturating_sub(ts[0]);
+        let wait = 60_000u128.saturating_sub(elapsed).div_ceil(1000);
+        return wait.max(1) as u64;
+    }
+    ts.push(now);
+    0
 }
 
 // ---------- 分片拉取（长轮询挂起） ----------
@@ -449,15 +699,17 @@ fn pull_chunk(world: &Arc<World>, room: &Arc<Room>, ip: &str, i: u64, resume: bo
                 // 挂起中被并发取走 → 冲突；新到访已消费 → consumed
                 return if parked { Pull::Conflict } else { Pull::Gone("consumed") };
             }
-            if let Some(c) = take_chunk(&mut inner, &world.global_buffered, i) {
+            let acct = ByteAccount { global: &world.global_buffered, ip_bytes: &world.ip_bytes, ip: &room.sender_ip };
+            if let Some(c) = take_chunk(&mut inner, &acct, i) {
                 touch(room);
                 return Pull::Done(c.as_ref().clone());
             }
+            // 已投递但 buffer 缺失 = 已被越序/并发取走（经典模式取走即焚）→ 明确 410，不要挂空等待
+            if i < inner.posted {
+                return if parked { Pull::Conflict } else { Pull::Gone("consumed") };
+            }
             if inner.sender_done && i >= inner.posted {
                 return Pull::Gone("sender-gone");
-            }
-            if parked && inner.posted > i {
-                return Pull::Conflict;
             }
         }
         let now = Instant::now();
@@ -497,7 +749,7 @@ fn wait_offers(world: &Arc<World>, ip: &str, remote: Option<SocketAddr>) -> Resu
     }
 }
 
-// ---------- 极简 HTTP GET（检查更新用，仅 http） ----------
+// ---------- 极简 HTTP GET（检查更新用，仅 http；https 见 fetch_update 的说明） ----------
 fn http_get_text(url: &str, timeout: Duration) -> Result<String, String> {
     let rest = url.strip_prefix("http://").ok_or("仅支持 http 更新源")?;
     let (hostport, path) = match rest.split_once('/') {
@@ -509,14 +761,42 @@ fn http_get_text(url: &str, timeout: Duration) -> Result<String, String> {
         _ => (hostport.clone(), 80),
     };
     let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(addr.as_str()).map_err(|e| e.to_string())?;
+    let mut stream = None;
+    for a in addr.to_socket_addrs().map_err(|e| e.to_string())? {
+        if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
+            stream = Some(s);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or("连接更新源失败")?;
     stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
     write!(stream, "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", path, hostport).map_err(|e| e.to_string())?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
-    match raw.split_once("\r\n\r\n") {
-        Some((_, body)) => Ok(body.to_string()),
-        None => Ok(raw),
+    let (head, body) = match raw.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b.to_string()),
+        None => (raw.as_str(), String::new()),
+    };
+    let status = head.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!("upstream {}", status));
+    }
+    Ok(body)
+}
+// 返回 (是否可缓存, JSON 响应体)。https 无 TLS 依赖：如实返回错误而不是假成功。
+fn fetch_update(url: &str, timeout: Duration) -> (bool, String) {
+    let fetched = match update_scheme(url).as_deref() {
+        Some("http") => http_get_text(url, timeout),
+        Some("https") => Err("https 更新源暂不支持（Rust 版无 TLS）".to_string()),
+        _ => Err("bad-update-url".to_string()),
+    };
+    match fetched {
+        Ok(text) => {
+            let latest = text.trim().to_string();
+            let newer = semver_newer(&latest, VERSION);
+            (true, serde_json::json!({"source": url, "current": VERSION, "latest": latest, "newer": newer}).to_string())
+        }
+        Err(e) => (false, serde_json::json!({"source": url, "current": VERSION, "error": e}).to_string()),
     }
 }
 
@@ -524,20 +804,35 @@ fn http_get_text(url: &str, timeout: Duration) -> Result<String, String> {
 struct Ctx {
     world: Arc<World>,
     statics: Vec<(&'static str, StaticFile)>,
+    limits: Limits,
+    // Host/Origin 白名单（IP 字面量动态放行，其余按集合）
+    allowed_hosts: HashSet<String>,
+    update: Mutex<UpdateState>,
+    update_cond: Condvar,
+}
+
+fn decorate_static<R: Read>(mut resp: Response<R>, f: &StaticFile) -> Response<R> {
+    resp = resp
+        .with_header(h("Content-Type", f.ctype))
+        .with_header(h("Content-Security-Policy", CSP))
+        .with_header(h("Referrer-Policy", "no-referrer"))
+        .with_header(h("X-Content-Type-Options", "nosniff"));
+    if f.ctype.starts_with("text/html") {
+        // HTML 内嵌版本号且体积小：保持 no-store，避免回源校验收不到更新
+        resp = resp.with_header(h("Cache-Control", "no-store"));
+    } else {
+        resp = resp.with_header(h("Cache-Control", "no-cache")).with_header(h("ETag", &f.etag));
+    }
+    resp
 }
 
 fn send_static(mut req: tiny_http::Request, f: &StaticFile) {
-    let _ = req.respond(
-        Response::from_data(f.data.clone())
-            .with_header(h("Content-Type", f.ctype))
-            .with_header(h("Cache-Control", "no-store"))
-            .with_header(h(
-                "Content-Security-Policy",
-                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-            ))
-            .with_header(h("Referrer-Policy", "no-referrer"))
-            .with_header(h("X-Content-Type-Options", "nosniff")),
-    );
+    let is_html = f.ctype.starts_with("text/html");
+    if !is_html && etag_matches(&hdr(&req, "If-None-Match"), &f.etag) {
+        let _ = req.respond(decorate_static(Response::empty(304), f));
+        return;
+    }
+    let _ = req.respond(decorate_static(Response::from_data(f.data.clone()), f));
 }
 
 fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
@@ -553,6 +848,18 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
     };
     let ip = client_ip(&req);
     let w = &ctx.world;
+
+    // ---- /api/* Host/Origin 闸门（防 DNS rebinding 与跨站 CSRF；静态页不受限） ----
+    if path == "/api" || path.starts_with("/api/") {
+        if !host_allowed(&hdr(&req, "Host"), &ctx.allowed_hosts) {
+            return jerr(req, 403, "bad-host");
+        }
+        if !origin_allowed(&hdr(&req, "Origin"), &ctx.allowed_hosts)
+            || !origin_allowed(&hdr(&req, "Referer"), &ctx.allowed_hosts)
+        {
+            return jerr(req, 403, "bad-origin");
+        }
+    }
 
     // ---- 静态资源 ----
     if method == "GET" {
@@ -578,8 +885,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             Ok(v) => v,
             Err(_) => return jerr(req, 400, "bad-body"),
         };
-        let name_raw = j.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let name: String = if name_raw.is_empty() { "未命名设备".into() } else { name_raw.chars().take(DEVICE_NAME_MAX).collect() };
+        let name = clean_device_name(j.get("name").and_then(|v| v.as_str()).unwrap_or(""));
         let pub_ = j.get("pub").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !valid_pub(&pub_) {
             return jerr(req, 400, "bad-pub");
@@ -587,7 +893,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         let secret_hdr = hdr(&req, "X-Device-Secret");
         let existing = w.devices.lock().unwrap().get(&ip).cloned();
         if let Some(prev) = existing {
-            if !secret_hdr.is_empty() && prev.secret == secret_hdr {
+            if !secret_hdr.is_empty() && ct_eq(&prev.secret, &secret_hdr) {
                 *prev.name.lock().unwrap() = name;
                 *prev.pub_.lock().unwrap() = pub_;
                 *prev.last_seen.lock().unwrap() = now_ms();
@@ -657,7 +963,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             .and_then(|j| j.get("token").and_then(|v| v.as_str().map(String::from)))
             .unwrap_or_default();
         let local = ip == "127.0.0.1" || ip == "::1";
-        if token.len() < 16 || sent != token || !local {
+        if token.len() < 16 || !ct_eq(&sent, &token) || !local {
             return jerr(req, 403, "forbidden");
         }
         json_resp(req, 200, "{\"ok\":true}".into());
@@ -669,37 +975,71 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         return;
     }
 
-    // ---- GET /api/update ----
+    // ---- GET /api/update：5min 缓存 + in-flight 去重 + 仅 http/https ----
     if path == "/api/update" && method == "GET" {
         let url = match std::env::var("CIPHERLANE_UPDATE_URL") {
             Ok(u) if !u.is_empty() => u,
             _ => return json_resp(req, 200, serde_json::json!({ "source": null, "current": VERSION, "message": "未配置更新源（CIPHERLANE_UPDATE_URL）" }).to_string()),
         };
-        match http_get_text(&url, Duration::from_secs(5)) {
-            Ok(text) => {
-                let latest = text.trim().to_string();
-                let newer = latest.starts_with(|c: char| c.is_ascii_digit()) && latest != VERSION;
-                return json_resp(req, 200, serde_json::json!({ "source": url, "current": VERSION, "latest": latest, "newer": newer }).to_string());
+        match update_scheme(&url).as_deref() {
+            Some("http") | Some("https") => {}
+            _ => {
+                return json_resp(req, 400, serde_json::json!({ "source": url, "current": VERSION, "error": "bad-update-url" }).to_string())
             }
-            Err(e) => return json_resp(req, 200, serde_json::json!({ "source": url, "current": VERSION, "error": e }).to_string()),
         }
+        // 5 分钟成功结果缓存（错误不缓存）
+        {
+            let st = ctx.update.lock().unwrap();
+            if let Some((at, payload)) = &st.cache {
+                if now_ms().saturating_sub(*at) < UPDATE_CACHE_MS {
+                    return json_resp(req, 200, payload.clone());
+                }
+            }
+        }
+        // 单飞：已有上游请求进行中则等它完成，共享同一结果（成功或错误）
+        {
+            let mut st = ctx.update.lock().unwrap();
+            if st.inflight {
+                while st.inflight {
+                    st = ctx.update_cond.wait(st).unwrap();
+                }
+                if let Some(p) = st.last_result.clone() {
+                    return json_resp(req, 200, p);
+                }
+            }
+            st.inflight = true;
+        }
+        let (cacheable, payload) = fetch_update(&url, Duration::from_secs(5));
+        {
+            let mut st = ctx.update.lock().unwrap();
+            if cacheable {
+                st.cache = Some((now_ms(), payload.clone()));
+            }
+            st.last_result = Some(payload.clone());
+            st.inflight = false;
+            ctx.update_cond.notify_all();
+        }
+        return json_resp(req, 200, payload);
     }
 
     // ---- GET /api/devices ----
     if path == "/api/devices" && method == "GET" {
         let devices = w.devices.lock().unwrap();
-        let list: Vec<serde_json::Value> = devices
+        let mut list: Vec<serde_json::Value> = devices
             .values()
             .filter(|d| device_alive(d))
             .map(|d| serde_json::json!({ "ip": d.ip, "id": d.id, "name": *d.name.lock().unwrap(), "pub": *d.pub_.lock().unwrap() }))
             .collect();
+        // HashMap 迭代顺序每个进程随机；按 IP 排序让 /api/devices 输出确定，客户端/测试
+        // 不依赖哈希顺序（本机回环 + LAN 地址可能同时存在多个设备条目）。
+        list.sort_by(|a, b| a["ip"].as_str().unwrap_or("").cmp(b["ip"].as_str().unwrap_or("")));
         return json_resp(req, 200, serde_json::json!({ "devices": list }).to_string());
     }
 
     // ---- GET /api/offers：长轮询 ----
     if path == "/api/offers" && method == "GET" {
         let secret = hdr(&req, "X-Device-Secret");
-        let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| d.secret == secret).cloned() };
+        let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
         let dev = match dev {
             Some(d) => d,
             None => return jerr(req, 401, "bad-secret"),
@@ -720,7 +1060,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         let parts: Vec<&str> = rest.split('/').collect();
         if parts.len() == 2 && (parts[1] == "accept" || parts[1] == "reject") && method == "POST" {
             let secret = hdr(&req, "X-Device-Secret");
-            let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| d.secret == secret).cloned() };
+            let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
             if dev.is_none() {
                 return jerr(req, 401, "bad-secret");
             }
@@ -742,6 +1082,10 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 }
             }
             let _ = read_body(&mut req, 1024);
+            // 读包期间房间可能已被 DELETE/清扫销毁（roomAlive 语义）
+            if room.inner.lock().unwrap().dead {
+                return jerr(req, 410, "gone");
+            }
             touch(&room);
             let mut inner = room.inner.lock().unwrap();
             let offer_opt = inner.offer.clone();
@@ -763,15 +1107,30 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         }
     }
 
-    // ---- POST /api/rooms ----
+    // ---- POST /api/rooms：per-IP 房间数/建房速率双闸 ----
     if path == "/api/rooms" && method == "POST" {
         let _ = read_body(&mut req, 1024);
-        if w.rooms.lock().unwrap().len() >= ROOMS_MAX {
-            return jerr(req, 503, "too-many-rooms");
+        // 速率窗口先记账（与 Node 一致：被配额拒绝的尝试也占用速率额度）
+        let rate_wait = create_rate_wait(w, &ip, now_ms());
+        if rate_wait > 0 {
+            return json_resp(req, 429, format!("{{\"error\":\"ip-quota\",\"retry\":{}}}", rate_wait));
+        }
+        {
+            let rooms = w.rooms.lock().unwrap();
+            let by_ip = rooms.values().filter(|r| r.sender_ip == ip).count();
+            if by_ip >= ctx.limits.ip_rooms_max {
+                drop(rooms);
+                return json_resp(req, 429, "{\"error\":\"ip-quota\",\"retry\":1}".into());
+            }
+            if rooms.len() >= ROOMS_MAX {
+                drop(rooms);
+                return jerr(req, 503, "too-many-rooms");
+            }
         }
         let id = rand_room_id();
         let room = Arc::new(Room {
             id: id.clone(),
+            sender_ip: ip.clone(),
             created_at: now_ms(),
             last_active: Mutex::new(now_ms()),
             cond: Condvar::new(),
@@ -811,7 +1170,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 return match room {
                     None => jerr(req, 404, "no-room"),
                     Some(r) => {
-                        if token_hdr != r.inner.lock().unwrap().token {
+                        if !ct_eq(&token_hdr, &r.inner.lock().unwrap().token) {
                             return jerr(req, 403, "bad-token");
                         }
                         destroy_room(w, &r);
@@ -823,7 +1182,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 Some(r) => r,
                 None => return jerr(req, 404, "no-room"),
             };
-            let token_ok = token_hdr == room.inner.lock().unwrap().token;
+            let token_ok = ct_eq(&token_hdr, &room.inner.lock().unwrap().token);
 
             // GET state
             if sub == "state" && method == "GET" {
@@ -860,6 +1219,10 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     Ok(v) => v,
                     Err(_) => return jerr(req, 400, "bad-body"),
                 };
+                // 读包期间房间可能已被销毁（roomAlive 语义）
+                if room.inner.lock().unwrap().dead {
+                    return jerr(req, 410, "gone");
+                }
                 let to = j.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let pub_ = j.get("pub").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let hint = j.get("hint").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -964,14 +1327,21 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 }
                 let outstanding = if inner.resumable { inner.posted - inner.through } else { inner.buffer.len() as u64 };
                 let global = *w.global_buffered.lock().unwrap();
-                if outstanding >= ROOM_CHUNKS_BUF || inner.bytes + body.len() > ROOM_BYTES_MAX || global + body.len() > GLOBAL_BYTES_MAX {
+                // per-IP 字节配额：按房间创建者 IP 归属（与 Node 的 room.senderIp 一致）
+                let ip_used = w.ip_bytes.lock().unwrap().get(&room.sender_ip).copied().unwrap_or(0);
+                if outstanding >= ROOM_CHUNKS_BUF
+                    || inner.bytes + body.len() > ROOM_BYTES_MAX
+                    || global + body.len() > GLOBAL_BYTES_MAX
+                    || ip_used + body.len() > ctx.limits.ip_bytes_max
+                {
                     drop(inner);
                     return json_resp(req, 429, "{\"error\":\"backpressure\",\"retry\":1}".into());
                 }
                 let i = inner.posted;
                 inner.posted += 1;
-                // 记账与插入在同一 inner 临界区内完成（旧实现是 drop(inner) 之后才 += 全局计数）
-                insert_chunk(&mut inner, &w.global_buffered, i, body);
+                // 记账与插入在同一 inner 临界区内完成（inner.bytes/global/ip_bytes 成对增减）
+                let acct = ByteAccount { global: &w.global_buffered, ip_bytes: &w.ip_bytes, ip: &room.sender_ip };
+                insert_chunk(&mut inner, &acct, i, body);
                 drop(inner);
                 touch(&room);
                 room.cond.notify_all();
@@ -980,8 +1350,11 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
 
             // GET chunk?i=N（X-Resume: 1 可续传）
             if sub == "chunk" && method == "GET" {
-                let i: Option<u64> = query.split('&').find_map(|kv| kv.strip_prefix("i=")).and_then(|v| v.parse().ok());
-                let i = match i {
+                // 缺省/空/带符号/超安全整数一律 400，不能用 Number(null)=0 静默消费 0 号分片
+                let i_raw: Option<&str> = query
+                    .split('&')
+                    .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == "i").map(|(_, v)| v));
+                let i = match i_raw.and_then(parse_strict_digits) {
                     Some(v) => v,
                     None => return jerr(req, 400, "bad-index"),
                 };
@@ -1018,6 +1391,10 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             // POST progress —— 可续传模式：接收方上报已落盘分片数
             if sub == "progress" && method == "POST" {
                 let body = read_body(&mut req, 1024).unwrap_or_default();
+                // 读包期间房间可能已被销毁（roomAlive 语义）
+                if room.inner.lock().unwrap().dead {
+                    return jerr(req, 410, "gone");
+                }
                 let through = serde_json::from_slice::<serde_json::Value>(&body)
                     .ok()
                     .and_then(|j| j.get("through").and_then(|v| v.as_u64()));
@@ -1030,7 +1407,8 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     drop(inner);
                     return jerr(req, 409, "not-resumable");
                 }
-                if !advance_through(&mut inner, &w.global_buffered, through) {
+                let acct = ByteAccount { global: &w.global_buffered, ip_bytes: &w.ip_bytes, ip: &room.sender_ip };
+                if !advance_through(&mut inner, &acct, through) {
                     drop(inner);
                     return jerr(req, 400, "bad-through");
                 }
@@ -1043,6 +1421,10 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             // POST ack（可选密钥凭证 proof，供发送方本地核对）
             if sub == "ack" && method == "POST" {
                 let body = read_body(&mut req, 1024).unwrap_or_default();
+                // 读包期间房间可能已被销毁（roomAlive 语义）
+                if room.inner.lock().unwrap().dead {
+                    return jerr(req, 410, "gone");
+                }
                 let proof = serde_json::from_slice::<serde_json::Value>(&body)
                     .ok()
                     .and_then(|j| j.get("proof").and_then(|v| v.as_str().map(String::from)))
@@ -1081,6 +1463,12 @@ fn sweeper(ctx: Arc<Ctx>) {
             }
         }
         w.devices.lock().unwrap().retain(|_, d| now.saturating_sub(*d.last_seen.lock().unwrap()) <= DEVICE_MEM_MS);
+        // 建房速率窗口清理，避免按 IP 无界增长
+        let mut creates = w.ip_creates.lock().unwrap();
+        creates.retain(|_, ts| {
+            ts.retain(|t| now.saturating_sub(*t) < 60_000);
+            !ts.is_empty()
+        });
     }
 }
 
@@ -1099,24 +1487,77 @@ fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
     out
 }
 
+// Host/Origin 白名单：内置回环名 + 实际绑定地址/HOST（域名时）+ os.hostname()（含短名）
+// + CIPHERLANE_EXTRA_HOSTS（逗号分隔，忽略端口）。IP 字面量在 host_allowed 中动态放行。
+fn build_allowed_hosts(addrs: &[String], host_env: &str) -> HashSet<String> {
+    let mut set: HashSet<String> = ["localhost", "127.0.0.1", "::1"].iter().map(|s| s.to_string()).collect();
+    for a in addrs {
+        let a = a.trim().to_ascii_lowercase();
+        if !a.is_empty() && a != "0.0.0.0" && a != "::" && a.parse::<IpAddr>().is_err() {
+            set.insert(a);
+        }
+    }
+    let host_env = host_env.trim().to_ascii_lowercase();
+    if !host_env.is_empty() && host_env.parse::<IpAddr>().is_err() {
+        set.insert(host_env);
+    }
+    let os_host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()));
+    if let Some(h) = os_host {
+        if let Some(short) = h.split('.').next() {
+            set.insert(short.to_string());
+        }
+        set.insert(h);
+    }
+    if let Ok(extra) = std::env::var("CIPHERLANE_EXTRA_HOSTS") {
+        for part in extra.split(',') {
+            let mut v = part.trim().to_ascii_lowercase();
+            // 忽略端口（对齐 Node 的 replace(/:\d+$/, '')）
+            if let Some(idx) = v.rfind(':') {
+                let port = &v[idx + 1..];
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    v.truncate(idx);
+                }
+            }
+            if !v.is_empty() {
+                set.insert(v);
+            }
+        }
+    }
+    set
+}
+
+// SIGTERM/SIGINT：异步信号安全地打印停机文案后 exit 0（与 Node 的优雅停机语义对齐）。
+// Node 的 SIGINT 文案是“再见”，SIGTERM 是“正在优雅停机…”，这里保持一致。
+#[cfg(unix)]
+fn install_signal_handlers() {
+    extern "C" fn on_sigterm(_: libc::c_int) {
+        const MSG: &[u8] = "\n收到 SIGTERM，正在优雅停机…\n".as_bytes();
+        unsafe {
+            libc::write(1, MSG.as_ptr() as *const libc::c_void, MSG.len());
+            libc::_exit(0);
+        }
+    }
+    extern "C" fn on_sigint(_: libc::c_int) {
+        const MSG: &[u8] = "\n再见\n".as_bytes();
+        unsafe {
+            libc::write(1, MSG.as_ptr() as *const libc::c_void, MSG.len());
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+    }
+}
+
 fn main() {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
     PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     let host = std::env::var("HOST").unwrap_or_default();
-
-    let ctx = Arc::new(Ctx {
-        world: Arc::new(World {
-            rooms: Mutex::new(HashMap::new()),
-            devices: Mutex::new(HashMap::new()),
-            offers_by_id: Mutex::new(HashMap::new()),
-            global_buffered: Mutex::new(0),
-            longpoll_count: Mutex::new(HashMap::new()),
-            offers_mutex: Mutex::new(()),
-            offers_cond: Condvar::new(),
-            started_at: now_ms(),
-        }),
-        statics: static_routes(),
-    });
 
     // 默认绑 127.0.0.1 + 局域网（RFC1918）网卡；显式 HOST 则只绑该地址
     let addrs: Vec<String> = if host.is_empty() {
@@ -1124,8 +1565,36 @@ fn main() {
         v.extend(lan_addresses().iter().map(|a| a.to_string()));
         v
     } else {
-        vec![host]
+        vec![host.clone()]
     };
+
+    // CIPHERLANE_TEST_LIMITS=1：仅降 per-IP 房间数/字节阈值，建房速率保持 120/min
+    let test_limits = std::env::var("CIPHERLANE_TEST_LIMITS").map(|v| v == "1").unwrap_or(false);
+    let limits = Limits {
+        ip_rooms_max: if test_limits { 4 } else { PER_IP_ROOMS },
+        ip_bytes_max: if test_limits { 2 * 1024 * 1024 } else { PER_IP_BYTES },
+    };
+    let allowed_hosts = build_allowed_hosts(&addrs, &host);
+
+    let ctx = Arc::new(Ctx {
+        world: Arc::new(World {
+            rooms: Mutex::new(HashMap::new()),
+            devices: Mutex::new(HashMap::new()),
+            offers_by_id: Mutex::new(HashMap::new()),
+            global_buffered: Mutex::new(0),
+            ip_bytes: Mutex::new(HashMap::new()),
+            ip_creates: Mutex::new(HashMap::new()),
+            longpoll_count: Mutex::new(HashMap::new()),
+            offers_mutex: Mutex::new(()),
+            offers_cond: Condvar::new(),
+            started_at: now_ms(),
+        }),
+        statics: static_routes(),
+        limits,
+        allowed_hosts,
+        update: Mutex::new(UpdateState::default()),
+        update_cond: Condvar::new(),
+    });
 
     let mut servers = vec![];
     for addr in &addrs {
@@ -1144,6 +1613,10 @@ fn main() {
             }
         }
     }
+
+    // 优雅停机：SIGTERM/SIGINT 打印关键词后 exit 0（测试会断言退出码 0）
+    #[cfg(unix)]
+    install_signal_handlers();
 
     std::thread::spawn({
         let ctx = ctx.clone();
@@ -1211,37 +1684,54 @@ mod tests {
         assert_eq!(*c.lock().unwrap(), 6);
     }
 
-    // 插入/取走分片后，房间字节数与全局计数必须同步归零；重复取走不得二次扣减。
+    // 插入/取走分片后，房间字节数、全局计数与 ip_bytes 必须同步归零；重复取走不得二次扣减。
     #[test]
     fn insert_and_take_keep_byte_accounting_in_sync() {
         let c = Mutex::new(0usize);
+        let ips = Mutex::new(HashMap::new());
+        let acct = ByteAccount { global: &c, ip_bytes: &ips, ip: "10.0.0.1" };
         let mut room = empty_room();
-        insert_chunk(&mut room, &c, 0, vec![7u8; 1024]);
-        insert_chunk(&mut room, &c, 1, vec![7u8; 2048]);
-        assert_eq!(*c.lock().unwrap(), 3072);
-        assert_eq!(room.bytes, 3072);
-        let c0 = take_chunk(&mut room, &c, 0).expect("chunk 0 应可取");
-        assert_eq!(c0.len(), 1024);
-        assert_eq!(room.bytes, 2048);
-        assert_eq!(*c.lock().unwrap(), 2048);
-        assert!(take_chunk(&mut room, &c, 0).is_none());
-        assert_eq!(*c.lock().unwrap(), 2048);
+        room.posted = 3;
+        insert_chunk(&mut room, &acct, 0, vec![7u8; 1024]);
+        insert_chunk(&mut room, &acct, 1, vec![7u8; 2048]);
+        insert_chunk(&mut room, &acct, 2, vec![7u8; 512]);
+        assert_eq!(*c.lock().unwrap(), 3584);
+        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 3584);
+        assert_eq!(room.bytes, 3584);
+        // 越序先取 1：head 不得推进（否则 0 号分片会变成不可达垃圾）
+        assert!(take_chunk(&mut room, &acct, 1).is_some());
+        assert_eq!(room.head, 0);
+        assert_eq!(room.bytes, 1536);
+        // 按序取 0：head 推进到 1，并跳过已取走的 1 → 2
+        assert!(take_chunk(&mut room, &acct, 0).is_some());
+        assert_eq!(room.head, 2);
+        assert_eq!(room.pulled, 2);
+        // 重复取走不得二次扣减
+        assert!(take_chunk(&mut room, &acct, 0).is_none());
+        assert_eq!(*c.lock().unwrap(), 512);
+        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 512);
+        assert!(take_chunk(&mut room, &acct, 2).is_some());
+        assert_eq!(*c.lock().unwrap(), 0);
+        assert!(!ips.lock().unwrap().contains_key("10.0.0.1"));
     }
 
     // progress 只释放 [1, through) 的数据分片，0 号 manifest 必须保留（续传重读用）。
     #[test]
     fn progress_releases_below_through_but_keeps_manifest() {
         let c = Mutex::new(0usize);
+        let ips = Mutex::new(HashMap::new());
+        let acct = ByteAccount { global: &c, ip_bytes: &ips, ip: "10.0.0.1" };
         let mut room = empty_room();
         for i in 0..3u64 {
-            insert_chunk(&mut room, &c, i, vec![0u8; 100]);
+            insert_chunk(&mut room, &acct, i, vec![0u8; 100]);
         }
         room.posted = 3; // 真实路径里 posted 由 handler 递增，insert_chunk 只管数据与记账
         assert_eq!(*c.lock().unwrap(), 300);
-        assert!(advance_through(&mut room, &c, 2));
+        assert!(advance_through(&mut room, &acct, 2));
         assert_eq!(*c.lock().unwrap(), 200);
+        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 200);
         assert!(room.buffer.contains_key(&0));
-        assert!(advance_through(&mut room, &c, 2)); // 重复/滞后上报幂等
+        assert!(advance_through(&mut room, &acct, 2)); // 重复/滞后上报幂等
         assert_eq!(*c.lock().unwrap(), 200);
     }
 
@@ -1271,5 +1761,65 @@ mod tests {
         ] {
             assert!(parse_chunk_seq(bad).is_none(), "应拒绝 {:?}", bad);
         }
+    }
+
+    #[test]
+    fn host_origin_gate_follows_node_rules() {
+        let mut allowed = HashSet::new();
+        for h in ["localhost", "127.0.0.1", "::1", "mybox.lan", "cipherlane-insecure.test"] {
+            allowed.insert(h.to_string());
+        }
+        // Host：IP 字面量动态放行；域名只在白名单；端口/大小写/尾点归一化
+        assert!(host_allowed("127.0.0.1:7777", &allowed));
+        assert!(host_allowed("[::1]:7777", &allowed));
+        assert!(host_allowed("::1", &allowed));
+        assert!(host_allowed("192.168.1.9:7777", &allowed));
+        assert!(host_allowed("LOCALHOST.:7777", &allowed));
+        assert!(host_allowed("mybox.lan:7777", &allowed));
+        assert!(!host_allowed("evil.example", &allowed));
+        assert!(!host_allowed("", &allowed));
+        // Origin/Referer：缺失放行；有值则 host 必须合法
+        assert!(origin_allowed("", &allowed));
+        assert!(origin_allowed("http://127.0.0.1:7777", &allowed));
+        assert!(origin_allowed("https://cipherlane-insecure.test:7777/page", &allowed));
+        assert!(!origin_allowed("https://evil.example", &allowed));
+        assert!(!origin_allowed("not-a-url", &allowed));
+    }
+
+    #[test]
+    fn semver_compares_numeric_segments() {
+        assert!(semver_newer("9.9.9", "0.5.1"));
+        assert!(semver_newer("0.6", "0.5.1"));
+        assert!(!semver_newer("0.0.1", "0.5.1"));
+        assert!(!semver_newer("0.5.1", "0.5.1"));
+        assert!(semver_newer("v1.0.0", "0.9.9"));
+        assert!(!semver_newer("garbage", "0.5.1"));
+        assert!(!semver_newer("0.5.1", "garbage"));
+    }
+
+    #[test]
+    fn device_name_control_chars_are_stripped() {
+        assert_eq!(clean_device_name("evil\u{1b}[31m\u{0}line\nname\u{9b}"), "evil[31mlinename");
+        assert_eq!(clean_device_name("  \u{1b}\u{0}  "), "未命名设备");
+        assert_eq!(clean_device_name("正常名字"), "正常名字");
+        let long: String = "a".repeat(DEVICE_NAME_MAX + 5);
+        assert_eq!(clean_device_name(&long).chars().count(), DEVICE_NAME_MAX);
+    }
+
+    #[test]
+    fn constant_time_compare_and_etag_helpers() {
+        assert!(ct_eq("abcdef", "abcdef"));
+        assert!(!ct_eq("abcdef", "abcdeg"));
+        assert!(!ct_eq("abc", "abcdef"));
+        let etag = "\"0123456789abcdef\"";
+        assert!(etag_matches(etag, etag));
+        assert!(etag_matches("*", etag));
+        assert!(etag_matches(&format!("W/\"x\", {}", etag), etag));
+        assert!(!etag_matches("\"other\"", etag));
+        assert_eq!(parse_strict_digits("007"), Some(7));
+        assert_eq!(parse_strict_digits(""), None);
+        assert_eq!(parse_strict_digits("+1"), None);
+        assert_eq!(parse_strict_digits("1 "), None);
+        assert_eq!(parse_strict_digits("9007199254740992"), None);
     }
 }
