@@ -112,18 +112,29 @@ const hiddenInvariant = (c, sid) =>
     .map((el) => el.id || el.className)`)
 
 // ---------- 启动:服务器 + 无头浏览器 ----------
+// v1.0 起产品去 Node：浏览器测试恒定启动 Rust 服务器二进制，不再有 Node/SEA 分支。
+// CIPHERLANE_SERVER_BIN 可覆盖（打包产物/自定义构建）；默认 cargo build --release 的输出。
+const SERVER_BIN = process.env.CIPHERLANE_SERVER_BIN
+  || path.join(ROOT, 'cipherlane-rs', 'target', 'release', 'cipherlane')
+
 function launchServer() {
-  // CL_SERVER_BIN: 直接测试打包产物（SEA 单文件二进制），而非源码
   // CIPHERLANE_EXTRA_HOSTS: 第 6 组用假域名 cipherlane-insecure.test 模拟非安全上下文，
   // 服务端 /api/* 的 Host 闸门默认只放行 IP/localhost，需显式白名单放行该域名。
   const env = { ...process.env, PORT: String(PORT), CIPHERLANE_EXTRA_HOSTS: 'cipherlane-insecure.test' }
-  const child = process.env.CL_SERVER_BIN
-    ? spawn(process.env.CL_SERVER_BIN, [], {
-        env, stdio: ['ignore', 'ignore', 'pipe'],
-      })
-    : spawn(process.execPath, ['server.js'], {
-        cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'],
-      })
+  try {
+    fs.accessSync(SERVER_BIN, fs.constants.X_OK)
+  } catch (e) {
+    throw new Error(
+      `找不到可执行的 Rust 服务器二进制：${SERVER_BIN}\n` +
+      '  · 先构建：CARGO_HOME=$PWD/build/cargo-home cargo build --release --manifest-path cipherlane-rs/Cargo.toml\n' +
+      '  · 或设置 CIPHERLANE_SERVER_BIN 指向已有二进制\n' +
+      `  · 原始错误：${e.message}`
+    )
+  }
+  const child = spawn(SERVER_BIN, [], {
+    cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  child.on('error', (e) => console.error(`✗ Rust 服务器启动失败(${SERVER_BIN}): ${e.message}`))
   child.stderr.on('data', () => {}) // 丢弃启动横幅,避免管道写满
   return child
 }
@@ -499,10 +510,12 @@ async function main() {
 
     // ---------- 10) 身份重置:应用内模态 —— 取消无副作用 / 确认换新且服务器同步 ----------
     {
-      // 冻结其他页面:sidB/sidC 与 sidA 同 IP(共享或轮换同一设备条目),其心跳
-      // 会在公钥同步断言窗口内与 sidA 的新公钥互相覆盖,造成竞态
-      await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidB).catch(() => {})
-      await c.send('Page.setWebLifecycleState', { state: 'frozen' }, sidC).catch(() => {})
+      // 停掉其他页面:sidB/sidC 与 sidA 同 IP(共享同一设备条目),其心跳会在公钥同步
+      // 断言窗口内把 sidA 的新公钥覆盖回旧值。曾用 setWebLifecycleState('frozen')
+      // 但该调用失败会被 .catch 吞掉、满负载时偶发不生效(真机 flake)。直接导航到
+      // about:blank 会让页面 JS 与心跳确定性停止,是竞态的根治手段。
+      await navigate(c, sidB, 'about:blank').catch(() => {})
+      await navigate(c, sidC, 'about:blank').catch(() => {})
       await navigate(c, sidA, S + '/')
       await waitFor(c, sidA,
         `/^#[0-9a-f]{32}$/.test(document.querySelector('#me-fp').textContent.trim())`, 10000, '重置前指纹')
@@ -534,7 +547,7 @@ async function main() {
       const pubPage = await evalJs(c, sidA, `toB64(identity.pk)`)
       let synced = false
       for (let i = 0; i < 40 && !synced; i++) {
-        const pubSrv = await evalJs(c, sidA, `(async () => (await (await fetch('/api/devices')).json()).devices[0]?.pub || '')()`)
+        const pubSrv = await evalJs(c, sidA, `(async () => (await (await fetch('/api/devices')).json()).devices.find((d) => d.ip === '127.0.0.1')?.pub || '')()`)
         if (pubSrv === pubPage) synced = true
         else await sleep(250)
       }

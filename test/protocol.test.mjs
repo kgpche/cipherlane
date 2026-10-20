@@ -1,8 +1,10 @@
-// 协议层验证 —— 起真实 server：设备在线/邀请/定向传输（X25519 派生密钥）全链路
+// 协议层验证 —— 对唯一被测实现（Rust 服务器二进制）跑真实 HTTP 全链路：
+// 设备在线/邀请/定向传输（X25519 派生密钥）、缓存/配额/加固等 v1.0 服务端能力。
 //
 // 注：本测试收发双方都来自 127.0.0.1，与"一个 IP 一台终端"模型形成同 IP 退化场景：
 //     后注册者轮换设备条目，先注册者需重新注册拿新 secret —— 测试顺带覆盖该路径。
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import http from 'node:http'
 import { randomBytes, createCipheriv, createDecipheriv, generateKeyPairSync, createPrivateKey, createPublicKey, diffieHellman, createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -15,6 +17,15 @@ const X25519 = require('../public/x25519.js')
 const SHA256 = require('../public/sha256.js')
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
+
+// v1.0 只测 Rust 二进制（Node 服务端已退出产品）。可用 CIPHERLANE_SERVER_BIN 覆盖路径。
+const SERVER_BIN = process.env.CIPHERLANE_SERVER_BIN || path.join(ROOT, 'cipherlane-rs/target/release/cipherlane')
+if (!fs.existsSync(SERVER_BIN)) {
+  console.error(`✗ 找不到被测服务器二进制：${SERVER_BIN}`)
+  console.error('  先构建：export CARGO_HOME=$PWD/build/cargo-home && cargo build --release --manifest-path cipherlane-rs/Cargo.toml')
+  console.error('  或设置 CIPHERLANE_SERVER_BIN=<path> 指定二进制。')
+  process.exit(1)
+}
 
 const PORT = 20000 + Math.floor(Math.random() * 20000)
 const S = `http://127.0.0.1:${PORT}`
@@ -68,11 +79,11 @@ function rawRequest(pathname, { method = 'GET', headers = {}, body } = {}) {
   })
 }
 
-// 独立起一个临时 server（随机端口、仅回环）：配额/更新等 Node 专属测试用，
-// 避免把测试专用 env 常驻到主 server 上，也不影响 Rust 平价。
+// 独立起一个临时 server（随机端口、仅回环）：配额/更新等测试用，
+// 避免把测试专用 env 常驻到主 server 上；被测二进制与主 server 相同。
 async function startTestServer(extraEnv = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000)
-  const child = spawn(process.execPath, ['server.js'], {
+  const child = spawn(SERVER_BIN, [], {
     cwd: ROOT,
     env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -102,10 +113,7 @@ async function register(name) {
 }
 
 async function main() {
-  // ---------- 启动真实服务器 ----------
-  // 平价对照引擎：CIPHERLANE_TEST_SERVER 指向其他实现（如 Rust 版二进制）时对其跑同一套断言
-  const ALT = (process.env.CIPHERLANE_TEST_SERVER || '').trim()
-
+  // ---------- 启动被测服务器（Rust 二进制，唯一实现） ----------
   // /api/update 的计数上游：/new 返回 9.9.9（较新）、/old 返回 0.0.1（较旧）
   let updateHits = 0
   const updateUpstream = http.createServer((req, res) => {
@@ -118,11 +126,8 @@ async function main() {
   const UPDATE_URL = UPDATE_BASE + '/new'
   const OLD_UPDATE_URL = UPDATE_BASE + '/old'
 
-  const serverEnv = { ...process.env, PORT: String(PORT) }
-  if (!ALT) serverEnv.CIPHERLANE_UPDATE_URL = UPDATE_URL // ALT 平价保持"未配置更新源"语义
-  const child = ALT
-    ? spawn(ALT, [], { cwd: ROOT, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] })
-    : spawn(process.execPath, ['server.js'], { cwd: ROOT, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  const serverEnv = { ...process.env, PORT: String(PORT), CIPHERLANE_UPDATE_URL: UPDATE_URL }
+  const child = spawn(SERVER_BIN, [], { cwd: ROOT, env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] })
   let logs = ''
   child.stdout.on('data', (d) => { logs += d })
   child.stderr.on('data', (d) => { logs += d })
@@ -521,7 +526,6 @@ async function main() {
 
     
     // ---------- 静态资源：ETag/304（HTML 仍 no-store） ----------
-    if (!ALT) {
       const a = await fetch(S + '/app.js')
       assert.strictEqual(a.status, 200)
       const etag = a.headers.get('etag')
@@ -535,10 +539,8 @@ async function main() {
       assert.strictEqual(html.headers.get('cache-control'), 'no-store', 'HTML 必须保持 no-store')
       await html.text()
       ok('静态资源：JS 200+ETag/no-cache → 304；HTML 仍 no-store')
-    }
 
     // ---------- 413 可达：超 BODY_MAX 回 JSON 而非 ECONNRESET ----------
-    if (!ALT) {
       const r13 = await jfetch('/api/rooms', { method: 'POST' })
       const rr13 = r13.json
       const big = await fetch(`${S}/api/rooms/${rr13.room}/chunk`, {
@@ -550,10 +552,8 @@ async function main() {
       assert.strictEqual((await big.json()).error, 'bad-body')
       assert.strictEqual((await jfetch('/api/version')).status, 200, '413 后服务器应继续可用')
       ok('413 可达：>1.5MiB 分片回 413 JSON（非 ECONNRESET），服务继续可用')
-    }
 
     // ---------- 请求边界：?i 缺失 400 / 越序 GET 不产生不可达分片 / DEPTH=3 预取 ----------
-    if (!ALT) {
       let rb = await jfetch('/api/rooms', { method: 'POST' })
       const br = rb.json
       const bkey = randomBytes(32)
@@ -581,7 +581,6 @@ async function main() {
       assert.deepStrictEqual(par.map((x) => x.status), [200, 200, 200, 200], 'DEPTH=3 并发按序预取应全 200')
       assert.strictEqual((await jfetch(`/api/rooms/${pr.room}/state`)).json.head, 4)
       ok('请求边界：缺/空 ?i→400；越序 GET 不产生不可达分片；DEPTH=3 并发预取正常')
-    }
 
     // ---------- 房间销毁与慢速 chunk POST 竞态：410 gone，不向已销毁房间记账 ----------
     {
@@ -622,7 +621,6 @@ async function main() {
     }
 
     // ---------- Host/Origin 闸门：防 DNS rebinding / 跨站 CSRF ----------
-    if (!ALT) {
       // 域名 Host（rebinding 前提）→ /api/* 403；IP 字面量 Host 正常
       assert.strictEqual((await rawRequest('/api/devices', { headers: { Host: 'evil.example' } })).status, 403)
       assert.strictEqual((await rawRequest('/api/devices', { headers: { Host: `127.0.0.1:${PORT}` } })).status, 200)
@@ -637,10 +635,8 @@ async function main() {
       assert.strictEqual(evilAdopt.status, 403, '跨站 Origin 的 adopt 应 403')
       assert.strictEqual((await rawRequest('/api/version', { headers: { Origin: `http://127.0.0.1:${PORT}` } })).status, 200)
       ok('Host/Origin：域名 Host 403 / IP Host 200 / 跨站 Origin 403 / 同源放行 / 静态页不受限')
-    }
 
     // ---------- /api/update：上游只请求一次（缓存 + in-flight 去重）+ 语义化 newer ----------
-    if (!ALT) {
       const hits0 = updateHits
       const [u1, u2] = await Promise.all([jfetch('/api/update'), jfetch('/api/update')])
       assert.strictEqual(u1.status, 200)
@@ -662,10 +658,8 @@ async function main() {
         srv.child.kill('SIGINT')
       }
       ok('/api/update：并发/缓存只请求上游一次、semver newer 正确、旧版本不误报')
-    }
 
     // ---------- per-IP 配额：独立低阈值 server（CIPHERLANE_TEST_LIMITS=1 → 4 房 / 2MB） ----------
-    if (!ALT) {
       const q = await startTestServer({ CIPHERLANE_TEST_LIMITS: '1', CIPHERLANE_UPDATE_URL: 'file:///etc/hostname' })
       try {
         const qrooms = []
@@ -716,10 +710,8 @@ async function main() {
       } finally {
         q.child.kill('SIGINT')
       }
-    }
 
     // ---------- 建房速率：滑动 60s 内第 121 次建房 → 429 ip-quota ----------
-    if (!ALT) {
       const rs = await startTestServer({ CIPHERLANE_TEST_LIMITS: '1' })
       try {
         for (let i = 0; i < 120; i++) {
@@ -738,10 +730,8 @@ async function main() {
       } finally {
         rs.child.kill('SIGINT')
       }
-    }
 
     // ---------- 设备名净化：C0/C1 控制字符入库前剔除（防终端转义注入） ----------
-    if (!ALT) {
       const kp = X25519.genKey()
       const dirty = 'evil\u001b[31m\u0000line\nname\u009b'
       const reg = await jfetch('/api/presence', {
@@ -754,7 +744,6 @@ async function main() {
       assert.strictEqual(me.name, 'evil[31mlinename', '控制字符应被移除后再 trim/slice')
       assert(!/[\u0000-\u001f\u007f-\u009f]/.test(me.name), '不应残留控制字符')
       ok('设备名净化：ESC/NUL/换行/C1 被剔除，/api/devices 返回干净名称')
-    }
 
     // ---------- 面板端点 ----------
     {
@@ -766,10 +755,10 @@ async function main() {
       assert.strictEqual(r.status, 403, '空令牌应 403')
       r = await jfetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'x'.repeat(24) }) })
       assert.strictEqual(r.status, 403, '错令牌应 403')
-      // update：主 server 已配置计数上游（ALT 平价不配 env，保持"无源如实返回"）
+      // update：主 server 配置了计数上游，source 应如实回显（缓存命中之一致）
       r = await jfetch('/api/update')
       assert.strictEqual(r.status, 200)
-      assert.strictEqual(r.json.source, ALT ? null : UPDATE_URL)
+      assert.strictEqual(r.json.source, UPDATE_URL)
       // panel 静态页可达
       const html = await fetch(S + '/panel')
       assert.ok(html.ok && (await html.text()).includes('控制面板'))
@@ -796,7 +785,6 @@ async function main() {
     }
 
     // ---------- SIGTERM 优雅停机：退出码 0 + 停机文案 ----------
-    if (!ALT) {
       const exited = await new Promise((resolve) => {
         const t = setTimeout(() => resolve(null), 3000)
         child.once('close', (code, signal) => { clearTimeout(t); resolve({ code, signal }) })
@@ -806,7 +794,6 @@ async function main() {
       assert.strictEqual(exited.code, 0, `SIGTERM 应退出码 0，实际 code=${exited.code} signal=${exited.signal}`)
       assert(/优雅停机/.test(logs), '应打印优雅停机文案: ' + logs.slice(-300))
       ok('SIGTERM 优雅停机：关闭监听/连接后 exit 0')
-    }
 
 console.log(`\nprotocol: 全部 ${passed} 组通过`)
   } finally {
