@@ -243,12 +243,14 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **原生 Rust CLI** 完整替代 Node CLI：子命令与选项不变（`devices` / `send` / `send-text` / `recv` / `listen`；`--to`、`--verify`、`--name`、`--server`、`-o`、`--yes`），支持协议 v2 AAD 与 v1 回退、链接模式断点续传、批量/目录递归、128bit TOFU 指纹与控制字符净化
 - **三平台 Rust 原生产物**：Linux deb（musl 静态 server/tray/cli，≈1.3MB）、Windows x64 zip（`cipherlane.exe` + `cipherlane-cli.exe`，静态 CRT）、macOS 通用 tar.gz（`lipo` 合并 arm64+x64）——不再有 Node、二进制注入等步骤
 - **发布自动化**：推送 `v*` 标签即由 GitHub 官方 runner 三平台原生构建，并用官方 `gh` CLI 发布产物与统一 SHA256SUMS；手动触发只构建 artifact 不发布
-- **CI**：Rust 三 bin 构建 + `cargo test`（crypto / protocol / CLI / browser / consistency）+ musl 协议平价 + deb 打包冒烟；一致性守卫本身也是 Rust 测试，校验版本、`include_bytes!` 资源与零 Node 残留
+- **CI**：Rust 三 bin 构建 + `cargo test`（crypto / protocol / CLI / browser / consistency）+ musl 协议平价 + deb 打包冒烟（断言三 bin 与维护脚本齐全）；Windows/macOS 编译门禁前置到普通 push/PR，CI 强制要求 Chrome（`CIPHERLANE_REQUIRE_CHROME=1`，前端覆盖不许静默清零）；发版前校验 tag 与 Cargo.toml 版本一致；一致性守卫本身也是 Rust 测试，校验版本、`include_bytes!` 资源与零 Node 残留
+- **服务端连接层加固**（v1.0 收口）：vendor 补丁版 tiny_http——请求头 16KiB 预算、每连接 60s 读/写超时、并发连接上限 256（对齐旧 JS 运行时的默认防护，堵住 slowloris 面）；真·优雅停机（停止派发 → 250ms 排干在途请求 → exit 0，SIGTERM/面板停机同路径）；worker panic 隔离（catch_unwind）与锁毒化恢复，单请求异常不再级联；`/api/update` 支持 https（rustls，纯 Rust TLS）与 ≤3 次重定向、响应上限 64KiB、单飞等待有界；设备/建房/字节配额三处并发窗口收口（检查与入账同一临界区）；静态资源 Arc 化零拷贝回源
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）
 - **分片投递幂等**：新增可选 `X-Chunk-Seq` 头；浏览器/CLI 的超时与背压重投复用同一序号，
   服务端只接受一次，杜绝"响应丢失后重投"造成的重复分片/错位；Node 与 Rust 服务端同构
+  （彼时双实现并存；v1.0 起仅剩 Rust 实现）
 - **前端可靠性**：API/心跳/邀请/状态轮询统一超时并防重入；邀请列表按服务端全量对账、
   清空后停止标题闪烁；设备列表差量渲染（不再每 5s 重建丢焦点）；同一时刻仅一路接收
 - **测试**：protocol 26 组（其中 17 组同时跑 Rust 服务端平价）、browser 19 组、cli 10 组
@@ -349,7 +351,7 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - 安全：ack 携带密钥凭证（无密钥者伪造的 ack 发送方可辨）；设备公钥指纹 + 变更警示（TOFU）；
   默认只绑回环 + 局域网网卡（不再默认 0.0.0.0，避免暴露 VPN/tun 网段）
 - 工程：零依赖浏览器冒烟测试 ×6（CDP 驱动 Chrome，前端自此有自动化测试）；
-  GitHub Actions CI（Node 18/20/22）；打包脚本入库并加供应链校验（SHASUMS256）；
+  GitHub Actions CI（Node 18/20/22，当时的 JS 工具链矩阵）；打包脚本入库并加供应链校验（SHASUMS256）；
   deb 包 systemd 最小权限化；连接停滞超时重试、listen 掉线告警
 
 **v0.2.1**（2026-10-12）

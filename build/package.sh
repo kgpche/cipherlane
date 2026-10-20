@@ -72,6 +72,14 @@ package_linux() {
   if command -v rustup >/dev/null 2>&1; then
     rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
   fi
+  # v1.0 加固起引入 rustls（ring 含 C 代码）：musl 交叉编译需要 musl-gcc。
+  # CI 已自动安装 musl-tools；本机缺失时给出明确指引（cc 报错会深得多）。
+  if ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1 && [ -z "$CC_x86_64_unknown_linux_musl" ]; then
+    echo "✗ 缺少 musl 交叉 C 编译器（rustls 的 ring 后端需要）。任选其一："
+    echo "    sudo apt-get install -y musl-tools        # 方式一：系统包"
+    echo "    export CC_x86_64_unknown_linux_musl='zig cc -target x86_64-linux-musl'  # 方式二：已有 zig"
+    exit 1
+  fi
   echo ">> 构建 Linux musl 静态二进制（server / tray / cli）…"
   cargo_build --target x86_64-unknown-linux-musl
   REL=$TARGET_DIR/x86_64-unknown-linux-musl/release
@@ -202,6 +210,26 @@ exit 0
 POSTINST
   chmod 755 "$DEBROOT/DEBIAN/postinst"
 
+  # prerm：升级/卸载前停服务——否则升级后旧进程继续跑旧二进制直到手动 restart
+  cat > "$DEBROOT/DEBIAN/prerm" << 'PRERM'
+#!/bin/sh
+if [ "$1" = "upgrade" ] || [ "$1" = "remove" ]; then
+  systemctl stop cipherlane 2>/dev/null || true
+fi
+exit 0
+PRERM
+  chmod 755 "$DEBROOT/DEBIAN/prerm"
+
+  # postrm：卸载后清掉失效的 unit 引用（升级路径由新包 postinst 的 daemon-reload 覆盖）
+  cat > "$DEBROOT/DEBIAN/postrm" << 'POSTRM'
+#!/bin/sh
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  systemctl daemon-reload 2>/dev/null || true
+fi
+exit 0
+POSTRM
+  chmod 755 "$DEBROOT/DEBIAN/postrm"
+
   rm -f "$DIST/cipherlane_${VER}_amd64.deb"
   dpkg-deb --build --root-owner-group "$DEBROOT" "$DIST/cipherlane_${VER}_amd64.deb" >/dev/null
   ARTIFACTS="cipherlane_${VER}_amd64.deb"
@@ -281,6 +309,8 @@ package_windows() {
 cipherlane · 密道（Windows 版）
 ================================
 启动：双击 cipherlane.exe（控制台显示局域网地址与二维码），Ctrl+C 退出
+      首次运行若被 SmartScreen 拦截（未签名 exe 的常规提示）：
+      点"更多信息" → "仍要运行"
 使用：浏览器打开启动后打印的局域网地址；其他设备需在同一 WiFi/网段
 CLI：cipherlane-cli.exe devices --server http://127.0.0.1:7777
      cipherlane-cli.exe send big.zip --server http://127.0.0.1:7777

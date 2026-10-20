@@ -30,6 +30,18 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      # tag 与 Cargo.toml 版本必须一致：产物文件名来自 Cargo.toml，错位会发布
+      # "标题 v1.0.1、文件 cipherlane_1.0.0_*" 的混乱 Release
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(grep -m1 '^version' cipherlane-rs/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "::error::标签 v$TAG_VER 与 cipherlane-rs/Cargo.toml version=$CARGO_VER 不一致（先同步版本再打标签）"
+            exit 1
+          fi
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -41,6 +53,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
       # shell: bash（Windows 走 Git Bash）；package.sh 按 uname 自动选择平台产物
+      - name: Install musl cross toolchain (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - name: Build package (native)
         shell: bash
         run: sh build/package.sh

@@ -79,8 +79,9 @@ v1.0.0 起 Node 实现删除，测试只针对 Rust 二进制运行，平价钩�
 
 ## 依赖面
 
-- 服务器：`tiny_http` + `serde_json` + `rand` + `base64` + `if-addrs`（+ `sha2` 用于 ETag，
-  `libc` 用于 unix 信号）
+- 服务器：`tiny_http`（**vendor 补丁版**，见 `vendor/tiny_http/PATCHES.md`）+ `serde_json`
+  + `rand` + `base64` + `if-addrs`（+ `sha2` 用于 ETag，`rustls`/`webpki-roots` 用于
+  https 更新源，`libc` 用于 unix 信号，后两者按 target 隔离）
 - 托盘：`ksni`（zbus，纯 Rust，仅 Linux target）
 - CLI：`sha2` / `aes-gcm` / `x25519-dalek` / `qrcodegen` / `rand` / `base64`
 - 测试（dev-dependencies）：`tungstenite`（CDP over WebSocket）
@@ -92,10 +93,38 @@ v1.0.0 起 Node 实现删除，测试只针对 Rust 二进制运行，平价钩�
 - 托盘仅 Linux（StatusNotifierItem / AppIndicator）；Windows/macOS 为终端运行 server/cli，
   无托盘。
 - `browser` 测试需要 Chrome/Chromium：CI 的 ubuntu-latest 自带 google-chrome；本机缺失时
-  测试内部打印跳过并以成功返回（与旧套件语义一致）。
+  测试内部打印跳过并以成功返回（与旧套件语义一致）；CI 设 `CIPHERLANE_REQUIRE_CHROME=1`
+  把"无 Chrome"升级为失败，防止前端覆盖静默清零。
 - Windows 构建在本机无法验证（需 Windows 环境）：由 CI 的 `windows-latest` 原生构建；
   静态 CRT 目标为 Windows 10/11 x64。
 - macOS universal 构建在本机无法验证（需 macOS + Xcode CLT 的 `lipo`）：由 CI 的
   `macos-latest` 原生构建；未签名/未公证，首次运行需右键打开。
 - 线协议兼容：v1.0 与 v0.5.x 线协议一致；v0.5.0+ 发送端与 v0.4.x 接收端不兼容
   （协议 v2 升级），两端需同时升级。
+
+## v1.0 加固收口（2026-10-20，review 后全面优化）
+
+Rust 化 review 发现的三类缺口全部修复：
+
+- **连接层**：`tiny_http` 改为 vendor 补丁版（`vendor/tiny_http/`，`[patch.crates-io]`
+  接入，差异见其 `PATCHES.md`）——请求头 16KiB 预算、每连接 60s 读/写超时（上游
+  client.rs 本就内置 TimedOut→408 断连，只是从未有人设超时）、并发连接上限 256。
+  旧 JS 运行时的默认防护（maxHeaderSize/headersTimeout 等）就此补齐，slowloris 面关闭。
+- **优雅停机**：SIGTERM/SIGINT 由 `pthread_sigmask`+`sigwait` 专职线程消费——打印文案、
+  停止向 worker 派发（unblock×WORKERS）、在途请求最多 250ms 排干（对齐旧版
+  closeAllConnections 时点）、exit 0；`/api/shutdown` 走同一条排干路径（不再裸 exit）。
+- **故障隔离**：worker 以 `catch_unwind` 包住 handler（单请求 panic 只丢该连接）；
+  全部锁改为毒化恢复（`PoisonError::into_inner`），杜绝"一锁毒化级联团灭全部 worker"；
+  `/api/update` 单飞等待 30s 有界 + panic 安全复位（Drop guard）。
+- **`/api/update` 补 https**：引入 `rustls`（ring 后端，纯 Rust TLS）+ `webpki-roots`，
+  支持 https、≤3 次 30x 重定向、chunked/Content-Length 双解码、响应上限 64KiB、
+  URL 字符白名单（防 CRLF 注入上游请求行）。
+- **并发窗口收口**：DEVICES_MAX / 建房双闸 / 全局与 per-IP 字节配额三处 check-then-act
+  全部并入单一临界区（字节配额经 `ByteAccount::try_add` 原子检查+入账）。
+- **协议边角对齐**：offer 的 hint 必须为 string（缺失/非 string → 400，对齐旧版）；
+  `?i` 只接受唯一纯十进制参数（重复/百分号编码 → 400）；长轮询 per-IP 配额只在真正
+  挂起时占用（即时应答不计数，对齐旧版）。
+- **工程**：静态资源 `Arc<[u8]>` 零拷贝回源；死代码/警告清零；CI 增 Windows/macOS
+  编译门禁（push/PR 即验证，不再等发版）、Chrome 必需断言（`CIPHERLANE_REQUIRE_CHROME=1`）、
+  deb 巡检断言三 bin + postinst/prerm/postrm 齐全；release 校验 tag↔Cargo.toml 版本；
+  deb 补 prerm（升级/卸载停服）/postrm（daemon-reload）；Windows zip 附 SmartScreen 提示。

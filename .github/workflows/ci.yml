@@ -22,6 +22,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # CI 必须真的跑前端覆盖：ubuntu-latest 预装 Chrome，若缺失则 fail 而非静默跳过
+      CIPHERLANE_REQUIRE_CHROME: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Cache cargo
@@ -39,10 +42,38 @@ jobs:
       # 一致性守卫先跑：版本徽章 / include_bytes ↔ public / 无外部运行时残留，失败信息精确到文件行号
       - name: Consistency guard
         run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml --test consistency
-      # 浏览器套件由 Rust CDP 客户端驱动真实 Chrome：ubuntu-latest 自带 google-chrome；
-      # 无 Chrome 时测试内部打印跳过（不失败）。
+      # 浏览器套件由 Rust CDP 客户端驱动真实 Chrome（ubuntu-latest 自带 google-chrome）。
       - name: Full test suite
         run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml
+
+  # 三平台编译门禁：Windows/macOS 在普通 push/PR 就验证可编译（含全部测试目标），
+  # 而不是等 tag 发布时才在 Release workflow 里暴露 cfg(unix)/平台 API 误用。
+  cross-build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cipherlane-rs/target
+          key: ${{ runner.os }}-cargo-cross-${{ hashFiles('cipherlane-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cross-
+      - name: Build release binaries
+        run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
+      # 编译全部测试目标（--no-run）：cli 套件在 Windows 为空目标属预期，重点是
+      # common/browser/crypto 等脚手架不许出现平台不兼容代码
+      - name: Compile test targets
+        run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml --no-run
 
   # 发布形态验证：musl 静态产物（deb 实际内容）、协议平价、deb 打包冒烟
   dist:
@@ -62,6 +93,8 @@ jobs:
             ${{ runner.os }}-cargo-dist-
       - name: Build static musl binaries (deb payload)
         run: |
+          # rustls 的 ring 后端含 C 代码：musl 交叉编译需要 musl-gcc（ubuntu 镜像不预装）
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --target x86_64-unknown-linux-musl --manifest-path cipherlane-rs/Cargo.toml
       # 同一套协议断言对 musl 发布二进制再跑一遍（CIPHERLANE_SERVER_BIN 覆盖被测路径）
@@ -76,6 +109,14 @@ jobs:
         run: |
           ls -la build/dist
           deb=$(ls build/dist/cipherlane_*_amd64.deb | head -n 1)
-          dpkg-deb -c "$deb" | grep -E 'usr/bin/(cipherlane|cipherlane-cli|cipherlane-tray)$'
+          # 三个二进制必须齐全：命中任意一个即通过的老写法发现不了缺件
+          n=$(dpkg-deb -c "$deb" | grep -cE 'usr/bin/(cipherlane|cipherlane-cli|cipherlane-tray)$')
+          if [ "$n" -ne 3 ]; then echo "::error::deb 内二进制应为 3 个，实际 $n"; exit 1; fi
           dpkg-deb -c "$deb" | grep -E 'systemd/system/cipherlane.service$'
           dpkg-deb -c "$deb" | grep -E 'applications/cipherlane.desktop$'
+          # 维护脚本齐全（prerm/postrm 是升级停服与卸载清理的保障；-c 只列数据包，control 须 -e 解出）
+          ctl=$(mktemp -d)
+          dpkg-deb -e "$deb" "$ctl"
+          for s in postinst prerm postrm; do
+            [ -f "$ctl/$s" ] || { echo "::error::deb 缺少 DEBIAN/$s"; exit 1; }
+          done
