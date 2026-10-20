@@ -268,16 +268,12 @@ fn random_bytes(n: usize) -> Vec<u8> {
     v
 }
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc == 0 {
-        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let s = String::from_utf8_lossy(&buf[..n]).to_string();
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    "cipherlane".to_string()
+    // 跨平台：unix 用 HOSTNAME，Windows 用 COMPUTERNAME；都缺失时回退固定名。
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "cipherlane".to_string())
 }
 
 // ============================================================
@@ -1439,7 +1435,8 @@ fn accept_offer(server: &UrlParts, secret: &str, id: &Identity, opts: &Opts, off
     println!("  （请与发送方当面/口头核对；不会自动比对）");
 
     if !opts.yes {
-        let is_tty = unsafe { libc::isatty(0) } == 1;
+        use std::io::IsTerminal;
+        let is_tty = std::io::stdin().is_terminal();
         if !is_tty {
             println!("  非 TTY 环境需 --yes 才能自动接受，已拒绝");
             let _ = reject_offer(server, secret, &oid);

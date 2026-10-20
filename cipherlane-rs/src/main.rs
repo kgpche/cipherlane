@@ -1616,6 +1616,7 @@ fn main() {
 
     // 优雅停机：SIGTERM/SIGINT 打印关键词后 exit 0（测试会断言退出码 0）
     #[cfg(unix)]
+    #[cfg(unix)]
     install_signal_handlers();
 
     std::thread::spawn({

@@ -11,7 +11,6 @@ serde_json = "1"
 rand = "0.8"
 base64 = "0.22"
 if-addrs = "0.13"
-ksni = { version = "0.3", features = ["blocking"] }
 # v1.0：产品去 Node —— CLI 需要与浏览器逐字节互通的密码学原语，服务器需要 sha256（ETag）
 sha2 = "0.10"
 aes-gcm = "0.10"
@@ -19,6 +18,11 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 qrcodegen = "1"
 # 服务器 SIGTERM/SIGINT 优雅停机（仅 unix 分支使用）
 libc = "0.2"
+
+# 托盘仅 Linux（ksni = StatusNotifierItem/AppIndicator）；按 target 隔离，
+# 避免 Windows/macOS 构建被迫编译 zbus/ksni。
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
 
 [[bin]]
 name = "cipherlane"
