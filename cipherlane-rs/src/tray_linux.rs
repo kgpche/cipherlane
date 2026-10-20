@@ -4,7 +4,7 @@
 // 托盘启动的服务持有停机令牌（面板"退出"可用）；外部启动的服务（如 systemd）只读管理。
 use ksni::blocking::TrayMethods; // 提供 Tray::spawn() 的同步阻塞版本
 use ksni::menu::StandardItem;
-use ksni::{Icon, MenuItem, ToolTip, Tray};
+use ksni::{MenuItem, ToolTip, Tray};
 use rand::Rng;
 use std::net::TcpStream;
 use std::io::{Read, Write};
@@ -177,7 +177,6 @@ impl Tray for CipherlaneTray {
             items.push(MenuItem::Separator);
         }
         if self.running {
-            let base = self.base();
             items.push(MenuItem::Standard(StandardItem {
                 label: "打开主页".into(),
                 activate: Box::new(|t: &mut Self| open(&format!("{}/", t.lan_base()))),

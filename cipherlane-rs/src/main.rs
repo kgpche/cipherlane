@@ -1,9 +1,13 @@
-// cipherlane · 密道 —— Rust 重构版服务器
+// cipherlane · 密道 —— Rust 版服务器
 //
 // 线协议为唯一实现；验收 = cargo test --test protocol（Rust 集成测试）对本实现全绿。
-// 架构：tiny_http 同步模型 + 每地址 256 工作线程；长轮询以 Condvar 挂起
-// （LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）。
+// 架构：tiny_http（vendor 补丁版：请求头 16KiB 预算 / 每连接 60s 读写超时 /
+// 并发连接上限 256，见 vendor/tiny_http/PATCHES.md）+ 每地址 128 工作线程；
+// worker 带 panic 隔离（catch_unwind）与锁毒化恢复，单个请求异常不波及服务；
+// 长轮询以 Condvar 挂起（LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）；
+// 优雅停机：sigwait 专职线程 → 停止派发 → 250ms 排干 → exit 0（对齐 Node 语义）。
 // 零知识：服务器只存转 AES-256-GCM 密文分片，永不做任何加解密。
+// 锁序：rooms → room.inner → global_buffered → ip_bytes（全程按此序获取）。
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -53,8 +57,9 @@ fn now_ms() -> u128 {
 }
 
 // ---------- 静态资源（编译期内嵌，等价 SEA） ----------
+// data 用 Arc：每请求响应只克隆指针（app.js 等较大文件高频回源时不再整体拷贝）
 struct StaticFile {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     ctype: &'static str,
     etag: String,
 }
@@ -65,7 +70,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 fn static_routes() -> Vec<(&'static str, StaticFile)> {
     let sf = |data: &'static [u8], t: &'static str| {
-        let data = data.to_vec();
+        let data: Arc<[u8]> = Arc::from(data.to_vec());
         let etag = format!("\"{}\"", sha256_hex(&data));
         StaticFile { data, ctype: t, etag }
     };
@@ -88,7 +93,7 @@ fn static_routes() -> Vec<(&'static str, StaticFile)> {
     for e in v.iter_mut() {
         if e.0 == "/" {
             let s = String::from_utf8_lossy(&e.1.data).replace("__VERSION__", VERSION);
-            e.1.data = s.into_bytes();
+            e.1.data = Arc::from(s.into_bytes());
             // ETag 必须基于替换版本号后的最终字节（与 Node 的读取顺序一致）
             e.1.etag = format!("\"{}\"", sha256_hex(&e.1.data));
         }
@@ -127,7 +132,6 @@ struct RoomInner {
 struct Room {
     id: String,
     sender_ip: String,
-    created_at: u128,
     last_active: Mutex<u128>,
     inner: Mutex<RoomInner>,
     cond: Condvar,
@@ -138,10 +142,12 @@ struct Device {
     secret: String,
     name: Mutex<String>,
     pub_: Mutex<String>,
-    since: u128,
     last_seen: Mutex<u128>,
 }
 struct World {
+    // 锁获取统一用 unwrap_or_else(PoisonError::into_inner)（毒化恢复）：配合 worker 的
+    // catch_unwind，单个请求 panic 至多留下计数/集合的轻微漂移（Rust 保证结构始终
+    // 内存安全），不允许毒化连锁击杀其余 worker（Node 版等价行为：try/catch 后继续服务）。
     rooms: Mutex<HashMap<String, Arc<Room>>>,
     devices: Mutex<HashMap<String, Arc<Device>>>,
     offers_by_id: Mutex<HashMap<String, String>>,
@@ -167,6 +173,18 @@ struct UpdateState {
     inflight: bool,
     last_result: Option<String>,
 }
+// 单飞标志的 panic 安全复位：fetch_update 期间 panic（被 worker 的 catch_unwind
+// 隔离）时由 Drop 复位 inflight 并唤醒等待者，避免后来请求永久挂起
+struct UpdateInflightGuard<'a>(&'a Ctx);
+impl Drop for UpdateInflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.inflight {
+            st.inflight = false;
+            self.0.update_cond.notify_all();
+        }
+    }
+}
 // 密文字节记账（room.bytes / global_buffered / ip_bytes 必须在同一处成对增减）
 struct ByteAccount<'a> {
     global: &'a Mutex<usize>,
@@ -174,13 +192,6 @@ struct ByteAccount<'a> {
     ip: &'a str,
 }
 impl ByteAccount<'_> {
-    fn add(&self, inner: &mut RoomInner, n: usize) {
-        inner.bytes = inner.bytes.saturating_add(n);
-        counter_add(self.global, n);
-        let mut m = self.ip_bytes.lock().unwrap();
-        let cur = m.get(self.ip).copied().unwrap_or(0);
-        m.insert(self.ip.to_string(), cur.saturating_add(n));
-    }
     fn del(&self, inner: &mut RoomInner, n: usize) {
         if n == 0 {
             return;
@@ -189,9 +200,25 @@ impl ByteAccount<'_> {
         counter_sub(self.global, n);
         ip_bytes_sub(self.ip_bytes, self.ip, n);
     }
+    /// 原子上账：在同一组全局锁（global_buffered → ip_bytes，锁序见文件头）下
+    /// 检查并加上 n 字节；任一全局/per-IP 配额不满足则不动任何计数返回 false。
+    /// 房间级配额（outstanding/room bytes）由调用方在 inner 锁内自查。
+    /// 与 del 的锁序一致，跨房间的检查+入账不再有 TOCTOU 窗口。
+    fn try_add(&self, inner: &mut RoomInner, n: usize, global_max: usize, ip_max: usize) -> bool {
+        let mut g = self.global.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ipm = self.ip_bytes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ip_used = ipm.get(self.ip).copied().unwrap_or(0);
+        if *g + n > global_max || ip_used + n > ip_max {
+            return false;
+        }
+        inner.bytes = inner.bytes.saturating_add(n);
+        *g = g.saturating_add(n);
+        ipm.insert(self.ip.to_string(), ip_used.saturating_add(n));
+        true
+    }
 }
 fn ip_bytes_sub(map: &Mutex<HashMap<String, usize>>, ip: &str, n: usize) {
-    let mut m = map.lock().unwrap();
+    let mut m = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let left = m.get(ip).copied().unwrap_or(0).saturating_sub(n);
     if left > 0 {
         m.insert(ip.to_string(), left);
@@ -244,7 +271,7 @@ fn hdr_values(req: &tiny_http::Request, name: &'static str) -> Vec<Vec<u8>> {
 fn h(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
 }
-fn json_resp(mut res: tiny_http::Request, code: u16, body: String) {
+fn json_resp(res: tiny_http::Request, code: u16, body: String) {
     let _ = res.respond(
         Response::from_string(body)
             .with_status_code(code)
@@ -297,18 +324,13 @@ fn valid_room_id(s: &str) -> bool {
     s.len() == ROOM_ID_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 fn touch(room: &Room) {
-    *room.last_active.lock().unwrap() = now_ms();
+    *room.last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now_ms();
 }
-// 全局缓冲计数：所有加值都必须在持有房间 inner 锁时完成（锁序 inner → global_buffered），
-// 与 take_chunk / advance_through / destroy_room 的减法串行，避免"减法先于加法"造成
-// usize 瞬时回绕（窗口内并发上传会被误判超限 429）。减法再用 saturating_sub 兜底：
-// 即使将来记账再出错，也不会留下一个巨大计数把全站上传永久顶死。
-fn counter_add(c: &Mutex<usize>, n: usize) {
-    let mut g = c.lock().unwrap();
-    *g = g.saturating_add(n);
-}
+// 全局缓冲计数：减法都走 counter_sub（与 destroy_room / take_chunk / advance_through 串行），
+// saturating_sub 兜底——即使将来记账出错，也不会留下巨大计数把全站上传永久顶死；
+// 产线加值走 ByteAccount::try_add（原子检查+入账），counter_add 仅供测试构造场景。
 fn counter_sub(c: &Mutex<usize>, n: usize) {
-    let mut g = c.lock().unwrap();
+    let mut g = c.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     *g = g.saturating_sub(n);
 }
 // X-Chunk-Seq 严格解析：只接受十进制非负整数，拒绝符号、中间空白、非数字和溢出。
@@ -529,7 +551,7 @@ struct LongpollGuard {
 }
 impl LongpollGuard {
     fn enter(world: &Arc<World>, ip: &str) -> Option<LongpollGuard> {
-        let mut m = world.longpoll_count.lock().unwrap();
+        let mut m = world.longpoll_count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let n = m.get(ip).copied().unwrap_or(0) + 1;
         if n > LONGPOLL_PER_IP {
             return None;
@@ -540,7 +562,7 @@ impl LongpollGuard {
 }
 impl Drop for LongpollGuard {
     fn drop(&mut self) {
-        let mut m = self.world.longpoll_count.lock().unwrap();
+        let mut m = self.world.longpoll_count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let n = m.get(&self.ip).copied().unwrap_or(1) - 1;
         if n <= 0 {
             m.remove(&self.ip);
@@ -552,16 +574,16 @@ impl Drop for LongpollGuard {
 
 // ---------- 房间操作 ----------
 fn device_alive(d: &Device) -> bool {
-    now_ms().saturating_sub(*d.last_seen.lock().unwrap()) <= DEVICE_TTL_MS
+    now_ms().saturating_sub(*d.last_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) <= DEVICE_TTL_MS
 }
 fn pending_offers_for(world: &World, ip: &str) -> Vec<serde_json::Value> {
-    let rooms = world.rooms.lock().unwrap();
+    let rooms = world.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = now_ms();
     let mut list = vec![];
     for room in rooms.values() {
-        let inner = room.inner.lock().unwrap();
+        let inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(o) = &inner.offer {
-            if o.to_ip == ip && *o.state.lock().unwrap() == "pending" && now.saturating_sub(o.created_at) <= OFFER_TTL_MS {
+            if o.to_ip == ip && *o.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == "pending" && now.saturating_sub(o.created_at) <= OFFER_TTL_MS {
                 list.push(serde_json::json!({
                     "id": o.id, "room": room.id, "pub": o.pub_, "hint": o.hint,
                     "from": { "ip": o.from_ip, "name": o.from_name },
@@ -611,25 +633,16 @@ fn advance_through(inner: &mut RoomInner, acct: &ByteAccount, through: u64) -> b
     }
     true
 }
-// 插入分片并记账：inner.bytes / global_buffered / ip_bytes 的加值都在调用方持有的
-// inner 锁内完成，与所有减法路径串行，杜绝“减法先于加法”的瞬时回绕。
-fn insert_chunk(inner: &mut RoomInner, acct: &ByteAccount, i: u64, body: Vec<u8>) -> usize {
-    let arc = Arc::new(body);
-    let added = arc.len();
-    inner.buffer.insert(i, arc);
-    acct.add(inner, added);
-    added
-}
 fn destroy_room(world: &World, room: &Arc<Room>) {
     {
-        let mut rooms = world.rooms.lock().unwrap();
+        let mut rooms = world.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !rooms.contains_key(&room.id) {
             return;
         }
         rooms.remove(&room.id);
     }
     {
-        let mut inner = room.inner.lock().unwrap();
+        let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = std::mem::take(&mut inner.bytes);
         inner.buffer.clear();
         // 与 global_buffered / ip_bytes 在同一临界区成对释放
@@ -637,7 +650,7 @@ fn destroy_room(world: &World, room: &Arc<Room>) {
         ip_bytes_sub(&world.ip_bytes, &room.sender_ip, bytes);
         inner.dead = true;
         if let Some(o) = &inner.offer {
-            world.offers_by_id.lock().unwrap().remove(&o.id);
+            world.offers_by_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&o.id);
             println!("[offer] - {}（房间销毁）", o.id);
         }
     }
@@ -646,7 +659,7 @@ fn destroy_room(world: &World, room: &Arc<Room>) {
 }
 // 滑动 60s 建房速率：返回 0 = 已记账允许；>0 = 需等待的秒数
 fn create_rate_wait(world: &World, ip: &str, now: u128) -> u64 {
-    let mut m = world.ip_creates.lock().unwrap();
+    let mut m = world.ip_creates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ts = m.entry(ip.to_string()).or_default();
     ts.retain(|t| now.saturating_sub(*t) < 60_000);
     if ts.len() >= ROOM_CREATE_PER_MIN {
@@ -668,16 +681,14 @@ enum Pull {
     TooMany,
 }
 fn pull_chunk(world: &Arc<World>, room: &Arc<Room>, ip: &str, i: u64, resume: bool, remote: Option<SocketAddr>) -> Pull {
-    let _guard = match LongpollGuard::enter(world, ip) {
-        Some(g) => g,
-        None => return Pull::TooMany,
-    };
     let deadline = Instant::now() + LONGPOLL;
-    let mut inner = room.inner.lock().unwrap();
+    let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if resume {
         inner.resumable = true;
     }
     let mut parked = false;
+    // per-IP 长轮询配额只在真正挂起时占用（对齐 Node：即时应答不计数）
+    let mut guard: Option<LongpollGuard> = None;
     loop {
         if inner.dead {
             return Pull::Gone("gone");
@@ -719,18 +730,25 @@ fn pull_chunk(world: &Arc<World>, room: &Arc<Room>, ip: &str, i: u64, resume: bo
         if parked && !conn_alive(PORT.load(std::sync::atomic::Ordering::Relaxed), remote) {
             return Pull::Timeout; // 客户端已断开：释放线程与配额（响应无人收听）
         }
+        // 即将挂起：先占 per-IP 配额，超限直接 429
+        if guard.is_none() {
+            match LongpollGuard::enter(world, ip) {
+                Some(g) => guard = Some(g),
+                None => return Pull::TooMany,
+            }
+        }
         let slice = (deadline - now).min(ALIVE_SLICE);
-        let (guard, _) = room.cond.wait_timeout(inner, slice).unwrap();
-        inner = guard;
+        let (g, _) = room.cond.wait_timeout(inner, slice).unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner = g;
         parked = true;
     }
 }
 
 // ---------- 邀请长轮询 ----------
 fn wait_offers(world: &Arc<World>, ip: &str, remote: Option<SocketAddr>) -> Result<Vec<serde_json::Value>, ()> {
-    let _guard = LongpollGuard::enter(world, ip).ok_or(())?;
     let deadline = Instant::now() + LONGPOLL;
-    let mut m = world.offers_mutex.lock().unwrap();
+    let mut guard: Option<LongpollGuard> = None;
+    let mut m = world.offers_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
         let list = pending_offers_for(world, ip);
         if !list.is_empty() {
@@ -743,54 +761,225 @@ fn wait_offers(world: &Arc<World>, ip: &str, remote: Option<SocketAddr>) -> Resu
         if !conn_alive(PORT.load(std::sync::atomic::Ordering::Relaxed), remote) {
             return Ok(vec![]);
         }
+        // 即将挂起才占 per-IP 配额（对齐 Node：即时应答不计数），超限 → 429
+        if guard.is_none() {
+            guard = Some(LongpollGuard::enter(world, ip).ok_or(())?);
+        }
         let slice = (deadline - now).min(ALIVE_SLICE);
-        let (guard, _) = world.offers_cond.wait_timeout(m, slice).unwrap();
-        m = guard;
+        let (gm, _) = world.offers_cond.wait_timeout(m, slice).unwrap_or_else(std::sync::PoisonError::into_inner);
+        m = gm;
     }
 }
 
-// ---------- 极简 HTTP GET（检查更新用，仅 http；https 见 fetch_update 的说明） ----------
-fn http_get_text(url: &str, timeout: Duration) -> Result<String, String> {
-    let rest = url.strip_prefix("http://").ok_or("仅支持 http 更新源")?;
+// ---------- 检查更新（http/https，跟随 ≤3 次重定向） ----------
+// 更新源由运维经 CIPHERLANE_UPDATE_URL 配置（非远程可控）；这里仍对 host/path 做
+// 字符白名单校验，拒绝空白/控制字符，杜绝把 CRLF 注入上游请求行/Host 头。
+const UPDATE_BODY_MAX: usize = 64 * 1024;
+const UPDATE_HEAD_MAX: usize = 16 * 1024;
+const UPDATE_REDIRECTS: usize = 3;
+
+struct UpdateUrl {
+    tls: bool,
+    host: String,   // 不含端口；IPv6 为括号内内容
+    port: u16,
+    path: String,
+}
+fn parse_update_url(url: &str) -> Option<UpdateUrl> {
+    let (scheme, rest) = url.split_once("://")?;
+    let tls = match scheme.to_ascii_lowercase().as_str() {
+        "http" => false,
+        "https" => true,
+        _ => return None,
+    };
     let (hostport, path) = match rest.split_once('/') {
-        Some((hp, p)) => (hp.to_string(), format!("/{}", p)),
-        None => (rest.to_string(), "/".to_string()),
+        Some((hp, p)) => (hp, format!("/{}", p)),
+        None => (rest, "/".to_string()),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h.to_string(), p.parse::<u16>().unwrap_or(80)),
-        _ => (hostport.clone(), 80),
+    if hostport.contains('@') {
+        return None; // 不接受 userinfo
+    }
+    if path.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return None;
+    }
+    let default_port: u16 = if tls { 443 } else { 80 };
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        // IPv6 字面量：[::1] 或 [::1]:8443
+        let end = inner.find(']')?;
+        let host = inner[..end].to_string();
+        let tail = &inner[end + 1..];
+        let port = if tail.is_empty() { default_port } else { tail.strip_prefix(':')?.parse().ok()? };
+        (host, port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                (h.to_string(), p.parse().ok()?)
+            }
+            _ => (hostport.to_string(), default_port),
+        }
     };
-    let addr = format!("{}:{}", host, port);
-    let mut stream = None;
-    for a in addr.to_socket_addrs().map_err(|e| e.to_string())? {
-        if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
-            stream = Some(s);
-            break;
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:".contains(&b)) {
+        return None;
+    }
+    Some(UpdateUrl { tls, host, port, path })
+}
+
+// 读一行（以 \n 结尾，容忍裸 \n；上限 cap 内找不到换行即报错）
+fn read_line_from<R: Read>(r: &mut R, cap: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut one = [0u8; 1];
+    while buf.len() <= cap {
+        match r.read(&mut one) {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(one[0]);
+                if one[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) => return Err(e.to_string()),
         }
     }
-    let mut stream = stream.ok_or("连接更新源失败")?;
-    stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
-    write!(stream, "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", path, hostport).map_err(|e| e.to_string())?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
-    let (head, body) = match raw.split_once("\r\n\r\n") {
-        Some((h, b)) => (h, b.to_string()),
-        None => (raw.as_str(), String::new()),
-    };
-    let status = head.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    if !(200..300).contains(&status) {
-        return Err(format!("upstream {}", status));
+    if !buf.ends_with(b"\n") {
+        return Err("响应头过长".into());
     }
-    Ok(body)
+    let mut line = String::from_utf8_lossy(&buf).to_string();
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
 }
-// 返回 (是否可缓存, JSON 响应体)。https 无 TLS 依赖：如实返回错误而不是假成功。
-fn fetch_update(url: &str, timeout: Duration) -> (bool, String) {
-    let fetched = match update_scheme(url).as_deref() {
-        Some("http") => http_get_text(url, timeout),
-        Some("https") => Err("https 更新源暂不支持（Rust 版无 TLS）".to_string()),
-        _ => Err("bad-update-url".to_string()),
+
+// 在已建立的连接上完成一次 GET：返回 (status, headers, body)。body 支持
+// Content-Length 与 chunked，总量不超过 UPDATE_BODY_MAX。超时由调用方在
+// TcpStream 上预设（连接建立后设置，TLS 包装前）。
+fn http_get_on<R: Read + Write>(sock: &mut R, u: &UpdateUrl) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let hostport = if u.host.contains(':') { format!("[{}]:{}", u.host, u.port) } else { format!("{}:{}", u.host, u.port) };
+    write!(sock, "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cipherlane/{}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n", u.path, hostport, VERSION)
+        .map_err(|e| e.to_string())?;
+    // ---- 状态行 + 响应头 ----
+    let status_line = read_line_from(sock, UPDATE_HEAD_MAX)?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| "上游响应非法".to_string())?;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let line = read_line_from(sock, UPDATE_HEAD_MAX)?;
+        if line.is_empty() {
+            break;
+        }
+        if headers.len() >= 100 {
+            return Err("上游响应头过多".into());
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let header = |name: &str| -> Option<&str> {
+        headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     };
-    match fetched {
+    // ---- body ----
+    let mut body: Vec<u8> = Vec::new();
+    let chunked = header("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
+    if chunked {
+        loop {
+            let line = read_line_from(sock, UPDATE_HEAD_MAX)?;
+            let size_txt = line.split(';').next().unwrap_or("").trim();
+            let n = usize::from_str_radix(size_txt, 16).map_err(|_| "上游 chunked 非法".to_string())?;
+            if n == 0 {
+                break; // 末块；Connection: close，不再等 trailer
+            }
+            if body.len() + n > UPDATE_BODY_MAX {
+                return Err("更新源响应过大".into());
+            }
+            let mut chunk = vec![0u8; n];
+            sock.read_exact(&mut chunk).map_err(|e| e.to_string())?;
+            body.extend_from_slice(&chunk);
+            let mut crlf = [0u8; 2];
+            sock.read_exact(&mut crlf).map_err(|e| e.to_string())?;
+        }
+    } else if let Some(cl) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if cl > UPDATE_BODY_MAX {
+            return Err("更新源响应过大".into());
+        }
+        body.resize(cl, 0);
+        sock.read_exact(&mut body).map_err(|e| e.to_string())?;
+    } else {
+        // 无长度：读到连接关闭（Connection: close），封顶 UPDATE_BODY_MAX
+        sock.take(UPDATE_BODY_MAX as u64 + 1).read_to_end(&mut body).map_err(|e| e.to_string())?;
+        if body.len() > UPDATE_BODY_MAX {
+            return Err("更新源响应过大".into());
+        }
+    }
+    Ok((status, headers, body))
+}
+
+fn tls_client_config() -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+// 抓取更新源文本：跟随 ≤3 次 30x 重定向（绝对地址或站内根相对路径），每跳独立超时。
+fn fetch_url_text(url: &str, timeout: Duration) -> Result<String, String> {
+    let cfg = tls_client_config();
+    let mut current = url.to_string();
+    for _ in 0..=UPDATE_REDIRECTS {
+        let u = parse_update_url(&current).ok_or_else(|| "bad-update-url".to_string())?;
+        let addr = format!("{}:{}", u.host, u.port);
+        let mut stream = None;
+        for a in addr.to_socket_addrs().map_err(|e| e.to_string())? {
+            if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let tcp = stream.ok_or_else(|| "连接更新源失败".to_string())?;
+        tcp.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        tcp.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        let (status, headers, body) = if u.tls {
+            let name = rustls::pki_types::ServerName::try_from(u.host.clone())
+                .map_err(|_| "更新源主机名无法用于 TLS".to_string())?;
+            let conn = rustls::ClientConnection::new(cfg.clone(), name).map_err(|e| e.to_string())?;
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            http_get_on(&mut tls, &u)?
+        } else {
+            let mut tcp = tcp;
+            http_get_on(&mut tcp, &u)?
+        };
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let loc = headers
+                .iter()
+                .find(|(k, _)| k == "location")
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| "上游重定向缺少 Location".to_string())?;
+            current = if loc.contains("://") {
+                loc
+            } else if loc.starts_with('/') {
+                let scheme = if u.tls { "https" } else { "http" };
+                let hostport = if u.host.contains(':') { format!("[{}]:{}", u.host, u.port) } else { format!("{}:{}", u.host, u.port) };
+                format!("{}://{}{}", scheme, hostport, loc)
+            } else {
+                return Err("上游重定向不支持相对路径".into());
+            };
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("upstream {}", status));
+        }
+        return String::from_utf8(body).map_err(|_| "更新源响应非 UTF-8".to_string());
+    }
+    Err("更新源重定向次数过多".into())
+}
+
+// 返回 (是否可缓存, JSON 响应体)：成功缓存 5min，错误如实上报且不缓存。
+fn fetch_update(url: &str, timeout: Duration) -> (bool, String) {
+    match fetch_url_text(url, timeout) {
         Ok(text) => {
             let latest = text.trim().to_string();
             let newer = semver_newer(&latest, VERSION);
@@ -826,13 +1015,21 @@ fn decorate_static<R: Read>(mut resp: Response<R>, f: &StaticFile) -> Response<R
     resp
 }
 
-fn send_static(mut req: tiny_http::Request, f: &StaticFile) {
+fn send_static(req: tiny_http::Request, f: &StaticFile) {
     let is_html = f.ctype.starts_with("text/html");
     if !is_html && etag_matches(&hdr(&req, "If-None-Match"), &f.etag) {
         let _ = req.respond(decorate_static(Response::empty(304), f));
         return;
     }
-    let _ = req.respond(decorate_static(Response::from_data(f.data.clone()), f));
+    // Arc 只克隆引用计数；data_length 显式给出 Content-Length（不做 chunked）
+    let resp = Response::new(
+        tiny_http::StatusCode(200),
+        vec![],
+        std::io::Cursor::new(f.data.clone()),
+        Some(f.data.len()),
+        None,
+    );
+    let _ = req.respond(decorate_static(resp, f));
 }
 
 fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
@@ -891,34 +1088,36 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             return jerr(req, 400, "bad-pub");
         }
         let secret_hdr = hdr(&req, "X-Device-Secret");
-        let existing = w.devices.lock().unwrap().get(&ip).cloned();
+        let existing = w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ip).cloned();
         if let Some(prev) = existing {
             if !secret_hdr.is_empty() && ct_eq(&prev.secret, &secret_hdr) {
-                *prev.name.lock().unwrap() = name;
-                *prev.pub_.lock().unwrap() = pub_;
-                *prev.last_seen.lock().unwrap() = now_ms();
+                *prev.name.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+                *prev.pub_.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pub_;
+                *prev.last_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now_ms();
                 return json_resp(req, 200, serde_json::json!({ "ip": ip, "id": prev.id, "secret": prev.secret }).to_string());
             }
         }
-        {
-            let devices = w.devices.lock().unwrap();
-            if devices.len() >= DEVICES_MAX && !devices.contains_key(&ip) {
-                return jerr(req, 503, "too-many-devices");
-            }
-        }
+        // 检查与插入同一临界区：并发 fresh presence 不得越过 DEVICES_MAX（TOCTOU 收口）
         let dev = Arc::new(Device {
             ip: ip.clone(),
             id: rand_hex16(),
             secret: rand_secret32(),
             name: Mutex::new(name),
             pub_: Mutex::new(pub_),
-            since: now_ms(),
             last_seen: Mutex::new(now_ms()),
         });
-        println!("[device] + {} {}", dev.ip, dev.name.lock().unwrap());
-        let (id, secret) = (dev.id.clone(), dev.secret.clone());
-        w.devices.lock().unwrap().insert(ip.clone(), dev);
-        return json_resp(req, 200, serde_json::json!({ "ip": ip, "id": id, "secret": secret }).to_string());
+        {
+            let mut devices = w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if devices.len() >= DEVICES_MAX && !devices.contains_key(&ip) {
+                drop(devices);
+                return jerr(req, 503, "too-many-devices");
+            }
+            println!("[device] + {} {}", dev.ip, dev.name.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            let (id, secret) = (dev.id.clone(), dev.secret.clone());
+            devices.insert(ip.clone(), dev);
+            drop(devices);
+            return json_resp(req, 200, serde_json::json!({ "ip": ip, "id": id, "secret": secret }).to_string());
+        }
     }
 
     // ---- POST /api/adopt：本机托盘接管（交接停机令牌）----
@@ -948,7 +1147,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
 
     // ---- GET /api/version ----
     if path == "/api/version" && method == "GET" {
-        let rooms = w.rooms.lock().unwrap().len();
+        let rooms = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
         // lan：本机首选局域网地址（供回环来源的客户端升级链接/跳转目标；无则 null）
         let lan = lan_addresses().first().map(|a| a.to_string());
         return json_resp(req, 200, serde_json::json!({ "version": VERSION, "rooms": rooms, "startedAt": w.started_at, "lan": lan }).to_string());
@@ -968,10 +1167,9 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         }
         json_resp(req, 200, "{\"ok\":true}".into());
         println!("[panel] 服务已从控制面板停止");
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(150));
-            std::process::exit(0);
-        });
+        // 与 SIGTERM 同一条排干路径：停派发 → 250ms 排干 → exit 0
+        // （响应先落盘给客户端，停机线程延迟 150ms 后开始排干）
+        SHUTDOWN_BY_PANEL.store(true, std::sync::atomic::Ordering::SeqCst);
         return;
     }
 
@@ -989,19 +1187,27 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         }
         // 5 分钟成功结果缓存（错误不缓存）
         {
-            let st = ctx.update.lock().unwrap();
+            let st = ctx.update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((at, payload)) = &st.cache {
                 if now_ms().saturating_sub(*at) < UPDATE_CACHE_MS {
                     return json_resp(req, 200, payload.clone());
                 }
             }
         }
-        // 单飞：已有上游请求进行中则等它完成，共享同一结果（成功或错误）
+        // 单飞：已有上游请求进行中则等它完成，共享同一结果（成功或错误）。
+        // 等待有界（30s > 单跳超时 5s × 最多 4 跳）：上游/取数线程异常时不至于
+        // 把所有 worker 永久挂死在这条 condvar 上。
         {
-            let mut st = ctx.update.lock().unwrap();
+            let mut st = ctx.update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if st.inflight {
+                let deadline = Instant::now() + Duration::from_secs(30);
                 while st.inflight {
-                    st = ctx.update_cond.wait(st).unwrap();
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return json_resp(req, 200, serde_json::json!({ "source": url, "current": VERSION, "error": "update-wait-timeout" }).to_string());
+                    }
+                    let (g, _) = ctx.update_cond.wait_timeout(st, left).unwrap_or_else(std::sync::PoisonError::into_inner);
+                    st = g;
                 }
                 if let Some(p) = st.last_result.clone() {
                     return json_resp(req, 200, p);
@@ -1009,9 +1215,12 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             }
             st.inflight = true;
         }
+        // 取数期间若 panic（被 worker 的 catch_unwind 隔离），guard 的 Drop 会复位
+        // inflight 并唤醒等待者，之后的新请求自行重新发起上游取数
+        let _inflight_guard = UpdateInflightGuard(ctx);
         let (cacheable, payload) = fetch_update(&url, Duration::from_secs(5));
         {
-            let mut st = ctx.update.lock().unwrap();
+            let mut st = ctx.update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if cacheable {
                 st.cache = Some((now_ms(), payload.clone()));
             }
@@ -1024,11 +1233,11 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
 
     // ---- GET /api/devices ----
     if path == "/api/devices" && method == "GET" {
-        let devices = w.devices.lock().unwrap();
+        let devices = w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut list: Vec<serde_json::Value> = devices
             .values()
             .filter(|d| device_alive(d))
-            .map(|d| serde_json::json!({ "ip": d.ip, "id": d.id, "name": *d.name.lock().unwrap(), "pub": *d.pub_.lock().unwrap() }))
+            .map(|d| serde_json::json!({ "ip": d.ip, "id": d.id, "name": *d.name.lock().unwrap_or_else(std::sync::PoisonError::into_inner), "pub": *d.pub_.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }))
             .collect();
         // HashMap 迭代顺序每个进程随机；按 IP 排序让 /api/devices 输出确定，客户端/测试
         // 不依赖哈希顺序（本机回环 + LAN 地址可能同时存在多个设备条目）。
@@ -1039,12 +1248,12 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
     // ---- GET /api/offers：长轮询 ----
     if path == "/api/offers" && method == "GET" {
         let secret = hdr(&req, "X-Device-Secret");
-        let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
+        let dev = { w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
         let dev = match dev {
             Some(d) => d,
             None => return jerr(req, 401, "bad-secret"),
         };
-        *dev.last_seen.lock().unwrap() = now_ms();
+        *dev.last_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now_ms();
         if !pending_offers_for(w, &ip).is_empty() {
             return json_resp(req, 200, serde_json::json!({ "offers": pending_offers_for(w, &ip) }).to_string());
         }
@@ -1060,44 +1269,44 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         let parts: Vec<&str> = rest.split('/').collect();
         if parts.len() == 2 && (parts[1] == "accept" || parts[1] == "reject") && method == "POST" {
             let secret = hdr(&req, "X-Device-Secret");
-            let dev = { w.devices.lock().unwrap().get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
+            let dev = { w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ip).filter(|d| ct_eq(&d.secret, &secret)).cloned() };
             if dev.is_none() {
                 return jerr(req, 401, "bad-secret");
             }
             let offer_id = parts[0];
-            let room_id = w.offers_by_id.lock().unwrap().get(offer_id).cloned();
-            let room = room_id.and_then(|rid| w.rooms.lock().unwrap().get(&rid).cloned());
+            let room_id = w.offers_by_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(offer_id).cloned();
+            let room = room_id.and_then(|rid| w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&rid).cloned());
             let room = match room {
                 Some(r) => r,
                 None => return jerr(req, 410, "gone"),
             };
             {
-                let inner = room.inner.lock().unwrap();
+                let inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let offer = match &inner.offer {
                     Some(o) if o.id == offer_id => o.clone(),
                     _ => return jerr(req, 410, "gone"),
                 };
-                if *offer.state.lock().unwrap() != "pending" || offer.to_ip != ip {
+                if *offer.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) != "pending" || offer.to_ip != ip {
                     return jerr(req, 410, "gone");
                 }
             }
             let _ = read_body(&mut req, 1024);
             // 读包期间房间可能已被 DELETE/清扫销毁（roomAlive 语义）
-            if room.inner.lock().unwrap().dead {
+            if room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead {
                 return jerr(req, 410, "gone");
             }
             touch(&room);
-            let mut inner = room.inner.lock().unwrap();
+            let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let offer_opt = inner.offer.clone();
             if let Some(offer) = offer_opt {
                 if parts[1] == "accept" {
-                    *offer.state.lock().unwrap() = "accepted".into();
+                    *offer.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = "accepted".into();
                     println!("[offer] ✓ {} {} → {}", offer.id, offer.from_ip, ip);
                     let rid = room.id.clone();
                     drop(inner);
                     return json_resp(req, 200, serde_json::json!({ "ok": true, "room": rid }).to_string());
                 }
-                *offer.state.lock().unwrap() = "rejected".into();
+                *offer.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = "rejected".into();
                 inner.rejected_at = Some(now_ms());
                 println!("[offer] ✗ {} {} → {}", offer.id, offer.from_ip, ip);
                 drop(inner);
@@ -1115,23 +1324,11 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         if rate_wait > 0 {
             return json_resp(req, 429, format!("{{\"error\":\"ip-quota\",\"retry\":{}}}", rate_wait));
         }
-        {
-            let rooms = w.rooms.lock().unwrap();
-            let by_ip = rooms.values().filter(|r| r.sender_ip == ip).count();
-            if by_ip >= ctx.limits.ip_rooms_max {
-                drop(rooms);
-                return json_resp(req, 429, "{\"error\":\"ip-quota\",\"retry\":1}".into());
-            }
-            if rooms.len() >= ROOMS_MAX {
-                drop(rooms);
-                return jerr(req, 503, "too-many-rooms");
-            }
-        }
+        // 配额检查与插入同一临界区：并发建房不得越过 ip_rooms_max / ROOMS_MAX（TOCTOU 收口）
         let id = rand_room_id();
         let room = Arc::new(Room {
             id: id.clone(),
             sender_ip: ip.clone(),
-            created_at: now_ms(),
             last_active: Mutex::new(now_ms()),
             cond: Condvar::new(),
             inner: Mutex::new(RoomInner {
@@ -1152,8 +1349,20 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 dead: false,
             }),
         });
-        let token = room.inner.lock().unwrap().token.clone();
-        w.rooms.lock().unwrap().insert(id.clone(), room);
+        let token = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).token.clone();
+        {
+            let mut rooms = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let by_ip = rooms.values().filter(|r| r.sender_ip == ip).count();
+            if by_ip >= ctx.limits.ip_rooms_max {
+                drop(rooms);
+                return json_resp(req, 429, "{\"error\":\"ip-quota\",\"retry\":1}".into());
+            }
+            if rooms.len() >= ROOMS_MAX {
+                drop(rooms);
+                return jerr(req, 503, "too-many-rooms");
+            }
+            rooms.insert(id.clone(), room);
+        }
         println!("[room] + {}", id);
         return json_resp(req, 200, serde_json::json!({ "room": id, "token": token }).to_string());
     }
@@ -1164,13 +1373,13 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
         if !parts.is_empty() && valid_room_id(parts[0]) {
             let sub = parts.get(1).copied().unwrap_or("");
             let token_hdr = hdr(&req, "X-Room-Token");
-            let room = w.rooms.lock().unwrap().get(parts[0]).cloned();
+            let room = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(parts[0]).cloned();
 
             if method == "DELETE" && sub.is_empty() {
                 return match room {
                     None => jerr(req, 404, "no-room"),
                     Some(r) => {
-                        if !ct_eq(&token_hdr, &r.inner.lock().unwrap().token) {
+                        if !ct_eq(&token_hdr, &r.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).token) {
                             return jerr(req, 403, "bad-token");
                         }
                         destroy_room(w, &r);
@@ -1182,12 +1391,12 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 Some(r) => r,
                 None => return jerr(req, 404, "no-room"),
             };
-            let token_ok = ct_eq(&token_hdr, &room.inner.lock().unwrap().token);
+            let token_ok = ct_eq(&token_hdr, &room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).token);
 
             // GET state
             if sub == "state" && method == "GET" {
-                let inner = room.inner.lock().unwrap();
-                let offer_state = inner.offer.as_ref().map(|o| o.state.lock().unwrap().clone());
+                let inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let offer_state = inner.offer.as_ref().map(|o| o.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
                 return json_resp(req, 200, serde_json::json!({
                     "posted": inner.posted, "head": inner.head, "pulled": inner.pulled,
                     "receiverSeen": inner.receiver_seen, "senderDone": inner.sender_done,
@@ -1203,7 +1412,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     return jerr(req, 403, "bad-token");
                 }
                 {
-                    let inner = room.inner.lock().unwrap();
+                    let inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if inner.offer.is_some() {
                         return jerr(req, 409, "offer-exists");
                     }
@@ -1220,35 +1429,35 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     Err(_) => return jerr(req, 400, "bad-body"),
                 };
                 // 读包期间房间可能已被销毁（roomAlive 语义）
-                if room.inner.lock().unwrap().dead {
+                if room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead {
                     return jerr(req, 410, "gone");
                 }
                 let to = j.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let pub_ = j.get("pub").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let hint = j.get("hint").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let target = { w.devices.lock().unwrap().get(&to).filter(|d| device_alive(d)).cloned() };
-                let target = match target {
-                    Some(t) => t,
-                    None => return jerr(req, 404, "device-offline"),
+                // hint 必须是 string 且 ≤4096：对齐 Node（缺失/非 string → 400 bad-hint）
+                let hint = match j.get("hint").and_then(|v| v.as_str()) {
+                    Some(h) if h.len() <= 4096 => h.to_string(),
+                    _ => return jerr(req, 400, "bad-hint"),
                 };
+                // 目标设备必须在线（能力校验；target 值本身不进入响应）
+                if !{ w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&to).is_some_and(|d| device_alive(d)) } {
+                    return jerr(req, 404, "device-offline");
+                }
                 if !valid_pub(&pub_) {
                     return jerr(req, 400, "bad-pub");
                 }
-                if hint.len() > 4096 {
-                    return jerr(req, 400, "bad-hint");
-                }
                 {
-                    let rooms = w.rooms.lock().unwrap();
+                    let rooms = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let pending = rooms.values().filter(|r| {
-                        let inner = r.inner.lock().unwrap();
-                        inner.offer.as_ref().map(|o| *o.state.lock().unwrap() == "pending" && o.to_ip == to).unwrap_or(false)
+                        let inner = r.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        inner.offer.as_ref().map(|o| *o.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == "pending" && o.to_ip == to).unwrap_or(false)
                     }).count();
                     if pending >= OFFERS_MAX {
                         return jerr(req, 429, "too-many-offers");
                     }
                 }
-                let sender = { w.devices.lock().unwrap().get(&ip).cloned() };
-                let from_name = sender.as_ref().filter(|d| device_alive(d)).map(|d| d.name.lock().unwrap().clone());
+                let sender = { w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ip).cloned() };
+                let from_name = sender.as_ref().filter(|d| device_alive(d)).map(|d| d.name.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
                 let offer = Arc::new(Offer {
                     id: rand_hex16(),
                     to_ip: to.clone(),
@@ -1261,12 +1470,12 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                 });
                 let oid = offer.id.clone();
                 {
-                    let mut inner = room.inner.lock().unwrap();
+                    let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     inner.offer = Some(offer);
                 }
-                w.offers_by_id.lock().unwrap().insert(oid.clone(), room.id.clone());
+                w.offers_by_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(oid.clone(), room.id.clone());
                 touch(&room);
-                drop(w.offers_mutex.lock().unwrap());
+                drop(w.offers_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                 w.offers_cond.notify_all();
                 println!("[offer] + {} {} → {}", oid, ip, to);
                 return json_resp(req, 200, serde_json::json!({ "offer": oid }).to_string());
@@ -1281,7 +1490,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     Some(b) => b,
                     None => return jerr(req, 413, "bad-body"),
                 };
-                let mut inner = room.inner.lock().unwrap();
+                let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // 房间清扫可能与慢速请求竞争：已销毁的房间不再接受分片，否则分片记账
                 // 只增不减（房间已从 rooms 移除，永远不会再有 destroy 来释放这笔计数）。
                 if inner.dead {
@@ -1326,22 +1535,20 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     // seq == posted：与无头路径一致，落到下面的背压检查/入库
                 }
                 let outstanding = if inner.resumable { inner.posted - inner.through } else { inner.buffer.len() as u64 };
-                let global = *w.global_buffered.lock().unwrap();
-                // per-IP 字节配额：按房间创建者 IP 归属（与 Node 的 room.senderIp 一致）
-                let ip_used = w.ip_bytes.lock().unwrap().get(&room.sender_ip).copied().unwrap_or(0);
+                // 房间级配额在 inner 锁内自查；全局/per-IP 配额由 try_add 在同一组
+                // 全局锁下检查+入账（锁序 inner → global_buffered → ip_bytes），
+                // 跨房间不再有"检查后放锁再入账"的 TOCTOU 窗口。
+                let acct = ByteAccount { global: &w.global_buffered, ip_bytes: &w.ip_bytes, ip: &room.sender_ip };
                 if outstanding >= ROOM_CHUNKS_BUF
                     || inner.bytes + body.len() > ROOM_BYTES_MAX
-                    || global + body.len() > GLOBAL_BYTES_MAX
-                    || ip_used + body.len() > ctx.limits.ip_bytes_max
+                    || !acct.try_add(&mut inner, body.len(), GLOBAL_BYTES_MAX, ctx.limits.ip_bytes_max)
                 {
                     drop(inner);
                     return json_resp(req, 429, "{\"error\":\"backpressure\",\"retry\":1}".into());
                 }
                 let i = inner.posted;
                 inner.posted += 1;
-                // 记账与插入在同一 inner 临界区内完成（inner.bytes/global/ip_bytes 成对增减）
-                let acct = ByteAccount { global: &w.global_buffered, ip_bytes: &w.ip_bytes, ip: &room.sender_ip };
-                insert_chunk(&mut inner, &acct, i, body);
+                inner.buffer.insert(i, Arc::new(body));
                 drop(inner);
                 touch(&room);
                 room.cond.notify_all();
@@ -1350,13 +1557,24 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
 
             // GET chunk?i=N（X-Resume: 1 可续传）
             if sub == "chunk" && method == "GET" {
-                // 缺省/空/带符号/超安全整数一律 400，不能用 Number(null)=0 静默消费 0 号分片
-                let i_raw: Option<&str> = query
+                // ?i 只接受唯一且纯十进制的参数：缺失/重复/百分号编码/符号/超安全整数
+                // 一律 400（比 Node 的 URLSearchParams 解码语义更严；浏览器与 CLI 只发纯数字）
+                let mut i_vals: Vec<&str> = query
                     .split('&')
-                    .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == "i").map(|(_, v)| v));
-                let i = match i_raw.and_then(parse_strict_digits) {
-                    Some(v) => v,
-                    None => return jerr(req, 400, "bad-index"),
+                    .filter_map(|kv| {
+                        if kv == "i" {
+                            Some("")
+                        } else {
+                            kv.split_once('=').filter(|(k, _)| *k == "i").map(|(_, v)| v)
+                        }
+                    })
+                    .collect();
+                let i = match i_vals.pop() {
+                    Some(v) if i_vals.is_empty() => match parse_strict_digits(v) {
+                        Some(n) => n,
+                        None => return jerr(req, 400, "bad-index"),
+                    },
+                    _ => return jerr(req, 400, "bad-index"),
                 };
                 let resume = hdr(&req, "X-Resume") == "1";
                 return match pull_chunk(w, &room, &ip, i, resume, req.remote_addr().copied()) {
@@ -1382,7 +1600,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     return jerr(req, 403, "bad-token");
                 }
                 let _ = read_body(&mut req, 1024);
-                room.inner.lock().unwrap().sender_done = true;
+                room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sender_done = true;
                 touch(&room);
                 room.cond.notify_all();
                 return json_resp(req, 200, "{\"ok\":true}".into());
@@ -1392,7 +1610,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             if sub == "progress" && method == "POST" {
                 let body = read_body(&mut req, 1024).unwrap_or_default();
                 // 读包期间房间可能已被销毁（roomAlive 语义）
-                if room.inner.lock().unwrap().dead {
+                if room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead {
                     return jerr(req, 410, "gone");
                 }
                 let through = serde_json::from_slice::<serde_json::Value>(&body)
@@ -1402,7 +1620,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     Some(t) => t,
                     None => return jerr(req, 400, "bad-through"),
                 };
-                let mut inner = room.inner.lock().unwrap();
+                let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !inner.resumable {
                     drop(inner);
                     return jerr(req, 409, "not-resumable");
@@ -1422,7 +1640,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
             if sub == "ack" && method == "POST" {
                 let body = read_body(&mut req, 1024).unwrap_or_default();
                 // 读包期间房间可能已被销毁（roomAlive 语义）
-                if room.inner.lock().unwrap().dead {
+                if room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead {
                     return jerr(req, 410, "gone");
                 }
                 let proof = serde_json::from_slice::<serde_json::Value>(&body)
@@ -1430,7 +1648,7 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
                     .and_then(|j| j.get("proof").and_then(|v| v.as_str().map(String::from)))
                     .filter(|p| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()));
                 {
-                    let mut inner = room.inner.lock().unwrap();
+                    let mut inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     inner.acked = true;
                     inner.ack_proof = proof;
                 }
@@ -1449,12 +1667,12 @@ fn sweeper(ctx: Arc<Ctx>) {
         std::thread::sleep(Duration::from_secs(30));
         let now = now_ms();
         let w = &ctx.world;
-        let rooms: Vec<Arc<Room>> = w.rooms.lock().unwrap().values().cloned().collect();
+        let rooms: Vec<Arc<Room>> = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect();
         for room in rooms {
-            let idle = now.saturating_sub(*room.last_active.lock().unwrap());
+            let idle = now.saturating_sub(*room.last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             let (acked, offer_expired, reject_expired) = {
-                let inner = room.inner.lock().unwrap();
-                let oe = inner.offer.as_ref().map(|o| *o.state.lock().unwrap() == "pending" && now.saturating_sub(o.created_at) > OFFER_TTL_MS).unwrap_or(false);
+                let inner = room.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let oe = inner.offer.as_ref().map(|o| *o.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == "pending" && now.saturating_sub(o.created_at) > OFFER_TTL_MS).unwrap_or(false);
                 let re = inner.rejected_at.map(|t| now.saturating_sub(t) > REJECT_GRACE_MS).unwrap_or(false);
                 (inner.acked, oe, re)
             };
@@ -1462,9 +1680,9 @@ fn sweeper(ctx: Arc<Ctx>) {
                 destroy_room(w, &room);
             }
         }
-        w.devices.lock().unwrap().retain(|_, d| now.saturating_sub(*d.last_seen.lock().unwrap()) <= DEVICE_MEM_MS);
+        w.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, d| now.saturating_sub(*d.last_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) <= DEVICE_MEM_MS);
         // 建房速率窗口清理，避免按 IP 无界增长
-        let mut creates = w.ip_creates.lock().unwrap();
+        let mut creates = w.ip_creates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         creates.retain(|_, ts| {
             ts.retain(|t| now.saturating_sub(*t) < 60_000);
             !ts.is_empty()
@@ -1530,31 +1748,64 @@ fn build_allowed_hosts(addrs: &[String], host_env: &str) -> HashSet<String> {
     set
 }
 
-// SIGTERM/SIGINT：异步信号安全地打印停机文案后 exit 0（与 Node 的优雅停机语义对齐）。
-// Node 的 SIGINT 文案是“再见”，SIGTERM 是“正在优雅停机…”，这里保持一致。
+// ---------- 优雅停机 ----------
+// 语义对齐 v0.x Node 版：SIGTERM/SIGINT → 打印文案 → 停止向 worker 派发新请求 →
+// 给在途处理最多 250ms 排干（Node 在 250ms 处 closeAllConnections 强切）→ exit 0。
+// 实现为 pthread_sigmask(SIG_BLOCK) + sigwait：信号只由专职线程消费，
+// 处理路径上没有任何非异步信号安全的调用；/api/shutdown 置位后走同一条排干路径。
+static SHUTDOWN_BY_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// 在途请求数：优雅停机的排干依据（worker 在 handle 前后增减）
+static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// 排干窗口：对齐 Node 版 closeAllConnections 的 250ms
+const DRAIN_MS: Duration = Duration::from_millis(250);
+
+// 在创建任何线程之前阻塞 SIGTERM/SIGINT：之后派生的线程全部继承该掩码，
+// 信号只会送达下面 sigwait 专职线程，不会随机打在某个 worker 上。
 #[cfg(unix)]
-fn install_signal_handlers() {
-    extern "C" fn on_sigterm(_: libc::c_int) {
-        const MSG: &[u8] = "\n收到 SIGTERM，正在优雅停机…\n".as_bytes();
-        unsafe {
-            libc::write(1, MSG.as_ptr() as *const libc::c_void, MSG.len());
-            libc::_exit(0);
-        }
-    }
-    extern "C" fn on_sigint(_: libc::c_int) {
-        const MSG: &[u8] = "\n再见\n".as_bytes();
-        unsafe {
-            libc::write(1, MSG.as_ptr() as *const libc::c_void, MSG.len());
-            libc::_exit(0);
-        }
-    }
+fn block_termination_signals() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
+}
+#[cfg(unix)]
+fn wait_termination_signal() -> libc::c_int {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        let mut sig: libc::c_int = 0;
+        libc::sigwait(&set, &mut sig);
+        sig
+    }
+}
+// 停止派发 + 排干 + 退出。MessagesQueue::unblock 每次只唤醒一个阻塞在
+// recv() 的 worker，因此按 worker 数逐个投放；随后等待在途请求归零或超时。
+fn drain_and_exit(servers: &[Arc<Server>]) -> ! {
+    for s in servers {
+        for _ in 0..WORKERS {
+            s.unblock();
+        }
+    }
+    let deadline = Instant::now() + DRAIN_MS;
+    while INFLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let left = INFLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    if left > 0 {
+        eprintln!("[shutdown] {} 个在途请求未及排干（250ms 排干上限，对齐旧版 250ms 强切语义）", left);
+    }
+    std::process::exit(0)
 }
 
 fn main() {
+    #[cfg(unix)]
+    block_termination_signals();
+
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
     PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     let host = std::env::var("HOST").unwrap_or_default();
@@ -1614,17 +1865,38 @@ fn main() {
         }
     }
 
-    // 优雅停机：SIGTERM/SIGINT 打印关键词后 exit 0（测试会断言退出码 0）
+    // 优雅停机线程：SIGTERM/SIGINT（unix）与面板停机（跨平台）共用排干路径
+    let shutdown_servers: Vec<Arc<Server>> = servers.iter().map(|(_, s)| s.clone()).collect();
     #[cfg(unix)]
-    #[cfg(unix)]
-    install_signal_handlers();
+    {
+        let servers = shutdown_servers.clone();
+        std::thread::spawn(move || loop {
+            match wait_termination_signal() {
+                libc::SIGINT => println!("\n再见"),
+                _ => println!("\n收到 SIGTERM，正在优雅停机…"),
+            }
+            drain_and_exit(&servers);
+        });
+    }
+    {
+        let servers = shutdown_servers;
+        std::thread::spawn(move || loop {
+            if SHUTDOWN_BY_PANEL.load(std::sync::atomic::Ordering::SeqCst) {
+                // 先给 150ms 让 /api/shutdown 的 200 响应送达客户端（对齐 Node 版），
+                // 再停派发、排干、退出
+                std::thread::sleep(Duration::from_millis(150));
+                drain_and_exit(&servers);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    }
 
     std::thread::spawn({
         let ctx = ctx.clone();
         move || sweeper(ctx)
     });
 
-    for (addr, server) in &servers {
+    for (_, server) in &servers {
         for _ in 0..WORKERS {
             let server = server.clone();
             let ctx = ctx.clone();
@@ -1632,7 +1904,21 @@ fn main() {
                 .stack_size(WORKER_STACK)
                 .spawn(move || loop {
                     match server.recv() {
-                        Ok(req) => handle(req, &ctx),
+                        Ok(req) => {
+                            // panic 隔离：单个请求的异常只丢该连接，不带走 worker，
+                            // 也不允许毒化锁级联击杀其余 worker（Node 版为 try/catch 500）
+                            INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, &ctx)));
+                            INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            if let Err(p) = r {
+                                let msg = p
+                                    .downcast_ref::<&str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| p.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "未知 panic".to_string());
+                                eprintln!("[cipherlane] 请求处理 panic（已隔离，服务继续）：{}", msg);
+                            }
+                        }
                         Err(_) => break,
                     }
                 });
@@ -1653,6 +1939,29 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 测试辅助：插入分片并记账（产线的入账走 chunk POST 的 try_add 原子路径；
+    // 这里独立构造同样语义，用于验证记账不变量本身）
+    fn counter_add(c: &Mutex<usize>, n: usize) {
+        let mut g = c.lock().unwrap();
+        *g = g.saturating_add(n);
+    }
+    impl ByteAccount<'_> {
+        fn add(&self, inner: &mut RoomInner, n: usize) {
+            inner.bytes = inner.bytes.saturating_add(n);
+            counter_add(self.global, n);
+            let mut m = self.ip_bytes.lock().unwrap();
+            let cur = m.get(self.ip).copied().unwrap_or(0);
+            m.insert(self.ip.to_string(), cur.saturating_add(n));
+        }
+    }
+    fn insert_chunk(inner: &mut RoomInner, acct: &ByteAccount, i: u64, body: Vec<u8>) -> usize {
+        let arc = Arc::new(body);
+        let added = arc.len();
+        inner.buffer.insert(i, arc);
+        acct.add(inner, added);
+        added
+    }
 
     fn empty_room() -> RoomInner {
         RoomInner {
@@ -1679,10 +1988,10 @@ mod tests {
     fn counter_sub_never_wraps() {
         let c = Mutex::new(0usize);
         counter_sub(&c, BODY_MAX);
-        assert_eq!(*c.lock().unwrap(), 0);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 0);
         counter_add(&c, 10);
         counter_sub(&c, 4);
-        assert_eq!(*c.lock().unwrap(), 6);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 6);
     }
 
     // 插入/取走分片后，房间字节数、全局计数与 ip_bytes 必须同步归零；重复取走不得二次扣减。
@@ -1696,8 +2005,8 @@ mod tests {
         insert_chunk(&mut room, &acct, 0, vec![7u8; 1024]);
         insert_chunk(&mut room, &acct, 1, vec![7u8; 2048]);
         insert_chunk(&mut room, &acct, 2, vec![7u8; 512]);
-        assert_eq!(*c.lock().unwrap(), 3584);
-        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 3584);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 3584);
+        assert_eq!(*ips.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get("10.0.0.1").unwrap(), 3584);
         assert_eq!(room.bytes, 3584);
         // 越序先取 1：head 不得推进（否则 0 号分片会变成不可达垃圾）
         assert!(take_chunk(&mut room, &acct, 1).is_some());
@@ -1709,11 +2018,11 @@ mod tests {
         assert_eq!(room.pulled, 2);
         // 重复取走不得二次扣减
         assert!(take_chunk(&mut room, &acct, 0).is_none());
-        assert_eq!(*c.lock().unwrap(), 512);
-        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 512);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 512);
+        assert_eq!(*ips.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get("10.0.0.1").unwrap(), 512);
         assert!(take_chunk(&mut room, &acct, 2).is_some());
-        assert_eq!(*c.lock().unwrap(), 0);
-        assert!(!ips.lock().unwrap().contains_key("10.0.0.1"));
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 0);
+        assert!(!ips.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key("10.0.0.1"));
     }
 
     // progress 只释放 [1, through) 的数据分片，0 号 manifest 必须保留（续传重读用）。
@@ -1727,13 +2036,13 @@ mod tests {
             insert_chunk(&mut room, &acct, i, vec![0u8; 100]);
         }
         room.posted = 3; // 真实路径里 posted 由 handler 递增，insert_chunk 只管数据与记账
-        assert_eq!(*c.lock().unwrap(), 300);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 300);
         assert!(advance_through(&mut room, &acct, 2));
-        assert_eq!(*c.lock().unwrap(), 200);
-        assert_eq!(*ips.lock().unwrap().get("10.0.0.1").unwrap(), 200);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 200);
+        assert_eq!(*ips.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get("10.0.0.1").unwrap(), 200);
         assert!(room.buffer.contains_key(&0));
         assert!(advance_through(&mut room, &acct, 2)); // 重复/滞后上报幂等
-        assert_eq!(*c.lock().unwrap(), 200);
+        assert_eq!(*c.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 200);
     }
 
     // X-Chunk-Seq 必须是严格十进制安全整数：+1/-1/中间空白/小数/非 ASCII/溢出/超 2^53-1

@@ -2,10 +2,14 @@
 name = "cipherlane"
 version = "1.0.0"
 edition = "2021"
+# is_some_and(1.70)/div_ceil(1.73)/let-else(1.65) + rustls 0.23 的 MSRV 要求
+rust-version = "1.75"
 description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器 + 系统托盘）"
 license = "MIT"
 
 [dependencies]
+# vendor 补丁版（见 vendor/tiny_http/PATCHES.md）：请求头 16KiB 预算、每连接读/写
+# 60s 超时（client.rs 对 TimedOut 回 408 断连）、并发连接上限 256——对齐 Node 默认防护。
 tiny_http = "0.12"
 serde_json = "1"
 rand = "0.8"
@@ -16,7 +20,12 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 qrcodegen = "1"
-# 服务器 SIGTERM/SIGINT 优雅停机（仅 unix 分支使用）
+# /api/update 的 https 更新源（纯 Rust TLS，musl/Win/mac 全平台可静态编译）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+
+# 服务器 SIGTERM/SIGINT 优雅停机（sigwait；仅 unix 分支使用，Windows 不链接）
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # 托盘仅 Linux（ksni = StatusNotifierItem/AppIndicator）；按 target 隔离，
@@ -44,3 +53,8 @@ tungstenite = { version = "0.21", default-features = false, features = ["handsha
 opt-level = "z"
 lto = true
 strip = true
+codegen-units = 1
+
+# 用本地补丁版 tiny_http 替换 crates.io 同名同版本（补丁内容见 vendor/tiny_http/PATCHES.md）
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
