@@ -1,10 +1,12 @@
-// CLI 端到端 —— 起真实 server,以子进程跑真实 cli.mjs 收发
+// CLI 端到端 —— 起真实 Rust server，以子进程跑真实 Rust CLI（v1.0 去 Node）
 //
 // 覆盖:单文件链接模式、目录递归批量(含空文件/嵌套/隐藏项跳过)、多路径混合、文本、
 //      协议 v2（AAD 位置绑定 / 完整性校验 / v1 回退）、TOFU 指纹与 --verify、终端注入净化。
+// 另含一组「Node 独立实现 → Rust CLI」交叉互操作（KDF/hint/AAD/ackProof/指纹逐字节一致）。
 // 批量 wire 格式(manifest + 顺序分片)由此测试以真实收发双方锁定。
 import { spawn } from 'node:child_process'
-import { randomBytes, createCipheriv, createDecipheriv, generateKeyPairSync } from 'node:crypto'
+import { randomBytes, createCipheriv, createDecipheriv, createHash, generateKeyPairSync } from 'node:crypto'
+import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -14,7 +16,19 @@ import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
-const CLI = path.join(ROOT, 'cli.mjs')
+// v1.0：默认被测实现 = Rust 二进制；可用环境变量指向其他构建产物
+const CLI_BIN = process.env.CIPHERLANE_CLI_BIN
+  || path.join(ROOT, 'cipherlane-rs/target/release/cipherlane-cli')
+const SERVER_BIN = process.env.CIPHERLANE_SERVER_BIN
+  || path.join(ROOT, 'cipherlane-rs/target/release/cipherlane')
+if (!fs.existsSync(CLI_BIN) || !fs.existsSync(SERVER_BIN)) {
+  if (!fs.existsSync(CLI_BIN)) console.error('缺少 Rust CLI 二进制: ' + CLI_BIN)
+  if (!fs.existsSync(SERVER_BIN)) console.error('缺少 Rust server 二进制: ' + SERVER_BIN)
+  console.error('请先执行：export CARGO_HOME=$PWD/build/cargo-home && (cd cipherlane-rs && cargo build --release)')
+  process.exit(1)
+}
+const require = createRequire(import.meta.url)
+const X25519 = require('../public/x25519.js')
 
 const PORT = 20000 + Math.floor(Math.random() * 20000)
 const S = `http://127.0.0.1:${PORT}`
@@ -50,7 +64,7 @@ async function postRaw(room, token, body) {
 }
 
 function runCli(args, { timeout = 120000 } = {}) {
-  const child = spawn(process.execPath, [CLI, ...args], {
+  const child = spawn(CLI_BIN, args, {
     cwd: ROOT, env: { ...process.env, CIPHERLANE_SERVER: S }, stdio: ['ignore', 'pipe', 'pipe'],
   })
   let out = ''
@@ -89,7 +103,7 @@ async function tree(root) {
 }
 
 async function main() {
-  const server = spawn(process.execPath, ['server.js'], {
+  const server = spawn(SERVER_BIN, [], {
     cwd: ROOT, env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'ignore', 'pipe'],
   })
   const t0 = Date.now()
@@ -294,7 +308,7 @@ async function main() {
       // 接收端:listen --yes 常驻,经代理上线
       const recvDir = path.join(TMP, 'targeted-recv')
       await fsp.mkdir(recvDir, { recursive: true })
-      const listener = spawn(process.execPath, [CLI, 'listen', '--yes', '-o', recvDir, '--name', '测试机B', '--server', `http://127.0.0.2:${PORT}`], {
+      const listener = spawn(CLI_BIN, ['listen', '--yes', '-o', recvDir, '--name', '测试机B', '--server', `http://127.0.0.2:${PORT}`], {
         cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
       })
       let lout = ''
@@ -356,6 +370,65 @@ async function main() {
       for (let i = 0; i < 50 && !savedOk; i++) { savedOk = fs.existsSync(saved); if (!savedOk) await sleep(200) }
       await sleep(300) // 等待写完
       assert(savedOk && Buffer.compare(fdata, fs.readFileSync(saved)) === 0, '定向文件应逐字节落盘')
+
+      // ---------- 8) 跨实现一致性：Node 独立实现 → Rust CLI listen 直发 ----------
+      // 用 Node 侧 X25519/roomKey/AES-GCM/ackProof 构造完整直发流，由 Rust CLI 解密/展示/ack，
+      // 锁定 KDF、hint、协议 v2 AAD、指纹、ackProof 五项跨实现逐字节一致。
+      {
+        const devs = await (await fetch(S + '/api/devices')).json()
+        const rustDev = devs.devices.find((d) => d.ip === '127.0.0.2')
+        assert(rustDev, 'Rust listener 应在线')
+        const rustPub = Buffer.from(rustDev.pub, 'base64url')
+        assert.strictEqual(rustPub.length, 32, 'Rust 公钥应为 32B')
+
+        // 指纹：Rust devices 输出 vs Node SHA256(原始公钥) 前 16B
+        const wantFp = createHash('sha256').update(rustPub).digest().subarray(0, 16).toString('hex')
+        const devOut = (await runCli(['devices']).done).out
+        const at = devOut.indexOf('127.0.0.2')
+        assert(at >= 0, 'devices 应含 Rust listener')
+        assert(devOut.slice(at).includes('#' + wantFp), 'Rust 指纹应与 Node 计算一致: ' + devOut)
+
+        // Node 身份 + roomKey（与 public/x25519.js 同源，Rust 必须逐字节一致）
+        const nodeSeed = randomBytes(32)
+        const nodePub = new Uint8Array(X25519.publicFromSecret(new Uint8Array(nodeSeed)))
+        const created = await newRoom()
+        const room = created.room, token = created.token
+        const shared = X25519.dh(new Uint8Array(nodeSeed), new Uint8Array(rustPub))
+        const key = Buffer.from(X25519.sessionKey(shared, nodePub, new Uint8Array(rustPub), room))
+        const payload = 'Node→Rust 跨实现直发 ' + Date.now()
+        const pt = Buffer.from(payload, 'utf8')
+        const hint = sealTo(key, Buffer.from(JSON.stringify({ kind: 'text', size: pt.length })))
+        const or = await fetch(`${S}/api/rooms/${room}/offer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Room-Token': token },
+          body: JSON.stringify({ to: '127.0.0.2', pub: Buffer.from(nodePub).toString('base64url'), hint: hint.toString('base64url') }),
+        })
+        assert(or.ok, '投递 Node 构造的邀请失败 ' + or.status)
+        const meta = { v: 2, type: 'text', name: null, mime: null, size: pt.length, count: 2 }
+        await postRaw(room, token, sealTo(key, Buffer.from(JSON.stringify(meta)), aadOf(room, 0)))
+        await postRaw(room, token, sealTo(key, pt, aadOf(room, 1)))
+
+        let gotText = false
+        for (let i = 0; i < 100 && !gotText; i++) {
+          gotText = lout.includes(payload)
+          if (!gotText) await sleep(100)
+        }
+        assert(gotText, 'Rust listen 应解密 Node 构造的直发文本,实际:\n' + lout.slice(-500))
+        assert(lout.includes('#' + createHash('sha256').update(Buffer.from(nodePub)).digest().subarray(0, 16).toString('hex')),
+          'Rust listen 应打印 Node 发送方指纹')
+        let st = null
+        for (let i = 0; i < 100; i++) {
+          st = await roomState(room)
+          if (st.acked) break
+          await sleep(100)
+        }
+        assert(st && st.acked, 'Rust listen 应 ack')
+        const wantAck = createHash('sha256')
+          .update(Buffer.concat([key, Buffer.from('cipherlane/ack/v1|' + room)]))
+          .digest('hex')
+        assert.strictEqual(st.ackProof, wantAck, 'Rust ackProof 必须与 Node SHA256(key‖label‖room) 一致')
+        ok('跨实现一致：Node 构造的 X25519/roomKey/hint/v2 AAD/ackProof → Rust CLI 解密并 ack')
+      }
 
       listener.kill('SIGINT')
       proxy.close()

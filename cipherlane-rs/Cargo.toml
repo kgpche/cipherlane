@@ -1,6 +1,6 @@
 [package]
 name = "cipherlane"
-version = "0.5.1"
+version = "1.0.0"
 edition = "2021"
 description = "密道 · cipherlane —— 局域网端到端加密传输（Rust 重构版服务器 + 系统托盘）"
 license = "MIT"
@@ -12,6 +12,13 @@ rand = "0.8"
 base64 = "0.22"
 if-addrs = "0.13"
 ksni = { version = "0.3", features = ["blocking"] }
+# v1.0：产品去 Node —— CLI 需要与浏览器逐字节互通的密码学原语，服务器需要 sha256（ETag）
+sha2 = "0.10"
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+qrcodegen = "1"
+# 服务器 SIGTERM/SIGINT 优雅停机（仅 unix 分支使用）
+libc = "0.2"
 
 [[bin]]
 name = "cipherlane"
@@ -20,6 +27,10 @@ path = "src/main.rs"
 [[bin]]
 name = "cipherlane-tray"
 path = "src/bin/tray.rs"
+
+[[bin]]
+name = "cipherlane-cli"
+path = "src/bin/cli.rs"
 
 [profile.release]
 opt-level = "z"
