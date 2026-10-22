@@ -61,6 +61,19 @@ fn rand_token() -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+// 接管在跑的无令牌服务：换得停机令牌，从此"退出=关服务"。
+// 返回 (令牌, 附注)：409 = 服务已被他人持令牌管理（如另一托盘/旧启动器残留）。
+fn try_adopt() -> (Option<String>, String) {
+    let t0 = rand_token();
+    match http_post_json("/api/adopt", &format!("{{\"token\":\"{}\"}}", t0)) {
+        Some(raw) if raw.contains("200") => (Some(t0), String::new()),
+        Some(raw) if raw.contains("409") => {
+            (None, "服务由其他管理者持有（如 systemd/另一托盘）".into())
+        }
+        _ => (None, "接管失败：旧版本服务器？退出将仅退托盘".into()),
+    }
+}
+
 struct CipherlaneTray {
     running: bool,
     token: Option<String>, // 托盘自己启动的服务才持有停机令牌
@@ -72,20 +85,30 @@ impl CipherlaneTray {
     fn base(&self) -> String {
         format!("http://127.0.0.1:{}", port())
     }
-    // 主页用 LAN 地址打开：经回环打开会让链接/二维码变成 127.0.0.1（对方不可达）
+    // 主页用 LAN 地址打开：经回环打开会让链接/二维码变成 127.0.0.1（对方不可达）。
+    // 与服务器 /api/version 的 lan 字段同源（含"默认路由网卡优先"的排序），避免两处各挑各的
     fn lan_base(&self) -> String {
-        let lan = if_addrs::get_if_addrs()
-            .ok()
-            .map(|v| {
-                v.into_iter()
-                    .filter_map(|i| match i.ip() {
-                        std::net::IpAddr::V4(v4) if !v4.is_loopback() && v4.is_private() => Some(v4),
-                        _ => None,
+        let lan = http_get_json("/api/version")
+            .and_then(|body| body.split("\"lan\":\"").nth(1).and_then(|s| s.split('"').next()).map(String::from))
+            .filter(|s| !s.is_empty());
+        match lan {
+            Some(ip) => format!("http://{}:{}", ip, port()),
+            None => {
+                // 服务器未就绪/lan:null：退回本地枚举（再退回环）
+                let lan = if_addrs::get_if_addrs()
+                    .ok()
+                    .map(|v| {
+                        v.into_iter()
+                            .filter_map(|i| match i.ip() {
+                                std::net::IpAddr::V4(v4) if !v4.is_loopback() && v4.is_private() => Some(v4),
+                                _ => None,
+                            })
+                            .next()
                     })
-                    .next()
-            })
-            .flatten();
-        format!("http://{}:{}", lan.map(|a| a.to_string()).unwrap_or_else(|| "127.0.0.1".into()), port())
+                    .flatten();
+                format!("http://{}:{}", lan.map(|a| a.to_string()).unwrap_or_else(|| "127.0.0.1".into()), port())
+            }
+        }
     }
     fn start_server(&mut self) {
         if self.running {
@@ -254,18 +277,11 @@ pub fn main() {
     let mut note = String::new();
     if running {
         // 接管在跑的无令牌服务:换得停机令牌,从此"退出=关服务"
-        let t0 = rand_token();
-        match http_post_json("/api/adopt", &format!("{{\"token\":\"{}\"}}", t0)) {
-            Some(raw) if raw.contains("200") => {
-                token = Some(t0);
-                println!("已接管运行中的服务（令牌交接）");
-            }
-            Some(raw) if raw.contains("409") => {
-                note = "服务由其他管理者持有（如 systemd/另一托盘）".into();
-            }
-            _ => {
-                note = "接管失败：旧版本服务器？退出将仅退托盘".into();
-            }
+        let (t, n) = try_adopt();
+        token = t;
+        note = n;
+        if token.is_some() {
+            println!("已接管运行中的服务（令牌交接）");
         }
     }
     let tray = CipherlaneTray {
@@ -280,7 +296,8 @@ pub fn main() {
         .assume_sni_available(true)
         .spawn()
         .expect("托盘初始化失败（无 D-Bus 环境？）");
-    // 状态轮询：外部启停也会反映到图标
+    // 状态轮询：外部启停也会反映到图标；服务由外部（桌面启动器/systemd）拉起时
+    // 主动 adopt 接管——否则托盘永远无令牌，"停止服务"会一直是灰的
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
         handle.update(|t| {
@@ -290,6 +307,15 @@ pub fn main() {
                 if !up {
                     t.token = None;
                     *t.server.lock().unwrap() = None;
+                } else if t.token.is_none() {
+                    let (tok, n) = try_adopt();
+                    if tok.is_some() {
+                        t.token = tok;
+                        t.note.clear();
+                        println!("已接管后启动的服务（令牌交接）");
+                    } else {
+                        t.note = n;
+                    }
                 }
             }
         });

@@ -1691,18 +1691,35 @@ fn sweeper(ctx: Arc<Ctx>) {
 }
 
 // ---------- 启动 ----------
+// 默认路由网卡名（/proc/net/route 中 Destination=00000000 的第一行）。
+// 多网卡（如 WiFi 192.168.1.x + 热点 192.168.137.x）时，lan 提示/链接/二维码
+// 必须选"真正能出网的那个网卡"的地址——按枚举顺序挑会随接口增减漂移，
+// 对端拿到不可达地址（历史上"链接时对时错"的根源）。非 Linux 读不到则退化为原顺序。
+fn default_route_iface() -> Option<String> {
+    let content = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in content.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 2 && cols[1] == "00000000" && !cols[0].is_empty() {
+            return Some(cols[0].to_string());
+        }
+    }
+    None
+}
 fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
-    let mut out = vec![];
+    let mut out: Vec<(Option<String>, std::net::Ipv4Addr)> = vec![];
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for i in ifaces {
             if let std::net::IpAddr::V4(v4) = i.ip() {
-                if !v4.is_loopback() && v4.is_private() && !out.contains(&v4) {
-                    out.push(v4);
+                if !v4.is_loopback() && v4.is_private() && !out.iter().any(|(_, a)| *a == v4) {
+                    out.push((Some(i.name), v4));
                 }
             }
         }
     }
-    out
+    let preferred = default_route_iface();
+    // 默认路由网卡的地址排最前（lan 提示取 [0]）；同组内保持枚举顺序稳定
+    out.sort_by_key(|(name, _)| if preferred.is_some() && *name == preferred { 0 } else { 1 });
+    out.into_iter().map(|(_, a)| a).collect()
 }
 
 // Host/Origin 白名单：内置回环名 + 实际绑定地址/HOST（域名时）+ os.hostname()（含短名）

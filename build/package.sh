@@ -102,10 +102,10 @@ package_linux() {
   mkdir -p "$DEBROOT/usr/lib/cipherlane"
   cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'APP'
 #!/bin/sh
-# cipherlane 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板。
-# 打开的是局域网地址：浏览器从回环 origin 打开与本机 LAN origin 会裂成两个
-# localStorage 身份（同一台机器在别人眼里变成两台设备）；lan 提示由服务器
-# /api/version 给出（回环询问同样返回），拿不到（无网卡/离线）才退回环。
+# cipherlane 桌面启动器：未运行则后台启动，随后打开传输主页。
+# 职责边界：这里只负责"传输主页"，且必须开局域网地址（回环 origin 会与 LAN origin
+# 裂成两个身份，页面内链接/二维码也以 LAN 为准）；管理面板 /panel 只在回环打开、
+# 只经托盘进入。启动不带停机令牌——留给托盘 adopt 接管（否则托盘 409 变只读）。
 PORT=${CIPHERLANE_PORT:-7777}
 LOCAL="http://127.0.0.1:$PORT"
 probe() { (curl -sf "$LOCAL/api/version" || wget -qO- "$LOCAL/api/version") >/dev/null 2>&1; }
@@ -119,17 +119,15 @@ if ! probe; then
   # 日志写用户态 XDG 目录：/var/log 普通用户无权创建,曾导致服务器静默不启动
   LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/cipherlane"
   mkdir -p "$LOGDIR"
-  TOKEN=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)
-  PORT="$PORT" CIPHERLANE_SHUTDOWN_TOKEN="$TOKEN" nohup /usr/bin/cipherlane >>"$LOGDIR/app.log" 2>&1 &
+  PORT="$PORT" nohup /usr/bin/cipherlane >>"$LOGDIR/app.log" 2>&1 &
   for i in $(seq 1 50); do probe && break; sleep 0.2; done
-  if probe; then
-    exec xdg-open "$(public_base)/panel#$TOKEN"
+  if ! probe; then
+    MSG="密道启动失败。常见原因：端口 $PORT 被旧实例占用（fuser -k $PORT/tcp 后重试）。日志：$LOGDIR/app.log"
+    if command -v zenity >/dev/null 2>&1; then zenity --error --title cipherlane --text "$MSG" 2>/dev/null; fi
+    exit 1
   fi
-  MSG="密道启动失败。常见原因：端口 $PORT 被旧实例占用（fuser -k $PORT/tcp 后重试）。日志：$LOGDIR/app.log"
-  if command -v zenity >/dev/null 2>&1; then zenity --error --title cipherlane --text "$MSG" 2>/dev/null; fi
-  exit 1
 fi
-exec xdg-open "$(public_base)/panel"
+exec xdg-open "$(public_base)/"
 APP
   chmod 755 "$DEBROOT/usr/lib/cipherlane/cipherlane-app"
 
@@ -200,7 +198,8 @@ Architecture: amd64
 Maintainer: kgpche <341253778+kgpche@users.noreply.github.com>
 Description: cipherlane · 密道 —— 局域网端到端加密传输
  自包含 Rust 静态二进制（内嵌全部前端资源），安装即用、无运行时依赖。
- 安装后执行: sudo systemctl enable --now cipherlane
+ 桌面：应用列表点击 cipherlane（托盘自动随登录启动，管理面板经托盘进入）；
+ 无桌面环境（服务器）: sudo systemctl enable --now cipherlane，
  然后浏览器打开 http://<本机IP>:7777
 Recommends: gnome-shell-extension-appindicator
 CONTROL
@@ -208,21 +207,33 @@ CONTROL
   cat > "$DEBROOT/DEBIAN/postinst" << 'POSTINST'
 #!/bin/sh
 systemctl daemon-reload 2>/dev/null || true
+# 升级前在跑的服务：prerm 已记录并停止，这里拉回（新二进制）
+if [ -f /run/cipherlane-was-active ]; then
+  rm -f /run/cipherlane-was-active
+  systemctl start cipherlane 2>/dev/null || true
+fi
 # GNOME:启用 Ubuntu 自带的 appindicator 扩展,让系统托盘图标可见(无桌面会话时静默跳过)
 if command -v gnome-extensions >/dev/null 2>&1 && gnome-extensions list 2>/dev/null | grep -q '^ubuntu-appindicators@'; then
   gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null || true
 fi
 echo
-echo "  cipherlane 已安装。应用列表点击 cipherlane,或等托盘图标(需 appindicator 扩展)自动出现"
+echo "  cipherlane 已安装。应用列表点击 cipherlane 打开传输主页（局域网地址）；"
+echo "  管理面板经系统托盘进入（仅回环）。无桌面环境可: sudo systemctl enable --now cipherlane"
 echo
 exit 0
 POSTINST
   chmod 755 "$DEBROOT/DEBIAN/postinst"
 
-  # prerm：升级/卸载前停服务——否则升级后旧进程继续跑旧二进制直到手动 restart
+  # prerm：升级/卸载前停服务——否则升级后旧进程继续跑旧二进制直到手动 restart。
+  # 升级路径先记录"之前在跑"，postinst 据此把服务拉回（升级不得悄悄断服）。
   cat > "$DEBROOT/DEBIAN/prerm" << 'PRERM'
 #!/bin/sh
-if [ "$1" = "upgrade" ] || [ "$1" = "remove" ]; then
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  systemctl stop cipherlane 2>/dev/null || true
+elif [ "$1" = "upgrade" ]; then
+  if systemctl is-active --quiet cipherlane 2>/dev/null; then
+    touch /run/cipherlane-was-active 2>/dev/null || true
+  fi
   systemctl stop cipherlane 2>/dev/null || true
 fi
 exit 0
