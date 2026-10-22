@@ -102,10 +102,19 @@ package_linux() {
   mkdir -p "$DEBROOT/usr/lib/cipherlane"
   cat > "$DEBROOT/usr/lib/cipherlane/cipherlane-app" << 'APP'
 #!/bin/sh
-# cipherlane 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板
+# cipherlane 桌面启动器：未运行则后台启动（带会话停机令牌），随后打开控制面板。
+# 打开的是局域网地址：浏览器从回环 origin 打开与本机 LAN origin 会裂成两个
+# localStorage 身份（同一台机器在别人眼里变成两台设备）；lan 提示由服务器
+# /api/version 给出（回环询问同样返回），拿不到（无网卡/离线）才退回环。
 PORT=${CIPHERLANE_PORT:-7777}
-URL="http://127.0.0.1:$PORT"
-probe() { (curl -sf "$URL/api/version" || wget -qO- "$URL/api/version") >/dev/null 2>&1; }
+LOCAL="http://127.0.0.1:$PORT"
+probe() { (curl -sf "$LOCAL/api/version" || wget -qO- "$LOCAL/api/version") >/dev/null 2>&1; }
+version_json() { curl -sf "$LOCAL/api/version" 2>/dev/null || wget -qO- "$LOCAL/api/version" 2>/dev/null; }
+# 公开访问地址：优先服务器报告的局域网 IP；"lan":null/解析失败时退回环（本机仍可用）
+public_base() {
+  lan=$(version_json | sed -n 's/.*"lan":"\([0-9][0-9.]*\)".*/\1/p')
+  if [ -n "$lan" ]; then echo "http://$lan:$PORT"; else echo "$LOCAL"; fi
+}
 if ! probe; then
   # 日志写用户态 XDG 目录：/var/log 普通用户无权创建,曾导致服务器静默不启动
   LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/cipherlane"
@@ -114,13 +123,13 @@ if ! probe; then
   PORT="$PORT" CIPHERLANE_SHUTDOWN_TOKEN="$TOKEN" nohup /usr/bin/cipherlane >>"$LOGDIR/app.log" 2>&1 &
   for i in $(seq 1 50); do probe && break; sleep 0.2; done
   if probe; then
-    exec xdg-open "$URL/panel#$TOKEN"
+    exec xdg-open "$(public_base)/panel#$TOKEN"
   fi
   MSG="密道启动失败。常见原因：端口 $PORT 被旧实例占用（fuser -k $PORT/tcp 后重试）。日志：$LOGDIR/app.log"
   if command -v zenity >/dev/null 2>&1; then zenity --error --title cipherlane --text "$MSG" 2>/dev/null; fi
   exit 1
 fi
-exec xdg-open "$URL/panel"
+exec xdg-open "$(public_base)/panel"
 APP
   chmod 755 "$DEBROOT/usr/lib/cipherlane/cipherlane-app"
 
