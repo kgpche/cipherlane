@@ -578,6 +578,11 @@ fn single_file_link_mode() {
     let (scode, sout) = send.wait_timeout(Duration::from_secs(120));
     assert_eq!(scode, 0, "发送方失败:\n{sout}");
     assert!(sout.contains("凭证校验通过"), "发送方应显示凭证校验通过:\n{sout}");
+    // 发送方观测到带凭证的 ack 后应删除房间：立即释放服务端内存与 per-IP 配额，
+    // 而不是等 2 分钟空闲清扫（残留房间会让同一 IP 的下一次大文件发送被背压卡住）
+    let after = common::http(srv.port, "GET", &format!("/api/rooms/{room}/state"), &[], None)
+        .expect("GET state（发送完成后）");
+    assert_eq!(after.status, 404, "ack 后发送方应已删除房间，state 实际返回 {}: {}", after.status, after.text());
 }
 
 // ============================================================

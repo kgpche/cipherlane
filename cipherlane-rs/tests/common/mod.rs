@@ -417,7 +417,17 @@ impl Cdp {
                         let _ = tcp.set_read_timeout(Some(Duration::from_secs(150)));
                         let _ = tcp.set_write_timeout(Some(Duration::from_secs(10)));
                     }
-                    return Cdp { ws, next_id: 0 };
+                    let mut cdp = Cdp { ws, next_id: 0 };
+                    // 内存模式接收完成时页面会真的触发下载（t08/t10/t11/t18）：一律拒绝，
+                    // 不往开发者的 ~/Downloads 里落 e2e-*.bin（历史上每跑一次套件留一批）。
+                    // 不认识该命令的旧版 Chrome 只告警，不影响测试。
+                    if cdp
+                        .try_send(None, "Browser.setDownloadBehavior", json!({ "behavior": "deny" }))
+                        .is_err()
+                    {
+                        eprintln!("  ⚠ 无法拒绝测试下载（Browser.setDownloadBehavior）：e2e-*.bin 可能落入 ~/Downloads");
+                    }
+                    return cdp;
                 }
                 Err(_) => {
                     if Instant::now() > deadline {
@@ -430,6 +440,12 @@ impl Cdp {
     }
 
     pub fn send(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
+        self.try_send(session, method, params)
+            .unwrap_or_else(|err| panic!("CDP {method} 失败: {err}"))
+    }
+
+    /// 与 send 相同，但 CDP 返回错误时返回 Err 而不是 panic（传输层错误仍然 panic）。
+    pub fn try_send(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({ "id": id, "method": method, "params": params });
@@ -449,9 +465,9 @@ impl Cdp {
                     let v: Value = serde_json::from_str(&t).expect("CDP 响应不是 JSON");
                     if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
                         if let Some(err) = v.get("error") {
-                            panic!("CDP {method} 失败: {err}");
+                            return Err(err.to_string());
                         }
-                        return v.get("result").cloned().unwrap_or(Value::Null);
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                     }
                 }
                 tungstenite::Message::Ping(p) => {

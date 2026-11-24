@@ -26,7 +26,12 @@ const GLOBAL_BYTES_MAX: usize = 256 * 1024 * 1024;
 const ROOM_IDLE_MS: u128 = 15 * 60 * 1000;
 const ACK_IDLE_MS: u128 = 2 * 60 * 1000;
 const LONGPOLL: Duration = Duration::from_secs(25);
-const ALIVE_SLICE: Duration = Duration::from_millis(100);
+// 长轮询挂起期间的断连检测周期（每次检测整读一遍 /proc/net/tcp，见 conn_alive）。
+// 内核按全机 socket 数生成这张表，台式机上实测一次约 3.6ms；而每个打开的页面常驻一条
+// 邀请长轮询：100ms 周期下每条挂起连接约占 3.6% 单核（5 台设备常驻约 18%），二十几条
+// 就吃满一核。放宽到 1s 后降到约 0.36%；代价是客户端断开后 worker 线程与 per-IP
+// 长轮询配额最多多占 1s 才释放（新数据的到达仍由 Condvar 即时唤醒，不受此周期影响）。
+const ALIVE_SLICE: Duration = Duration::from_secs(1);
 const LONGPOLL_PER_IP: i32 = 8;
 const DEVICE_TTL_MS: u128 = 20 * 1000;
 const DEVICE_MEM_MS: u128 = 5 * 60 * 1000;

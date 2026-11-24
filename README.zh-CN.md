@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2059-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2062-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -257,6 +257,22 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
   出现时主动接管；deb 升级自动恢复之前在跑的服务（prerm 记录、postinst 拉回）。
   多网卡时 lan 提示固定取**默认路由网卡**地址（/proc/net/route），不再随接口枚举顺序
   漂移——多网段机器上链接时对时错的根源
+- **修复：浏览器批量接收越过背压窗口即卡死**：页面拉分片恒带 `X-Resume`（只读回放、不释放），
+  而批量接收从不上报进度——发送方投满服务端 64 片窗口后被永久 429，接收方又在等下一片，
+  双方停在约 63MiB 互等（链接模式与设备直发均中招，CLI 做接收端不受影响）。现在整批放不进
+  窗口时，每落定一个文件就上报进度、放行它占用的分片；能整批塞进窗口的批量不报进度，行为
+  与以往一致（刷新后仍可整批重拉）。browser 回归 t17（70 片批量流式落盘）
+- **修复：残留房间占着 per-IP 字节配额**：传输结束后房间要等空闲清扫（ack 后 2 分钟、无人
+  接收 15 分钟），这期间滞留密文一直算在发送方 IP 的 96MiB 配额里，同一台机器的下一次大文件
+  发送会被背压卡住且没有任何报错。现在发送方（浏览器与 CLI）在观测到带有效凭证的 ack、
+  拒绝、中断或失败后立即删除房间，浏览器页面真正卸载时也经 `beforeunload` 删除在途房间；
+  没有有效凭证的 ack（可能是伪造）不删，保留服务端宽限。browser 回归 t18 + CLI 断言
+- **空闲 CPU 降到约 1/10**：长轮询挂起期间每 100ms 整读一遍 `/proc/net/tcp` 做断连检测
+  （台式机实测每次约 3.5ms；每个打开的页面常驻一条邀请长轮询，每条挂起连接约占 3.6% 单核）。
+  检测周期放宽到 1s（同一时刻 A/B，16 条挂起长轮询：58–60% → 6%）；代价是客户端断开后
+  worker 线程与 per-IP 长轮询配额最多多占 1s 才释放
+- **测试基建**：浏览器套件显式拒绝页面触发的下载（旧版 headless Chrome 会把测试文件落进
+  `~/Downloads`）；新增回归 t17 / t18
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）

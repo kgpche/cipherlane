@@ -759,7 +759,8 @@ fn g13_longpoll_cap() {
     for s in parked {
         let _ = s.shutdown(Shutdown::Both);
     }
-    thread::sleep(Duration::from_millis(400));
+    // 客户端断连由服务端按 ALIVE_SLICE（1s）周期检测：留足一个周期以上再验证配额已释放
+    thread::sleep(Duration::from_millis(1500));
     expect_parked(p, &path); // 释放后应允许新的长轮询挂起
     assert_status(&delete_room(p, &room), 200, "删除长轮询房间");
     ok("长轮询并发上限：第 9 个 429 / 断开释放后可再挂");

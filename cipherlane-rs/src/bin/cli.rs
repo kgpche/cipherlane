@@ -909,7 +909,21 @@ fn print_qr(link: &str) {
     println!("{}  ↑ 手机扫码接收\n", out);
 }
 
-fn await_ack(server: &UrlParts, room: &str, key: &[u8; 32], target: &Option<Value>) {
+// 发送方已观测到带有效凭证的 ack：房间对发送方再无用途，立即删除以释放服务端内存与
+// per-IP 字节配额（否则要等 2 分钟空闲清扫）。没有有效凭证的 ack 可能是抢到房间号的
+// 第三方伪造——真正的接收方或许还在收，那种情况不删，保留服务端的宽限。
+fn release_room(server: &UrlParts, room: &str, token: &str) {
+    let u = url(server, &format!("/api/rooms/{room}"));
+    let _ = http_request(
+        "DELETE",
+        &u,
+        &[("X-Room-Token", token.to_string())],
+        None,
+        Duration::from_secs(5),
+    );
+}
+
+fn await_ack(server: &UrlParts, room: &str, token: &str, key: &[u8; 32], target: &Option<Value>) {
     let deadline = Instant::now() + Duration::from_secs(15 * 60);
     print!("\n  等待对方接收…");
     let _ = io::stdout().flush();
@@ -939,6 +953,7 @@ fn await_ack(server: &UrlParts, room: &str, key: &[u8; 32], target: &Option<Valu
                 .unwrap_or_else(|| "对方".to_string());
             if verified {
                 println!("\n\n✅ {}已完整接收（凭证校验通过）", who);
+                release_room(server, room, token);
             } else {
                 println!("\n\n⚠ {}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造\n", who);
             }
@@ -1019,7 +1034,7 @@ fn do_send_file(sa: &SendArgs, path: &Path) -> CResult<()> {
         let _ = io::stdout().flush();
     }
     post_done(sa.server, &info.room, &info.token)?;
-    await_ack(sa.server, &info.room, &info.key, &info.target);
+    await_ack(sa.server, &info.room, &info.token, &info.key, &info.target);
     Ok(())
 }
 
@@ -1042,7 +1057,7 @@ fn do_send_text(sa: &SendArgs, text: &str) -> CResult<()> {
     print!("\r  已发送 {} / {}", fmt_bytes(size), fmt_bytes(size));
     let _ = io::stdout().flush();
     post_done(sa.server, &info.room, &info.token)?;
-    await_ack(sa.server, &info.room, &info.key, &info.target);
+    await_ack(sa.server, &info.room, &info.token, &info.key, &info.target);
     Ok(())
 }
 
@@ -1151,7 +1166,7 @@ fn do_send_batch(sa: &SendArgs, paths: &[String]) -> CResult<()> {
     }
     post_done(sa.server, &info.room, &info.token)?;
     println!("\n  共 {} 个文件（{}）已全部发出", files.len(), fmt_bytes(total));
-    await_ack(sa.server, &info.room, &info.key, &info.target);
+    await_ack(sa.server, &info.room, &info.token, &info.key, &info.target);
     Ok(())
 }
 

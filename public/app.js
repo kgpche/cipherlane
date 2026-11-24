@@ -757,9 +757,33 @@ document.addEventListener('click', function askOnce() {
 })
 
 // ---------- 发送 ----------
-const sendState = { stopPoll: null } // stopPoll：取消发送时停状态轮询
+// 发送中房间的句柄。传输有了结果（发送方已观测到带凭证的 ack / 拒绝 / 中断 / 失败）时
+// 主动删除房间，立即释放服务端内存与该 IP 的字节配额——否则要等空闲清扫（ack 后 2 分钟、
+// 无人接收 15 分钟），期间这笔滞留密文一直算在发送方 IP 的 96MiB 配额里，同一台机器的
+// 下一次大文件发送会被背压卡住且没有任何报错。
+// active：房间仍在途（卸载页面时需要删）；stopPoll：取消发送时停状态轮询。
+const sendState = { stopPoll: null, room: null, token: null, active: false }
+
+// 删除发送方自己建的房间（幂等；房间已不存在时服务端回 404，忽略即可）。
+// keepalive：beforeunload 期间页面脚本即将停止，普通请求可能被浏览器直接丢弃，
+// keepalive 请求会在页面卸载后继续发出。
+function releaseRoom(keepalive = false) {
+  if (!sendState.room) return
+  fetch(`/api/rooms/${sendState.room}`, {
+    method: 'DELETE', headers: { 'X-Room-Token': sendState.token }, keepalive,
+  }).catch(() => {})
+  sendState.active = false
+}
+// 页面真正卸载（关标签页 / 刷新 / 跳走）：在途传输的房间随发送方一起消失，不留 15 分钟的
+// 孤儿房间。用 beforeunload 而不是 pagehide：pagehide 还会在页面进入往返缓存时触发
+//（部分移动浏览器切换应用或标签页就是这种情况，页面并没有真正离开），在那里删房间会误杀
+// "切出去粘贴链接"的发送方的传输。系统直接回收后台标签页时两个事件都不保证触发，属尽力而为。
+window.addEventListener('beforeunload', () => { if (sendState.active) releaseRoom(true) })
 
 const FILES_MAX = 256
+// 服务端单房间背压窗口（cipherlane-rs/src/main.rs 的 ROOM_CHUNKS_BUF，片数含 0 号 meta）。
+// 整批放不进窗口时，批量接收必须边收边报进度，见 doReceiveBatch。
+const ROOM_WINDOW = 64
 const dataChunkCount = (n) => (n === 0 ? 0 : Math.ceil(n / CHUNK))
 
 async function startSend(kind, payload, target) {
@@ -822,6 +846,9 @@ async function startSend(kind, payload, target) {
 
   // 先绑定取消按钮：建立阶段任何一步失败都必须保证有退路
   let room = null, token = null
+  sendState.room = null
+  sendState.token = null
+  sendState.active = false
   const ctl = new AbortController()
   const cancelBtn = $('#cancel-send')
   cancelBtn.className = 'btn danger'
@@ -830,6 +857,7 @@ async function startSend(kind, payload, target) {
     ctl.abort()
     if (sendState.stopPoll) sendState.stopPoll()
     if (room) api(`/api/rooms/${room}`, { method: 'DELETE', headers: { 'X-Room-Token': token } }).catch(() => {})
+    sendState.active = false
     showView('landing')
   }
 
@@ -838,6 +866,9 @@ async function startSend(kind, payload, target) {
   try {
     // 建房 + 协商密钥（密钥只存在于双方浏览器内存；定向模式的密钥经 X25519 派生，永不过网）
     ;({ room, token } = await (await api('/api/rooms', { method: 'POST', signal: ctl.signal })).json())
+    sendState.room = room
+    sendState.token = token
+    sendState.active = true
     if (target) {
       const theirPub = fromB64(target.pub)
       const shared = X25519.dh(identity.sk, theirPub)
@@ -859,6 +890,8 @@ async function startSend(kind, payload, target) {
     }
   } catch (e) {
     if (ctl.signal.aborted) return
+    // 房间可能已建好而后续一步（如投递邀请）失败：不留空房间
+    releaseRoom()
     setStatus('send-status', '❌ 建立密道失败：' + e.message, 'err')
     cancelBtn.className = 'btn'
     cancelBtn.textContent = '返回首页'
@@ -887,9 +920,14 @@ async function startSend(kind, payload, target) {
     setTimeout(() => ($('#copy').textContent = '复制链接'), 1500)
   }
 
-  // 终态：成功时把进度补到 100%，停轮询，"取消发送"换成语义正确的"返回首页"
-  const finish = (ok, msg) => {
+  // 终态：成功时把进度补到 100%，停轮询，"取消发送"换成语义正确的"返回首页"。
+  // roomDone = 这个房间对发送方已无用途（拒绝 / 中断 / 失败，或 ack 凭证校验通过），立即删除。
+  // 没有有效凭证的 ack 可能是抢到房间号的第三方伪造——真正的接收方或许还在收，
+  // 这时不删房间，留给服务端 2 分钟的宽限。
+  const finish = (ok, msg, roomDone = false) => {
     if (sendState.stopPoll) sendState.stopPoll()
+    sendState.active = false // 已到终态：之后卸载页面不再需要清理
+    if (roomDone) releaseRoom()
     if (ok) {
       setBar('bar-pulled', 1)
       $('#pulled-meta').textContent = '对方已接收 ' + fmtBytes(size) + '（100%）'
@@ -908,14 +946,14 @@ async function startSend(kind, payload, target) {
       busy = true
       try {
         const r = await fetchT(`/api/rooms/${room}/state`, {}, 10_000)
-        if (r.status === 404) return finish(false, '❌ 传输已中断（房间过期或被回收）')
+        if (r.status === 404) return finish(false, '❌ 传输已中断（房间过期或被回收）', true)
         const st = await r.json()
         if (st.acked) {
           const verified = st.ackProof && st.ackProof === ackProofOf(key, room)
           const who = target ? target.name || '对方' : '对方'
           return finish(true, verified
             ? `✅ ${who}已完整接收（凭证校验通过）`
-            : `⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造，建议与对方口头确认`)
+            : `⚠ ${who}已接收，但 ack 无有效凭证——房间号泄露时可能被伪造，建议与对方口头确认`, verified)
         }
         if (st.receiverSeen && !st.acked)
           setStatus('send-status', '📡 传输中…', 'warn')
@@ -936,11 +974,11 @@ async function startSend(kind, payload, target) {
       let st
       try {
         const r = await fetchT(`/api/rooms/${room}/state`, {}, 10_000)
-        if (r.status === 404) return finish(false, '❌ 对方超时未接受，邀请已过期')
+        if (r.status === 404) return finish(false, '❌ 对方超时未接受，邀请已过期', true)
         st = await r.json()
       } catch { await sleep(1000); continue }
       if (st.offer === 'accepted') break
-      if (st.offer === 'rejected') return finish(false, `❌ ${target.name || '对方'}拒绝了传输`)
+      if (st.offer === 'rejected') return finish(false, `❌ ${target.name || '对方'}拒绝了传输`, true)
       await sleep(800)
     }
     setStatus('send-status', '📡 对方已接受，传输中…', 'warn')
@@ -1000,7 +1038,7 @@ async function startSend(kind, payload, target) {
     setStatus('send-status', '🟢 已全部发出，等待对方接收完成…', 'warn')
   } catch (e) {
     if (ctl.signal.aborted) return
-    finish(false, '❌ 发送失败：' + e.message)
+    finish(false, '❌ 发送失败：' + e.message, true)
   }
 }
 
@@ -1136,6 +1174,11 @@ async function receiveBatch(room, key, meta, ctl, useAAD) {
 }
 
 async function doReceiveBatch(room, key, meta, signal, useAAD) {
+  // 本页拉分片恒带 X-Resume（只读回放、不释放）。整批放不进服务端背压窗口时如果不报进度，
+  // 发送方投满窗口后被永久 429，接收方又在等下一片——双方停在窗口边缘互等到房间被空闲回收
+  //（曾卡死在约 63MiB）。所以每落定一个文件就上报一次进度，放行它占用的分片。
+  // 能整批塞进窗口的批量不报进度，行为与以往一致（刷新页面后仍可整批重拉）。
+  const reportProgress = (meta.count || 0) > ROOM_WINDOW
   const hasGesture = hasUserGesture()
   // 目录选择器:有新鲜手势的 Chromium 流式落盘;否则内存模式完成后逐个下载
   let dir = null
@@ -1190,6 +1233,7 @@ async function doReceiveBatch(room, key, meta, signal, useAAD) {
     else memParts.push({ name: fname, blob: new Blob(parts8) })
     // 完整性：每个文件的累计字节数必须与 manifest 一致，否则不落下载、不 ack
     if (fgot !== (info.size || 0)) throw new Error(`完整性校验失败：${info.name || fname} 大小 ${fgot} ≠ ${info.size || 0}`)
+    if (reportProgress) progressPost(room, idx) // 该文件已落定：放行 [1, idx) 的分片
   }
   if (got !== (meta.size || 0)) throw new Error(`完整性校验失败：总大小 ${got} ≠ ${meta.size || 0}`)
   if (!dir) {

@@ -8,7 +8,8 @@
 //!   `CARGO_BIN_EXE_cipherlane` 提供），前端仍是浏览器里的 JS，本文件用 CDP 驱动真实 Chrome。
 //! - 每个 `#[test]` 先取 `common::serial()` 跨进程串行锁（cargo 会并行跑 tests/*.rs，且同文件
 //!   内测试也并行）；无 Chrome 时打印跳过并正常 return（不能 fail）。
-//! - 场景编号与旧 .mjs 的 `ok()` 一一对应，共 19 条断言（见每个测试的函数注释）。
+//! - 场景编号与旧 .mjs 的 `ok()` 一一对应，共 19 条断言（见每个测试的函数注释）；
+//!   t16（TOFU 重信）、t17（批量越过背压窗口）、t18（发送方释放房间）为 Rust 版新增的回归。
 //! - 服务器统一传 `HOST=""`（恢复"回环 + 局域网网卡"自动绑定，链路里 publicOrigin 会升级为
 //!   LAN 地址）与 `CIPHERLANE_EXTRA_HOSTS=cipherlane-insecure.test`（第 9 组非安全上下文用假
 //!   域名；Chrome 启动参数里已有 host-resolver-rules 映射到 127.0.0.1）。
@@ -16,6 +17,7 @@ mod common;
 
 use common::{hex, random_bytes, Cdp, Chrome, Page, Server};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -126,6 +128,25 @@ fn assert_hidden_ok(cdp: &mut Cdp, p: &Page, when: &str) {
     if !bad.is_empty() {
         panic!("hidden 属性被 display 覆盖（{when}）: {}", bad.join(","));
     }
+}
+
+/// 轮询房间 state 直到服务端回 404 no-room（发送方已删除房间）。
+/// 必须比对 error 码：路径写错时服务端同样回 404（not-found），只看状态码会假通过。
+/// 异步表达式不能交给 wait_for（它只认同步表达式）。
+fn wait_room_gone(cdp: &mut Cdp, p: &Page, room: &str, what: &str) {
+    let expr = js(
+        r#"fetch('/api/rooms/' + __ROOM__ + '/state').then(async (r) => r.status === 404 && (await r.json()).error === 'no-room')"#,
+        &[("__ROOM__", &jstr(room))],
+    );
+    let mut gone = false;
+    for _ in 0..100 {
+        if eval_bool(cdp, p, &expr) {
+            gone = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert!(gone, "{what}（房间 {room} 的 state 在 10s 内未变成 404）");
 }
 
 // =====================================================================================
@@ -1348,4 +1369,216 @@ fn t16_tofu_retrust_closes_the_loop() {
         "fetch('/api/rooms/' + window.__offerRoom, { method: 'DELETE', headers: { 'X-Room-Token': window.__offerToken } })",
     );
     ok("TOFU 重信闭环:直发/邀请确认后回写新公钥、红条消除、不再重复确认");
+}
+
+// =====================================================================================
+// 场景 17（Rust 版新增）：批量接收越过背压窗口（回归：>63 片的批量曾卡死在窗口边缘）
+//   页面拉分片恒带 X-Resume（只读回放、不释放）；批量接收若不报 progress，发送方投满服务端
+//   64 片窗口后被永久 429，接收方又在等下一片——双方互等到房间被空闲回收。
+//   70 片数据 + 1 片 meta = 71 片 > 窗口 64。接收端用 OPFS 真实目录句柄冒充目录选择器
+//   （Chromium 流式落盘路径），避免内存模式逐个触发 70 次下载。
+// =====================================================================================
+#[test]
+fn t17_batch_beyond_backpressure_window() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let s = srv.url();
+    let a = cdp.new_page();
+    nav(&mut cdp, &a, &format!("{s}/"));
+
+    // 70 个 1MiB 文件（内容为同一随机块：页面内按 SHA-256 与 Rust 侧计算值核对）
+    let dir = common::unique_dir("e2e-batch70");
+    let block = random_bytes(1024 * 1024);
+    let mut files = Vec::new();
+    for i in 0..70 {
+        let p = dir.join(format!("b{i:02}.bin"));
+        fs::write(&p, &block).expect("写批量测试文件");
+        files.push(p);
+    }
+    cdp.set_files(&a, "#file", &files);
+    cdp.eval(&a, "document.querySelector('#file').onchange()");
+    cdp.wait_for(
+        &a,
+        "document.querySelector('#link').textContent.startsWith('http')",
+        60000,
+        "批量链接",
+    );
+    let link = text(&mut cdp, &a, "#link");
+    let frag = link[link.find('#').expect("链接无 fragment")..].to_string();
+
+    // 接收端：目录选择器桩 + 手势进入接收 → 走流式落盘路径
+    let dir_stub = r#"
+(() => {
+  const stub = async () => {
+    const root = await navigator.storage.getDirectory()
+    return await root.getDirectoryHandle('t17-batch', { create: true })
+  }
+  try { Object.defineProperty(window, 'showDirectoryPicker', { configurable: true, value: stub }) }
+  catch { try { window.showDirectoryPicker = stub } catch {} }
+})()
+"#;
+    let b = cdp.new_page();
+    cdp.send(
+        Some(&b.sid),
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": dir_stub }),
+    );
+    nav(&mut cdp, &b, &format!("{s}/"));
+    cdp.eval_gesture(&b, &format!("(location.hash = {}, 'ok')", jstr(&frag)));
+
+    // 修复前：双方停在 63MiB（服务端 posted=64、through=0），直到超时
+    cdp.wait_for(
+        &b,
+        "document.querySelector('#recv-file-status').textContent.includes('已接收 70 个文件')",
+        120000,
+        "越过背压窗口的批量接收",
+    );
+    let status = text(&mut cdp, &b, "#recv-file-status");
+    assert!(
+        status.contains("已写入所选目录"),
+        "应走目录流式落盘路径，实际: {status}"
+    );
+    cdp.wait_for(
+        &a,
+        "document.querySelector('#send-status').textContent.includes('凭证校验通过')",
+        30000,
+        "发送方凭证校验",
+    );
+    // 目录内 70 个文件；抽查一个的内容与原文一致
+    let got = cdp.eval(
+        &b,
+        r#"(async () => {
+  const root = await navigator.storage.getDirectory()
+  const d = await root.getDirectoryHandle('t17-batch')
+  let n = 0, dig = ''
+  for await (const [name, h] of d.entries()) {
+    if (h.kind !== 'file') continue
+    n++
+    if (name === 'b00.bin') {
+      const buf = new Uint8Array(await (await h.getFile()).arrayBuffer())
+      dig = [...new Uint8Array(await crypto.subtle.digest('SHA-256', buf))].map((x) => x.toString(16).padStart(2, '0')).join('')
+    }
+  }
+  return { n, dig }
+})()"#,
+    );
+    assert_eq!(got["n"].as_i64(), Some(70), "目录内应落盘 70 个文件: {got}");
+    let want = hex(&Sha256::digest(&block));
+    assert_eq!(got["dig"].as_str(), Some(want.as_str()), "落盘内容应与原文一致");
+    let _ = fs::remove_dir_all(&dir);
+    ok("批量接收越过背压窗口:70 片批量（71 片 > 窗口 64）流式落盘完成，内容一致，ack 凭证闭环");
+}
+
+// =====================================================================================
+// 场景 18（Rust 版新增）：发送方释放房间（回归：残留房间占着 per-IP 96MiB 字节配额）
+//   a) 传输完成且 ack 凭证校验通过 → 发送方删除房间（state → 404）
+//   b) 没有有效凭证的 ack（可能是伪造）→ 不删房间，留给服务端 2 分钟宽限
+//   c) 发送中途页面卸载（关标签页/刷新/跳走）→ beforeunload 以 keepalive 请求删除在途房间
+// =====================================================================================
+#[test]
+fn t18_sender_releases_room() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let s = srv.url();
+    let room_of = |link: &str| {
+        link.split('#')
+            .nth(1)
+            .and_then(|x| x.split('.').next())
+            .expect("链接缺少 room")
+            .to_string()
+    };
+    // 起一个发送页并等到接收链接出现
+    let start_send = |cdp: &mut Cdp, f: &std::path::Path| -> (Page, String) {
+        let p = cdp.new_page();
+        nav(cdp, &p, &format!("{s}/"));
+        cdp.set_files(&p, "#file", &[f.to_path_buf()]);
+        cdp.eval(&p, "document.querySelector('#file').onchange()");
+        cdp.wait_for(
+            &p,
+            "document.querySelector('#link').textContent.startsWith('http')",
+            30000,
+            "接收链接",
+        );
+        let room = room_of(&text(cdp, &p, "#link"));
+        (p, room)
+    };
+
+    let dir = common::unique_dir("e2e-release");
+    let f = dir.join("release.bin");
+    fs::write(&f, random_bytes(3 * 1024 * 1024)).expect("写测试文件");
+
+    // ---- a) 完成且凭证校验通过 → 删除 ----
+    let (a, room_a) = start_send(&mut cdp, &f);
+    let link = text(&mut cdp, &a, "#link");
+    let b = cdp.new_page();
+    nav(&mut cdp, &b, &link); // 链接模式无手势 → 内存模式；下载由测试基建统一拒绝
+    cdp.wait_for(
+        &b,
+        "document.querySelector('#recv-file-status').textContent.includes('已保存')",
+        60000,
+        "接收完成",
+    );
+    cdp.wait_for(
+        &a,
+        "document.querySelector('#send-status').textContent.includes('凭证校验通过')",
+        30000,
+        "发送方凭证校验",
+    );
+    wait_room_gone(&mut cdp, &a, &room_a, "完成后房间应被发送方删除");
+    ok("发送方释放房间:完成后删除（state → 404）");
+
+    // ---- b) 没有有效凭证的 ack → 保留 ----
+    let (d, room_d) = start_send(&mut cdp, &f);
+    cdp.wait_for(
+        &d,
+        "document.querySelector('#send-status').textContent.includes('已全部发出')",
+        60000,
+        "分片投完（伪造 ack 场景）",
+    );
+    // 只知道房间号的第三方发一个不带凭证的 ack
+    let acked = eval_i64(
+        &mut cdp,
+        &a,
+        &js(
+            r#"fetch('/api/rooms/' + __ROOM__ + '/ack', { method: 'POST' }).then((r) => r.status)"#,
+            &[("__ROOM__", &jstr(&room_d))],
+        ),
+    );
+    assert_eq!(acked, 200, "无凭证 ack 应被服务端接受（由发送方本地识别）");
+    cdp.wait_for(
+        &d,
+        "document.querySelector('#send-status').textContent.includes('无有效凭证')",
+        20000,
+        "发送方识别出无凭证 ack",
+    );
+    sleep_ms(1500); // 给可能发出的删除请求留足时间
+    let still = eval_i64(
+        &mut cdp,
+        &a,
+        &js(
+            r#"fetch('/api/rooms/' + __ROOM__ + '/state').then((r) => r.status)"#,
+            &[("__ROOM__", &jstr(&room_d))],
+        ),
+    );
+    assert_eq!(still, 200, "无有效凭证的 ack 不应删除房间（真正的接收方可能还在收）");
+    // 收尾：这个房间由测试手动删除
+    cdp.eval(
+        &d,
+        "fetch(`/api/rooms/${sendState.room}`, { method: 'DELETE', headers: { 'X-Room-Token': sendState.token } }); sendState.active = false; 'ok'",
+    );
+    ok("发送方释放房间:无有效凭证的 ack 不删房间（保留服务端宽限）");
+
+    // ---- c) 页面卸载 → 删除在途房间 ----
+    let (c, room_c) = start_send(&mut cdp, &f);
+    // 等发送方投完全部分片：此后它只会一直"等待接收方打开链接"，直到房间被清扫
+    cdp.wait_for(
+        &c,
+        "document.querySelector('#send-status').textContent.includes('已全部发出')",
+        60000,
+        "分片投完（卸载场景）",
+    );
+    nav(&mut cdp, &c, "about:blank"); // 真正离开页面 → beforeunload
+    wait_room_gone(&mut cdp, &a, &room_c, "页面卸载后在途房间应被删除");
+    let _ = fs::remove_dir_all(&dir);
+    ok("发送方释放房间:页面卸载时经 beforeunload 删除在途房间");
 }
