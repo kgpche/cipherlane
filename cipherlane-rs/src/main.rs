@@ -2,7 +2,7 @@
 //
 // 线协议为唯一实现；验收 = cargo test --test protocol（Rust 集成测试）对本实现全绿。
 // 架构：tiny_http（vendor 补丁版：请求头 16KiB 预算 / 每连接 60s 读写超时 /
-// 并发连接上限 256，见 vendor/tiny_http/PATCHES.md）+ 每地址 128 工作线程；
+// 并发连接上限 256 / 任务池不丢唤醒，见 vendor/tiny_http/PATCHES.md）+ 每地址 128 工作线程；
 // worker 带 panic 隔离（catch_unwind）与锁毒化恢复，单个请求异常不波及服务；
 // 长轮询以 Condvar 挂起（LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）；
 // 优雅停机：sigwait 专职线程 → 停止派发 → 250ms 排干 → exit 0（对齐 Node 语义）。

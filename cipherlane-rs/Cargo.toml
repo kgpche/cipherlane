@@ -9,7 +9,8 @@ license = "MIT"
 
 [dependencies]
 # vendor 补丁版（见 vendor/tiny_http/PATCHES.md）：请求头 16KiB 预算、每连接读/写
-# 60s 超时（client.rs 对 TimedOut 回 408 断连）、并发连接上限 256——对齐 Node 默认防护。
+# 60s 超时（client.rs 对 TimedOut 回 408 断连）、并发连接上限 256——对齐 Node 默认防护；
+# 任务池丢唤醒修复（上游实现下并发到达的连接可能被接受却一直没人读）。
 tiny_http = "0.12"
 serde_json = "1"
 rand = "0.8"

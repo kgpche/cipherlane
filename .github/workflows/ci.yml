@@ -70,8 +70,9 @@ jobs:
             ${{ runner.os }}-cargo-cross-
       - name: Build release binaries
         run: cargo build --release --manifest-path cipherlane-rs/Cargo.toml
-      # 编译全部测试目标（--no-run）：cli 套件在 Windows 为空目标属预期，重点是
-      # common/browser/crypto 等脚手架不许出现平台不兼容代码
+      # 编译全部测试目标（--no-run）：cli / screenshots 套件与 protocol 的 g26（SIGTERM）
+      # 用到 unix 专有接口，在 Windows 为空目标/不编译属预期；重点是其余目标与 common 脚手架
+      # 不许出现平台不兼容代码
       - name: Compile test targets
         run: cargo test --release --manifest-path cipherlane-rs/Cargo.toml --no-run
 

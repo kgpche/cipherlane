@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2065-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2067-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -293,6 +293,17 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **测试**：新增明文 http 主路径的多分片用例（纯 JS AES + worker 池 + 内存模式，21 片，页面内
   SHA-256 逐字节比对，t19）；修复 t06 的偶发失败（约 1/6：页面启动那一轮还在途的设备刷新把
   注入的测试设备覆盖掉）
+- **修复：页面偶发一直停在加载中**（Rust 版 CI 首跑时暴露）：vendored tiny_http 上游的
+  连接任务池有一个丢唤醒竞态——"已被唤醒、还没回到取任务循环"的线程仍被算作空闲，浏览器
+  并发建立 6 条连接时，第 5、6 条连接的任务被塞进队列却没人认领：连接已被接受、请求
+  一直没人读，页面缺一两个静态资源停在 loading，直到别的连接关闭才恢复。核越少越容易
+  撞上（整机 4 核时实测约 1/4 的页面加载中招；回环与局域网地址都会）。空闲线程改为
+  "先预约再唤醒"的计数方式（vendor 补丁 4）。回归 g28（直接驱动任务池，上游实现下必
+  失败）与 g27（真实服务器的突发连接）；browser 套件钉在 4 核上连跑 6 次全绿（修复前
+  每次都有页面加载超时）
+- **CI**：Windows 的"编译测试目标"此前因 `screenshots` 套件用到 unix 专有接口而失败；
+  连同 g26（SIGTERM）一起按 unix 门控，全部测试目标对 Windows / macOS 做了交叉类型
+  检查（零错误零警告）。注意 Windows / macOS 目前仍然只验证"能编译"，没有真跑过测试
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）

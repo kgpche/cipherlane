@@ -2,10 +2,11 @@
 
 #[cfg(unix)]
 use std::os::unix::net as unix_net;
-use std::{
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    path::PathBuf,
-};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+// [cipherlane patch] PathBuf 只在 unix 分支（Unix 域套接字）用到：上游在 Windows 上留下
+// 一条 unused import 警告，CI 的三平台编译门禁要求零警告通过
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Unified listener. Either a [`TcpListener`] or [`std::os::unix::net::UnixListener`]
 pub enum Listener {

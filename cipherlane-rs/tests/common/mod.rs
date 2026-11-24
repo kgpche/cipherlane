@@ -147,6 +147,40 @@ impl Drop for Server {
 /// 启动被测服务器。extra_env 覆盖默认值；未显式给 HOST 时只绑回环。
 /// free_port 的 bind-后-drop 与真正监听之间存在被抢端口的窗口：子进程若秒退
 /// （几乎必为端口被抢）则立刻换端口重试，最多 3 次，全部失败才 panic。
+/// 启动被测服务器。extra_env 覆盖默认值；未显式给 HOST 时只绑回环。
+
+/// 本进程当前被允许运行的第一个 CPU（Linux 的 Cpus_allowed_list）；读不到返回 None。
+pub fn first_allowed_cpu() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let list = status.lines().find(|l| l.starts_with("Cpus_allowed_list:"))?.split(':').nth(1)?.trim();
+    list.split(',').next()?.split('-').next()?.trim().parse().ok()
+}
+
+/// 把当前线程钉到指定 CPU（Linux）；其他平台或失败时返回 Err。
+pub fn pin_self_to(cpu: usize) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let bits = std::mem::size_of::<libc::cpu_set_t>() * 8;
+        if cpu >= bits {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "cpu 超出 cpu_set_t 范围"));
+        }
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let words = &mut set as *mut libc::cpu_set_t as *mut u64;
+        unsafe {
+            *words.add(cpu / 64) |= 1u64 << (cpu % 64);
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cpu;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "仅 Linux"))
+    }
+}
+
 pub fn spawn_server(extra_env: &[(&str, &str)]) -> Server {
     let mut last_log = String::new();
     for attempt in 1..=3 {

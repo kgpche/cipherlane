@@ -27,12 +27,20 @@
 //!   group 24 面板端点：version / shutdown 令牌双闸 403 / update source / panel 页可达
 //!   group 25 adopt：回环接管 200 / 短令牌 400 / 二次接管 409 / shutdown 空令牌 403
 //!   group 26 SIGTERM 优雅停机：退出码 0 +「优雅停机」
+//!   group 27 突发连接：一批并发 keep-alive 连接全部有人处理
+//!   group 28 任务池不丢任务（直接驱动 vendor/tiny_http 的 TaskPool；g27 的确定性版本）
 mod common;
+
+// 按路径引入 vendored tiny_http 的任务池源码：测的就是服务器编译进去的那份文件
+//（它在 tiny_http 里是私有模块，外部无法引用；文件挪位置时这里会编译失败，不会静默失效）
+#[path = "../vendor/tiny_http/src/util/task_pool.rs"]
+#[allow(dead_code)]
+mod task_pool;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1131,7 +1139,9 @@ fn g25_adopt() {
 }
 
 // ==================== group 26) SIGTERM 优雅停机 ====================
-
+// SIGTERM 与 libc::kill 都是 unix 专有（Windows 没有这条优雅停机路径）；Windows/macOS 的
+// CI 编译门禁会连测试目标一起编，所以整个测试按 unix 门控，而不是只门控其中的调用。
+#[cfg(unix)]
 #[test]
 fn g26_sigterm_graceful() {
     let _g = common::serial();
@@ -1156,4 +1166,105 @@ fn g26_sigterm_graceful() {
     let out = srv.stdout();
     assert!(out.contains("优雅停机"), "应打印优雅停机文案: {out}");
     ok("SIGTERM 优雅停机：关闭监听/连接后 exit 0");
+}
+
+// ==================== group 27) 突发连接：被接受的连接必须有人处理 ====================
+// 模拟浏览器加载一个页面：一批连接并发到达并各自保持打开（keep-alive），每条都必须有人处理。
+// 这是端到端的冒烟；"任务池把已接受的连接搁置"那个竞态的确定性复现见 g28。
+#[test]
+fn g27_burst_connections_all_served() {
+    let _g = common::serial();
+    let srv = common::spawn_server(&[]);
+    let p = srv.port;
+    let req = format!("GET /api/version HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\r\n");
+    const BURST: usize = 8;
+    const ROUNDS: usize = 30;
+    let mut worst = Duration::ZERO;
+    for round in 0..ROUNDS {
+        let start = Arc::new(std::sync::Barrier::new(BURST));
+        let handles: Vec<_> = (0..BURST)
+            .map(|_| {
+                let req = req.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    let mut s = TcpStream::connect(("127.0.0.1", p)).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    s.write_all(req.as_bytes()).expect("write");
+                    let t = Instant::now();
+                    // 只读状态行：读到即认为这条连接有人处理；连接由 drop 关闭（保持到本轮结束）
+                    let mut buf = [0u8; 12];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    (n == 12 && buf.starts_with(b"HTTP/1.1 200"), t.elapsed())
+                })
+            })
+            .collect();
+        let mut stranded = Vec::new();
+        for (i, h) in handles.into_iter().enumerate() {
+            let (ok_resp, dt) = h.join().expect("burst thread");
+            worst = worst.max(dt);
+            if !ok_resp {
+                stranded.push(i);
+            }
+        }
+        assert!(
+            stranded.is_empty(),
+            "第 {round} 轮第 {stranded:?} 条连接 3s 内没有拿到响应——连接已被接受却没人处理"
+        );
+    }
+    ok(&format!("突发连接不丢：{ROUNDS} 轮 × {BURST} 条并发 keep-alive 连接全部在 3s 内应答，最慢 {worst:?}"));
+}
+
+// ==================== group 28) 任务池不丢任务（vendor/tiny_http 补丁 4 的回归） ====================
+// tiny_http 上游的任务池有一个丢唤醒竞态：线程在调用 wait 之前给"空闲计数"加一、醒来回到循环
+// 之后才减一，于是"已经被 notify_one 唤醒、但还没抢到锁回到循环"的线程仍被算作空闲。这时到达的
+// spawn 以为有人在等，把任务塞进队列再 notify_one，而此刻已经没有真正睡在 condvar 上的线程，
+// 信号落空；被唤醒的线程各取走一个任务后，多出来的任务就一直躺在队列里，直到某个线程干完活
+// 回到循环才被捡起。对 keep-alive 连接来说就是"连接已被接受却一直没人读"。
+//
+// 浏览器打开一个页面时会并发建立约 6 条连接，4 核环境下实测约 1/4 的页面加载中招（缺一两个
+// 静态资源，页面一直停在 loading）。复现条件是"一批 spawn 落在同一段线程已唤醒、还没回到循环
+// 的窗口里"：这里把本线程（以及它创建的池线程）钉在同一个 CPU 上，8 次 spawn 一口气做完，
+// 被唤醒的线程要等本线程让出 CPU 才能回到循环——上游实现下恰好只有 4 个常驻线程各取走一个
+// 任务，其余 4 个被搁置。
+#[test]
+fn g28_task_pool_never_strands_a_task() {
+    // 不起服务器，本不需要串行锁；这里仍然拿锁，是为了独占机器调度——别的测试线程挤进
+    // 同一个 CPU 会让被唤醒的池线程提前得到运行机会，上游那个竞态就复现不出来
+    let _g = common::serial();
+    const N: usize = 8;
+    let pinned = common::first_allowed_cpu().and_then(|c| common::pin_self_to(c).ok()).is_some();
+    for round in 0..4 {
+        let started = Arc::new(AtomicUsize::new(0));
+        // 模拟长连接：任务开始后一直占着线程，直到本测试放行
+        let hold: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let pool = task_pool::TaskPool::new();
+        thread::sleep(Duration::from_millis(60)); // 让 4 个常驻线程先进入等待
+        for _ in 0..N {
+            let started = Arc::clone(&started);
+            let hold = Arc::clone(&hold);
+            pool.spawn(Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _guard = hold.1.wait_while(hold.0.lock().unwrap(), |go| !*go).unwrap();
+            }));
+        }
+        let t0 = Instant::now();
+        while started.load(Ordering::SeqCst) < N && t0.elapsed() < Duration::from_millis(1500) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let s = started.load(Ordering::SeqCst);
+        // 放行，让这一轮的线程收尾
+        *hold.0.lock().unwrap() = true;
+        hold.1.notify_all();
+        assert_eq!(
+            s,
+            N,
+            "第 {round} 轮：一口气 spawn {N} 个长任务，1.5s 内只有 {s} 个开始执行——其余的被任务池搁置（本线程{}）",
+            if pinned { "已钉在单个 CPU 上" } else { "未能钉核" }
+        );
+    }
+    ok(&format!(
+        "任务池不丢任务：一口气 spawn {N} 个长任务全部立即开始执行（4 轮；本线程{}）",
+        if pinned { "钉在单个 CPU 上" } else { "未能钉核" }
+    ));
 }

@@ -2,6 +2,11 @@
 //!   cargo test --release --manifest-path cipherlane-rs/Cargo.toml --test screenshots -- --ignored
 //! 需要本机 Chrome/Chromium；输出直接覆盖 docs/screenshots/{landing,send-done,recv-text}.png。
 //! 用真实 Rust 服务器 + headless Chrome 驱动前端，保证截图与当前 UI 一致。
+//!
+//! 用到 libc 原始 socket（见 register_fake）等 unix 专有接口：非 unix 平台是空目标（同 cli 套件），
+//! 只要求能编译——Windows/macOS 的 CI 编译门禁会连测试目标一起编。
+#![cfg(unix)]
+
 mod common;
 
 use std::io::{Read, Write};

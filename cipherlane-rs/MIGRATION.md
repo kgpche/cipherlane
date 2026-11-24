@@ -128,3 +128,20 @@ Rust 化 review 发现的三类缺口全部修复：
   编译门禁（push/PR 即验证，不再等发版）、Chrome 必需断言（`CIPHERLANE_REQUIRE_CHROME=1`）、
   deb 巡检断言三 bin + postinst/prerm/postrm 齐全；release 校验 tag↔Cargo.toml 版本；
   deb 补 prerm（升级/卸载停服）/postrm（daemon-reload）；Windows zip 附 SmartScreen 提示。
+
+## Rust 版 CI 首跑后的收口（2026-11-24）
+
+- **tiny_http 任务池丢唤醒**（vendor 补丁 4，见 `vendor/tiny_http/PATCHES.md`）：上游把
+  "已被唤醒、还没回到取任务循环"的线程仍算作空闲，浏览器并发建连时多出来的连接任务被
+  塞进队列却没人认领——连接已被接受、请求一直没人读，页面停在 loading。4 核环境下约
+  1/4 的页面加载中招（回环与局域网地址都会），这正是 Rust 版 CI 在 Linux 上首跑时
+  browser 套件里 3 个"页面加载超时"的根因。空闲线程改为先预约再唤醒；回归 g28
+  （按路径引入 vendored 的 `task_pool.rs` 直接驱动，上游实现下必失败）+ g27。
+- **Windows / macOS 编译门禁补全**：`tests/screenshots.rs` 与 `protocol.rs` 的 g26 用到
+  unix 专有接口（libc 原始 socket、SIGTERM），此前在 Windows 上编译测试目标必然失败。
+  现按 unix 门控（同 `tests/cli.rs`）。本机用 scratch crate 对全部测试目标做了
+  `cargo check --tests --target x86_64-pc-windows-msvc / aarch64-apple-darwin`（零错误
+  零警告）；vendored tiny_http 另对 Windows / macOS / musl 三个目标做了类型检查。
+  **Windows / macOS 仍然只验证"能编译"，一次都没有真跑过测试**（`tests/protocol.rs`
+  的 g26 在 Windows 上不编译；`cli` / `screenshots` 为空目标）。
+
