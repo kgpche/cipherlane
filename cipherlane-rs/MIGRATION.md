@@ -149,6 +149,8 @@ Rust 化 review 发现的三类缺口全部修复：
   "变量名后紧跟全角字符"的写法在 macOS 自带的 bash 3.2 下会把后面的字节并进变量名，
   `set -u` 报 unbound variable（Linux 的 dash / bash 5 上正常，同一个 bash 3.2 在 Linux
   容器里也不复现）。相关写法改为 `${变量名}`，`tests/consistency.rs` 新增守卫。
-  **发布链路里真正打 tag 之后才会跑的步骤（tag↔Cargo.toml 校验、统一 SHA256SUMS、
-  `gh release create`）在空跑里不会执行**，仍然没有验证过。
+- **v1.0.0 首次打 tag 发布**：三平台构建成功，Publish job 失败——"failed to run git:
+  fatal: not a git repository"。该 job 没有 checkout，三条 `gh release` 命令都没带
+  `--repo`（空跑不执行 publish job，所以空跑发现不了）。已改为显式 `--repo
+  "$GITHUB_REPOSITORY"`；tag v1.0.0 重新指向修复后的提交，再由工作流发布。
 

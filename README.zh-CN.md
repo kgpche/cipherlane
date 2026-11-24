@@ -309,6 +309,9 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
   变量名，`set -u` 直接报 unbound variable；Linux 的 dash / bash 5 上完全正常，所以普通
   CI 发现不了（macOS 只在 Release 工作流里跑打包脚本）。相关写法一律改为 `${变量名}`，
   并由 consistency 套件守住
+- **修复：Release 发不出去**（v1.0.0 首次打 tag 时暴露）：发布 job 只下载构建物、没有
+  checkout，三条 `gh release` 命令都没带 `--repo`，报 "not a git repository"——三平台构建
+  成功但 Release 没建出来。现已显式指定仓库
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）
