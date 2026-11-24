@@ -13,6 +13,12 @@
 #
 # 依赖：cargo/rustup（stable）；Linux 另需 rustup musl target + dpkg-deb；
 #       macOS 需 Xcode 命令行工具（lipo）；Windows 在 Git Bash 中运行。
+# 可移植性：macOS 上本脚本由系统自带的 bash 3.2 以 sh 模式执行。实测（Rust 版 Release
+#       工作流首次空跑）"变量名后紧跟全角括号 / 中文逗号"的写法——比如 echo "... $t" 的
+#       变量后面不加空格直接跟全角括号——会让它把后面的高位字节也当成变量名的一部分，
+#       在 set -u 下报 "unbound variable"。同样的写法在 Linux 的 dash / bash 5 上完全正常，
+#       所以普通 CI 发现不了。凡是变量后面紧接非 ASCII 字符，一律写 ${变量名}
+#      （由 tests/consistency.rs 守卫）。
 # 每次运行都会刷新 build/dist/cipherlane-<ver>-SHA256SUMS.txt。
 set -eu
 cd "$(dirname "$0")/.."
@@ -66,7 +72,7 @@ make_zip() { # $1=输出 zip；其余=要打包的文件（当前目录）
 
 # ================= Linux：musl 静态二进制 + .deb =================
 package_linux() {
-  [ "$ARCH" = "x86_64" ] || { echo "✗ Linux 产物目前仅支持 x86_64（当前 $ARCH）"; exit 1; }
+  [ "$ARCH" = "x86_64" ] || { echo "✗ Linux 产物目前仅支持 x86_64（当前 ${ARCH}）"; exit 1; }
   need cargo
   need dpkg-deb
   if command -v rustup >/dev/null 2>&1; then
@@ -264,7 +270,7 @@ package_macos() {
     rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
   fi
   for t in x86_64-apple-darwin aarch64-apple-darwin; do
-    echo ">> 构建 macOS $t（server / cli）…"
+    echo ">> 构建 macOS ${t}（server / cli）…"
     cargo_build --target "$t" --bin cipherlane --bin cipherlane-cli
   done
   STAGE=$BUILD/macos-root/cipherlane
@@ -351,5 +357,5 @@ esac
 
 write_sums
 echo
-echo "✓ 打包完成（cipherlane $VER，$OS/$ARCH）"
+echo "✓ 打包完成（cipherlane ${VER}，${OS}/${ARCH}）"
 for f in $ARTIFACTS; do ls -la "$DIST/$f"; done

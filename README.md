@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2067-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2068-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -259,6 +259,7 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **Tests**: a multi-chunk case for the plain-http main path (pure-JS AES + worker pool + memory mode, 21 chunks, SHA-256 compared in-page, t19); fixed the intermittent t06 failure (about 1 in 6: the still-in-flight device refresh from page start overwrote the injected test device)
 - **Fixed: pages occasionally stuck on "loading" forever** (surfaced by the Rust-era CI's first run): the connection task pool of the vendored tiny_http had a lost-wakeup race — a thread that had already been notified but not yet returned to its task loop still counted as idle. With a browser opening 6 connections at once, the tasks for connections 5 and 6 were pushed onto the queue with nobody left to claim them: the connection was accepted, its request was never read, and the page sat on "loading" missing a static file until some other connection closed. The fewer the cores, the more often it happens (about 1 in 4 page loads with the whole machine squeezed to 4 cores; loopback and LAN addresses alike). Idle threads are now reserved before being woken (vendor patch 4). Regressions: g28 (drives the task pool directly; the upstream code always fails it) and g27 (burst connections through the real server); the browser suite pinned to 4 cores passed 6 runs in a row (before: page-load timeouts every run)
 - **CI**: the Windows "compile test targets" step used to fail because the `screenshots` suite uses Unix-only APIs; it and g26 (SIGTERM) are now gated to Unix, and every test target was cross type-checked for Windows and macOS (zero errors, zero warnings). Windows and macOS still only verify "it compiles" — no test has actually run there
+- **Fixed: the macOS package could not be built** (surfaced by the release workflow's first dry run): in `build/package.sh`, a variable followed directly by a full-width parenthesis or a Chinese comma made macOS's built-in bash 3.2 swallow the following bytes into the variable name, and `set -u` then failed with "unbound variable". The same code is fine under Linux's dash / bash 5, so ordinary CI never saw it (macOS only runs the packaging script in the release workflow). Every such spot now uses `${variable}`, enforced by the consistency suite
 - **Docs**: README (en/zh) and the migration document rewritten for the Rust-only product
 
 **v0.5.1** (2026-10-19, reliability)

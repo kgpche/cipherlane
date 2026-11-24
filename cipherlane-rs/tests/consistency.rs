@@ -7,6 +7,7 @@
 //!   3) 三个 bin 声明与源文件存在
 //!   4) 五个 Rust 测试目标存在（crypto / protocol / cli / browser / consistency）
 //!   5) 产品、构建、CI、文档命令块中无 Node/npm/旧 Node 实现残留
+//!   6) build/package.sh 里 `$变量名` 不紧跟非 ASCII 字符（macOS 自带 bash 3.2 的解析坑）
 //!
 //! 失败信息带 `文件:行号`，便于直接定位。
 use std::fs;
@@ -384,3 +385,55 @@ fn no_node_remnants_in_product_build_ci_docs() {
         violations.join("\n  ")
     );
 }
+
+// ---------- shell 可移植性守卫 ----------
+
+/// `build/package.sh` 在 macOS 上由系统自带的 bash 3.2 以 sh 模式执行。实测（GitHub 的
+/// macOS runner，Rust 版 Release 工作流第一次空跑）`$t（server / cli）` 这种"变量名后紧跟
+/// 全角括号 / 中文逗号"的写法会让它把后面的高位字节也当成变量名的一部分，配合脚本开头的
+/// `set -u` 报 "unbound variable"（日志里是 `line 267: t<…>: unbound variable`）。同样的
+/// 写法在 Linux 的 dash / bash 5 上完全正常——同一个 bash 3.2 放进 Linux 容器里也不复现，
+/// 和 libc 对高位字节的分类有关——而 macOS 只在 Release 工作流里跑 `package.sh`，普通 CI
+/// 不经过，所以要在这里守住。写法一律是 `${变量名}`。
+#[test]
+fn package_script_braces_variables_before_non_ascii() {
+    let root = repo_root();
+    let path = root.join("build/package.sh");
+    let text = read_text(&path);
+    let mut violations = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // 找 `$` 后面紧跟的标识符起始（`${`、`$(`、`$1`、`$$` 等不是变量名，跳过）
+            if chars[i] == '$' && i + 1 < chars.len() && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+                let start = i + 1;
+                let mut j = start + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                if j < chars.len() && !chars[j].is_ascii() {
+                    let name: String = chars[start..j].iter().collect();
+                    violations.push(format!(
+                        "{}:{}: `${name}` 后紧跟非 ASCII 字符 `{}`（改写为 `${{{name}}}`）← {}",
+                        rel(&root, &path),
+                        idx + 1,
+                        chars[j],
+                        line.trim()
+                    ));
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "build/package.sh 有 {} 处 `$变量名` 紧跟非 ASCII 字符，macOS 自带的 bash 3.2 会把后面的字节\
+         并进变量名（set -u 下即 unbound variable）：\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}
+

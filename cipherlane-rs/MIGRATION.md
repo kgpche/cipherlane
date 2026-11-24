@@ -144,4 +144,11 @@ Rust 化 review 发现的三类缺口全部修复：
   零警告）；vendored tiny_http 另对 Windows / macOS / musl 三个目标做了类型检查。
   **Windows / macOS 仍然只验证"能编译"，一次都没有真跑过测试**（`tests/protocol.rs`
   的 g26 在 Windows 上不编译；`cli` / `screenshots` 为空目标）。
+- **Release 工作流首次空跑**（`gh workflow run release.yml`，只出 artifact 不发布）：Linux 与
+  Windows 产物构建成功，macOS 在 `build/package.sh` 第 267 行失败——`$t（server / cli）` 这种
+  "变量名后紧跟全角字符"的写法在 macOS 自带的 bash 3.2 下会把后面的字节并进变量名，
+  `set -u` 报 unbound variable（Linux 的 dash / bash 5 上正常，同一个 bash 3.2 在 Linux
+  容器里也不复现）。相关写法改为 `${变量名}`，`tests/consistency.rs` 新增守卫。
+  **发布链路里真正打 tag 之后才会跑的步骤（tag↔Cargo.toml 校验、统一 SHA256SUMS、
+  `gh release create`）在空跑里不会执行**，仍然没有验证过。
 

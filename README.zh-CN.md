@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2067-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2068-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -304,6 +304,11 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **CI**：Windows 的"编译测试目标"此前因 `screenshots` 套件用到 unix 专有接口而失败；
   连同 g26（SIGTERM）一起按 unix 门控，全部测试目标对 Windows / macOS 做了交叉类型
   检查（零错误零警告）。注意 Windows / macOS 目前仍然只验证"能编译"，没有真跑过测试
+- **修复：macOS 发行包打不出来**（Release 工作流首次空跑时暴露）：`build/package.sh` 里
+  "变量名后紧跟全角括号 / 中文逗号"的写法在 macOS 自带的 bash 3.2 下会把后面的字节并进
+  变量名，`set -u` 直接报 unbound variable；Linux 的 dash / bash 5 上完全正常，所以普通
+  CI 发现不了（macOS 只在 Release 工作流里跑打包脚本）。相关写法一律改为 `${变量名}`，
+  并由 consistency 套件守住
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）
