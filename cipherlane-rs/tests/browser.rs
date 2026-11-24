@@ -436,11 +436,15 @@ fn t06_direct_tofu_confirm() {
     let s = srv.url();
     let a = cdp.new_page();
     nav(&mut cdp, &a, &format!("{s}/"));
+    // 注入"公钥已变化"的设备 + 选中 + 填文本 + 点击发送放在同一个同步 eval：startSend 在点击
+    // 处理里同步捕获 selectedDevice()，此后即使陈旧的 refreshDevices 落地也改不掉本次 target。
+    //（拆成几次 eval 时，页面启动那一轮还在途的 refreshDevices 可能恰好落在中间、整体替换
+    // deviceCache，点击时目标已不在 → 走"设备已离线"分支而不弹确认——实测约 1/6 概率的偶发失败。）
     let warned = eval_i64(
         &mut cdp,
         &a,
         r#"(() => {
-  refreshDevices = () => {}
+  refreshDevices = () => {} // 防后续轮询覆盖注入设备
   const kp = X25519.genKey()
   deviceCache.push({ ip: '10.99.0.6', id: 'tofu', name: 'TOFU设备', pub: toB64(kp.pk) })
   const known = knownPubs.load()
@@ -448,14 +452,15 @@ fn t06_direct_tofu_confirm() {
   knownPubs.save(known)
   selectedIp = '10.99.0.6'
   renderDevices()
-  return document.querySelectorAll('.device.fp-changed').length
+  const warned = document.querySelectorAll('.device.fp-changed').length
+  document.querySelector('#text').value = 'TOFU 确认测试'
+  document.querySelector('#send-text').click()
+  return warned
 })()"#,
     );
     if warned < 1 {
         panic!("公钥变化设备卡应有\"⚠ 公钥已变化\"警示");
     }
-    cdp.eval(&a, "document.querySelector('#text').value = 'TOFU 确认测试'");
-    cdp.eval(&a, "document.querySelector('#send-text').click()");
     cdp.wait_for(&a, "!document.querySelector('#modal-mask').hidden", 20000, "直发 TOFU 确认弹窗");
     let title = text(&mut cdp, &a, "#modal-title");
     if !title.contains("公钥已变化") {
@@ -1581,4 +1586,465 @@ fn t18_sender_releases_room() {
     wait_room_gone(&mut cdp, &a, &room_c, "页面卸载后在途房间应被删除");
     let _ = fs::remove_dir_all(&dir);
     ok("发送方释放房间:页面卸载时经 beforeunload 删除在途房间");
+}
+
+// =====================================================================================
+// 场景 19（Rust 版新增）：明文 http 主路径——纯 JS AES + worker 池 + 内存模式，多分片文件
+//   用户在局域网里用 http://<IP> 打开页面时必然是非安全上下文：加解密走纯 JS AES，没有
+//   用户手势时落盘走内存模式。这条真实主路径此前只有两个小文本场景覆盖。收发两端都放在
+//   非安全上下文（假域名），20MiB 出头 = 21 片：越过流水线深度（3）与两个内存模式断点
+//   检查点（第 8、16 片）。用 URL.createObjectURL 钩子截获最终下载的 Blob，在页面内用
+//   纯 JS SHA-256 与 Rust 侧计算值比对；并断言完成后断点记录与分片段已清干净。
+// =====================================================================================
+#[test]
+fn t19_plain_http_pure_js_multichunk() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let base = format!("http://cipherlane-insecure.test:{}", srv.port);
+
+    let dir = common::unique_dir("e2e-insecure");
+    let data = random_bytes(20 * 1024 * 1024 + 12345); // 21 片（末片不满）
+    let f = dir.join("plain-http.bin");
+    fs::write(&f, &data).expect("写测试文件");
+
+    let a = cdp.new_page();
+    nav(&mut cdp, &a, &format!("{base}/"));
+    let ctx = cdp.eval(&a, "({ subtle: !!crypto.subtle, aesgcm: typeof AESGCM })");
+    assert_eq!(ctx["subtle"], json!(false), "发送端应在非安全上下文（走纯 JS AES）: {ctx}");
+    assert_eq!(ctx["aesgcm"], json!("object"), "纯 JS AESGCM 应可用: {ctx}");
+    cdp.set_files(&a, "#file", &[f.clone()]);
+    cdp.eval(&a, "document.querySelector('#file').onchange()");
+    cdp.wait_for(
+        &a,
+        "document.querySelector('#link').textContent.startsWith('http')",
+        30000,
+        "链接（纯 JS 加密）",
+    );
+    let link = text(&mut cdp, &a, "#link");
+    assert!(link.starts_with(&format!("{base}/#")), "非回环 origin 下链接不应被改写: {link}");
+    let room = link
+        .split('#')
+        .nth(1)
+        .and_then(|x| x.split('.').next())
+        .expect("链接缺少 room")
+        .to_string();
+
+    // 接收端：在 app.js 之前挂钩，截获内存模式最终创建的下载 Blob（下载本身由测试基建拒绝）
+    let hook = r#"
+(() => {
+  const orig = URL.createObjectURL.bind(URL)
+  window.__blobs = []
+  URL.createObjectURL = (blob) => { window.__blobs.push(blob); return orig(blob) }
+})()
+"#;
+    let b = cdp.new_page();
+    cdp.send(Some(&b.sid), "Page.addScriptToEvaluateOnNewDocument", json!({ "source": hook }));
+    nav(&mut cdp, &b, &link); // 无手势 → 内存模式
+    cdp.wait_for(
+        &b,
+        "document.querySelector('#recv-file-status').textContent.includes('已保存')",
+        180000,
+        "纯 JS 路径接收完成",
+    );
+    cdp.wait_for(
+        &a,
+        "document.querySelector('#send-status').textContent.includes('凭证校验通过')",
+        60000,
+        "发送方凭证校验",
+    );
+    let got = cdp.eval(
+        &b,
+        r#"(async () => {
+  const bytes = new Uint8Array(await window.__blobs[window.__blobs.length - 1].arrayBuffer())
+  const dig = Array.from(SHA256.hash(bytes), (x) => x.toString(16).padStart(2, '0')).join('')
+  const room = location.hash.slice(1).split('.')[0]
+  const keys = await new Promise((res) => {
+    const rq = indexedDB.open('cipherlane-resume', 1)
+    rq.onsuccess = () => {
+      const db = rq.result
+      const r = db.transaction('transfers').objectStore('transfers').getAllKeys()
+      r.onsuccess = () => { res(r.result); db.close() }
+    }
+  })
+  return { size: bytes.length, dig, rec: (await resumeDB.get(room)) || null, keys }
+})()"#,
+    );
+    assert_eq!(got["size"].as_u64(), Some(data.len() as u64), "接收长度应与原文一致: {got}");
+    let want = hex(&Sha256::digest(&data));
+    assert_eq!(got["dig"].as_str(), Some(want.as_str()), "纯 JS 路径收到的内容应与原文逐字节一致");
+    assert!(got["rec"].is_null(), "完成后断点记录应已删除: {got}");
+    let leftover: Vec<String> = got["keys"]
+        .as_array()
+        .map(|ks| ks.iter().filter_map(|k| k.as_str().map(String::from)).filter(|k| k.starts_with(&room)).collect())
+        .unwrap_or_default();
+    assert!(leftover.is_empty(), "完成后该房间的断点记录与分片段应全部删除，残留: {leftover:?}");
+    let _ = fs::remove_dir_all(&dir);
+    ok("明文 http 主路径:纯 JS AES 收发 21 片 + 内存模式 2 个断点检查点，内容逐字节一致，断点记录清理干净");
+}
+
+/// 给 FSA 续传场景预置一个"发了一半"的房间：真实服务端房间 + 12MiB 出头（13 片）的 v2 加密
+/// 分片，只投 0 号 meta 与前 9 片数据，其余留在页面变量里由测试决定何时补投。
+/// 返回 { room, frag, size, dig }。
+fn post_fsa_fixture(cdp: &mut Cdp, p: &Page) -> Value {
+    cdp.eval(
+        p,
+        r#"(async () => {
+  const size = 12 * CHUNK - 12345
+  const plain = new Uint8Array(size)
+  // getRandomValues 单次上限 64KiB(QuotaExceededError),按 64KiB 循环填满
+  for (let off = 0; off < size; off += 65536) crypto.getRandomValues(plain.subarray(off, Math.min(off + 65536, size)))
+  const created = await (await fetch('/api/rooms', { method: 'POST' })).json()
+  const room = created.room, token = created.token
+  const key = crypto.getRandomValues(new Uint8Array(32))
+  const meta = { v: 2, type: 'file', name: 'fsa-resume-e2e.bin', mime: 'application/octet-stream', size, count: 13 }
+  const seal = async (pt, i) => {
+    const k = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['encrypt', 'decrypt'])
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const aad = enc.encode('cipherlane/chunk/v2|' + room + '|' + i)
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, k, pt))
+    const out = new Uint8Array(12 + ct.length)
+    out.set(iv); out.set(ct, 12)
+    return out
+  }
+  const chunks = []
+  for (let off = 0; off < size; off += CHUNK) chunks.push(plain.subarray(off, Math.min(off + CHUNK, size)))
+  const post = async (seq, bytes) => {
+    for (;;) {
+      const r = await fetch('/api/rooms/' + room + '/chunk', {
+        method: 'POST', headers: { 'X-Room-Token': token, 'X-Chunk-Seq': String(seq) }, body: bytes,
+      })
+      if (r.status === 429) { await new Promise((res) => setTimeout(res, 100)); continue }
+      if (!r.ok) throw new Error('post chunk ' + r.status)
+      return
+    }
+  }
+  await post(0, await seal(enc.encode(JSON.stringify(meta)), 0))
+  for (let i = 0; i < 9; i++) await post(i + 1, await seal(chunks[i], i + 1))
+  const dig = [...new Uint8Array(await crypto.subtle.digest('SHA-256', plain))].map((x) => x.toString(16).padStart(2, '0')).join('')
+  window.__fxAll = window.__fxAll || []
+  window.__fxAll.push({ room, token, rest: chunks.slice(9), nextSeq: 10, post, seal })
+  return { n: window.__fxAll.length - 1, frag: '#' + room + '.' + toB64(key), room, size, dig }
+})()"#,
+    )
+}
+
+/// 用 OPFS 里的真实文件句柄冒充"保存文件"选择器的结果。
+/// `tag` 为空：始终给同一个文件（续传场景）；否则每次给一个名字里带 `tag` 的新文件。
+fn save_file_picker_stub(tag: &str) -> String {
+    let name = if tag.is_empty() { "'fsa-picked.bin'".to_string() } else { format!("'fsa-fresh-{tag}.bin'") };
+    format!(
+        r#"
+(() => {{
+  const stub = async () => {{
+    const root = await navigator.storage.getDirectory()
+    return await root.getFileHandle({name}, {{ create: true }})
+  }}
+  try {{ Object.defineProperty(window, 'showSaveFilePicker', {{ configurable: true, value: stub }}) }}
+  catch {{ try {{ window.showSaveFilePicker = stub }} catch {{}} }}
+}})()
+"#
+    )
+}
+
+/// 列出 OPFS 根目录里名字以 `prefix` 开头的文件及其字节数。
+fn opfs_files(cdp: &mut Cdp, p: &Page, prefix: &str) -> Vec<(String, u64)> {
+    let v = cdp.eval(
+        p,
+        &js(
+            r#"(async () => {
+  const root = await navigator.storage.getDirectory()
+  const out = []
+  for await (const [name, h] of root.entries()) {
+    if (h.kind !== 'file' || !name.startsWith(__PREFIX__)) continue
+    out.push([name, (await h.getFile()).size])
+  }
+  return out
+})()"#,
+            &[("__PREFIX__", &jstr(prefix))],
+        ),
+    );
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| (e[0].as_str().unwrap_or("").to_string(), e[1].as_u64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// OPFS 根目录里某个文件的 SHA-256（页面在安全上下文，用 WebCrypto 算）。
+fn opfs_sha256(cdp: &mut Cdp, p: &Page, name: &str) -> Option<String> {
+    cdp.eval(
+        p,
+        &js(
+            r#"(async () => {
+  const root = await navigator.storage.getDirectory()
+  const h = await root.getFileHandle(__NAME__)
+  const buf = new Uint8Array(await (await h.getFile()).arrayBuffer())
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', buf))].map((x) => x.toString(16).padStart(2, '0')).join('')
+})()"#,
+            &[("__NAME__", &jstr(name))],
+        ),
+    )
+    .as_str()
+    .map(String::from)
+}
+
+// =====================================================================================
+// 场景 20（Rust 版新增）：续传没接上时必须从头收，不能在空文件里留空洞
+//   FSA 续传记录存在（done=8），但原文件句柄已失效（文件被移走/删除，或授权被拒）→
+//   回落到重新选一个保存位置。旧代码在这种情况下没有把断点归零：新的空文件从第 9 片的
+//   位置开始写，开头 8MiB 是空洞，而总长度仍然对得上，完整性校验发现不了（静默损坏）。
+//   现在断点归零、从头收：
+//   a) 服务端还留着前面的分片 → 完整重收，内容与原文一致
+//   b) 前面的分片已按进度释放 → 重拉第 1 片得到明确的 410 报错，用户知道要让发送方重发，
+//      而不是拿到一个坏文件
+// =====================================================================================
+#[test]
+fn t20_failed_resume_restarts_from_zero() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let s = srv.url();
+    let a = cdp.new_page();
+    nav(&mut cdp, &a, &format!("{s}/"));
+
+    // 跑一遍"流式接收到第 8 片检查点 → 关页 → 原句柄授权被拒 + 新空文件 → 点继续"。
+    // 返回 (第二轮结束时的状态文案, 第二轮新建的文件 [(名字, 字节数)], 原文摘要, 原文长度, 新文件摘要)。
+    // released：第一轮的进度上报是否送达服务端（送达 = 前 8 片已释放）。
+    fn run(
+        cdp: &mut Cdp,
+        s: &str,
+        a: &Page,
+        released: bool,
+    ) -> (String, Vec<(String, u64)>, String, u64, Option<String>) {
+        let fx = post_fsa_fixture(cdp, a);
+        let n = fx["n"].as_u64().expect("fixture n");
+        let room = fx["room"].as_str().expect("room").to_string();
+        let frag = fx["frag"].as_str().expect("frag").to_string();
+        let dig = fx["dig"].as_str().expect("dig").to_string();
+        let size = fx["size"].as_u64().expect("size");
+
+        // 第一轮：流式接收写到第 8 片的检查点后停住（后续分片还没投）
+        let d = cdp.new_page();
+        cdp.send(
+            Some(&d.sid),
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": save_file_picker_stub("") }),
+        );
+        if !released {
+            // 模拟进度上报在网络上丢了：服务端不知道接收方已经落盘，前 8 片不会释放
+            cdp.send(
+                Some(&d.sid),
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": r#"
+(() => {
+  const of = window.fetch.bind(window)
+  window.fetch = (input, init) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || ''
+    if (url.includes('/progress')) return Promise.resolve(new Response('{}', { status: 200 }))
+    return of(input, init)
+  }
+})()"# }),
+            );
+        }
+        nav(cdp, &d, &format!("{s}/"));
+        cdp.eval_gesture(&d, &format!("(location.hash = {}, 'ok')", jstr(&frag)));
+        let idb_js = js(
+            r#"(async () => { const r = await resumeDB.get(__ROOM__); return r ? { mode: r.mode, done: r.done } : null })()"#,
+            &[("__ROOM__", &jstr(&room))],
+        );
+        let mut rec = Value::Null;
+        for _ in 0..300 {
+            rec = cdp.eval(&d, &idb_js);
+            if rec["done"].as_i64().unwrap_or(-1) >= 8 {
+                break;
+            }
+            sleep_ms(100);
+        }
+        assert_eq!(rec["mode"].as_str(), Some("fs"), "应走 FSA 流式保存并留下断点记录: {rec}");
+        assert!(rec["done"].as_i64().unwrap_or(-1) >= 8, "断点记录应推进到 8: {rec}");
+        // 进度上报是发后不管的：关页之前先确认服务端进度确实是 9，消除竞态
+        let through_js = js(
+            r#"fetch('/api/rooms/' + __ROOM__ + '/state').then((r) => r.json()).then((x) => x.through)"#,
+            &[("__ROOM__", &jstr(&room))],
+        );
+        if released {
+            let mut through = -1;
+            for _ in 0..200 {
+                through = eval_i64(cdp, &d, &through_js);
+                if through >= 9 {
+                    break;
+                }
+                sleep_ms(50);
+            }
+            assert!(through >= 9, "进度上报应已送达服务端（through={through}）");
+        }
+        cdp.close_page(&d);
+        let through = eval_i64(cdp, a, &through_js);
+        assert_eq!(through, if released { 9 } else { 0 }, "关页后服务端进度应与预期一致");
+
+        // 第二轮：原文件句柄已失效（文件被移走/删除后 createWritable 报 NotFoundError）+
+        // 保存选择器给一个全新的空文件。只让第一次 createWritable 失败——那是对旧句柄的续传尝试；
+        // 之后对新文件的 createWritable 照常工作
+        let deny = r#"
+(() => {
+  const orig = FileSystemFileHandle.prototype.createWritable
+  let n = 0
+  FileSystemFileHandle.prototype.createWritable = function (...args) {
+    if (n++ === 0) return Promise.reject(new DOMException('原文件已不在', 'NotFoundError'))
+    return orig.apply(this, args)
+  }
+})()
+"#;
+        let tag = now_nanos().to_string();
+        let d2 = cdp.new_page();
+        for src in [deny.to_string(), save_file_picker_stub(&tag)] {
+            cdp.send(Some(&d2.sid), "Page.addScriptToEvaluateOnNewDocument", json!({ "source": src }));
+        }
+        nav(cdp, &d2, &format!("{s}/?r={}{}", now_nanos(), frag));
+        cdp.wait_for(
+            &d2,
+            "document.querySelector('#start-recv').textContent.includes('继续接收')",
+            25000,
+            "续传按钮出现",
+        );
+        cdp.eval_gesture(&d2, "document.querySelector('#start-recv').click()");
+        // 发送方补齐剩余分片：旧代码会带着空洞"成功"；新代码要么完整重收，要么在重拉第 1 片时得到 410
+        cdp.eval(
+            a,
+            &js(
+                r#"(async () => {
+  const fx = window.__fxAll[__N__]
+  for (const chunk of fx.rest) {
+    const seq = fx.nextSeq++
+    await fx.post(seq, await fx.seal(chunk, seq))
+  }
+  await fetch('/api/rooms/' + fx.room + '/done', { method: 'POST', headers: { 'X-Room-Token': fx.token } })
+})()"#,
+                &[("__N__", &n.to_string())],
+            ),
+        );
+        cdp.wait_for(
+            &d2,
+            "(() => { const t = document.querySelector('#recv-file-status').textContent; return t.includes('已保存') || t.startsWith('❌') })()",
+            60000,
+            "第二轮接收结束",
+        );
+        let status = text(cdp, &d2, "#recv-file-status");
+        let fresh = opfs_files(cdp, &d2, &format!("fsa-fresh-{tag}"));
+        let got_dig = fresh.first().and_then(|(name, _)| opfs_sha256(cdp, &d2, name));
+        (status, fresh, dig, size, got_dig)
+    }
+
+    // ---- a) 前面的分片还在：从头完整重收，内容必须与原文一致 ----
+    let (status, fresh, dig, size, got) = run(&mut cdp, &s, &a, false);
+    assert!(status.contains("已保存"), "分片仍在时应完整重收并成功: {status}");
+    assert_eq!(fresh.len(), 1, "第二轮应新建一个保存文件: {fresh:?}");
+    assert_eq!(fresh[0].1, size, "新文件长度应与原文一致: {fresh:?}");
+    assert_eq!(got.as_deref(), Some(dig.as_str()), "重收的文件开头不能是空洞（内容应与原文一致）");
+    ok("续传没接上且分片仍在:断点归零完整重收，内容与原文一致");
+
+    // ---- b) 前面的分片已释放：明确报错，新文件里一个字节都不写 ----
+    let (status, fresh, _, _, _) = run(&mut cdp, &s, &a, true);
+    assert!(
+        status.starts_with("❌") && !status.contains("已保存"),
+        "分片已释放时应明确报错，而不是报成功: {status}"
+    );
+    for (name, bytes) in &fresh {
+        assert_eq!(*bytes, 0, "新开的空文件不应被写入任何字节: {name}");
+    }
+    ok("续传没接上且分片已释放:重拉第 1 片得到明确报错，不在空文件里留空洞后报成功");
+}
+
+// =====================================================================================
+// 场景 21（Rust 版新增）：断点记录的清理
+//   a) 房间已不在服务器上的记录（空闲清扫 / 发送方已删）永远续不上，启动时删除——
+//      内存模式下那是已下载的那部分文件，以前会一直留在 IndexedDB 里
+//   b) 删除按键区间覆盖全部分片段；旧布局（分片内嵌单条记录）一并覆盖
+//   c) 房间仍然存在的记录必须保留
+// =====================================================================================
+#[test]
+fn t21_stale_resume_records_pruned() {
+    let _g = common::serial();
+    let Some((srv, _chrome, mut cdp)) = boot() else { return };
+    let s = srv.url();
+    let p = cdp.new_page();
+    nav(&mut cdp, &p, &format!("{s}/"));
+    let seeded = cdp.eval(
+        &p,
+        r#"(async () => {
+  const created = await (await fetch('/api/rooms', { method: 'POST' })).json()
+  const meta = { size: 100, count: 20, name: 'x.bin' }
+  // 失效记录（新布局：断点记录 + 两段分片）与旧布局记录：房间号在服务器上都不存在
+  await resumeDB.append('Stale00001', { room: 'Stale00001', mode: 'mem', done: 8, meta, segments: 1 }, 0, [new Uint8Array(1024 * 1024)])
+  await resumeDB.append('Stale00001', { room: 'Stale00001', mode: 'mem', done: 16, meta, segments: 2 }, 1, [new Uint8Array(1024 * 1024)])
+  await resumeDB.set('Legacy0001', { room: 'Legacy0001', mode: 'mem', done: 8, meta, parts: [new Uint8Array(4096)] })
+  // 有效记录：房间还在
+  await resumeDB.set(created.room, { room: created.room, mode: 'fs', done: 0, meta })
+  return created
+})()"#,
+    );
+    let live = seeded["room"].as_str().expect("room").to_string();
+    let token = seeded["token"].as_str().expect("token").to_string();
+
+    let gone = |cdp: &mut Cdp, room: &str| {
+        eval_bool(
+            cdp,
+            &p,
+            &js(
+                r#"(async () => (await resumeDB.get(__ROOM__)) == null)()"#,
+                &[("__ROOM__", &jstr(room))],
+            ),
+        )
+    };
+    let rooms_left = |cdp: &mut Cdp| {
+        eval_text(cdp, &p, "(async () => JSON.stringify(await resumeDB.rooms()))()")
+    };
+    // 重新加载页面 → 启动时清理
+    nav(&mut cdp, &p, &format!("{s}/?r={}", now_nanos()));
+    let mut pruned = false;
+    for _ in 0..100 {
+        if gone(&mut cdp, "Stale00001") && gone(&mut cdp, "Legacy0001") {
+            pruned = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert!(
+        pruned,
+        "房间已不存在的断点记录（含旧布局）应在启动时被清理；仍存在的记录: {}",
+        rooms_left(&mut cdp)
+    );
+    sleep_ms(1500); // 给清理留足时间后再验证"有效记录没被误删"
+    let state = cdp.eval(
+        &p,
+        &js(
+            r#"(async () => ({ live: await resumeDB.get(__ROOM__), staleParts: (await resumeDB.parts('Stale00001')).length }))()"#,
+            &[("__ROOM__", &jstr(&live))],
+        ),
+    );
+    assert_eq!(state["staleParts"].as_u64(), Some(0), "失效记录的分片段应一并删除: {state}");
+    assert_eq!(state["live"]["done"].as_i64(), Some(0), "房间仍然存在的记录必须保留: {state}");
+
+    // 房间被删除后，对应记录在下一次启动时清掉
+    let st = eval_i64(
+        &mut cdp,
+        &p,
+        &js(
+            r#"fetch('/api/rooms/' + __ROOM__, { method: 'DELETE', headers: { 'X-Room-Token': __TOKEN__ } }).then((r) => r.status)"#,
+            &[("__ROOM__", &jstr(&live)), ("__TOKEN__", &jstr(&token))],
+        ),
+    );
+    assert_eq!(st, 200, "删除仍存在的房间");
+    nav(&mut cdp, &p, &format!("{s}/?r={}", now_nanos()));
+    let mut live_gone = false;
+    for _ in 0..100 {
+        if gone(&mut cdp, &live) {
+            live_gone = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert!(live_gone, "房间删除后其断点记录应在下次启动时被清理");
+    ok("断点记录清理:失效记录（含分片段与旧布局）启动时删除，房间仍在的记录保留");
 }

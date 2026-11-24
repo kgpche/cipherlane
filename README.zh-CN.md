@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2062-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2065-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -193,7 +193,7 @@ IDE 集成终端（Electron/xterm.js）的字符行高与字形度量偏离标�
 内存模式下逐个触发下载，浏览器会请求一次"允许下载多个文件"，点允许即可；Chromium 系在接收前弹目录选择器直接流式写入，无此提示。
 
 **纯 JS 降级路径速度如何？**
-加密在 Worker 池（×4）并行执行；单 worker 约 22 MB/s（T-table 优化后），4 核约 80–90 MB/s，接近千兆线速。localhost / https 下走原生 WebCrypto 更快。X25519 为毫秒级，无感。
+明文 http（`http://<局域网 IP>`）是非安全上下文，加解密走纯 JS AES：单个 worker 约 17 MiB/s，页面让 3 片同时在途，实测接收约 32 MiB/s、发送约 30 MiB/s（100MiB 文件，headless Chrome 158，开发机实测值）。localhost / https 下走原生 WebCrypto，内存模式接收约 55–65 MiB/s。X25519 为毫秒级，无感。
 
 ## 目录结构
 
@@ -273,6 +273,26 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
   worker 线程与 per-IP 长轮询配额最多多占 1s 才释放
 - **测试基建**：浏览器套件显式拒绝页面触发的下载（旧版 headless Chrome 会把测试文件落进
   `~/Downloads`）；新增回归 t17 / t18
+- **性能：明文 http 路径收发提速约 2 倍**：页面在 `http://<局域网 IP>` 下是非安全上下文，加解密
+  走纯 JS AES，而调用方式是一次只等一片——4 个 worker 里只有 1 个在干活。收发两端现在各保持
+  3 片"读切片 / 拉取 + 加解密"在途，与写盘 / 投递重叠。实测（100MiB，headless Chrome 158，
+  开发机）：纯 JS 接收 15.6 → 32 MiB/s，纯 JS 发送 17.7 → 30 MiB/s，两端都是纯 JS 的内存模式
+  接收 9.7 → 25 MiB/s。深度取 3 是上限：同一浏览器里同时开发送页与接收页时，浏览器的
+  6 条每主机连接正好用满，取 4 会死锁（已实测）
+- **性能：内存模式断点改为按段追加**：旧布局每个检查点把"到目前为止的全部分片"整条重写进
+  IndexedDB，耗时随文件大小平方增长（400MiB：57s，关掉断点只要 5s）。现在断点记录不含分片
+  本体，每 8 片只追加一段（同一事务里更新记录）：400MiB 约 7s，与关掉断点相当
+- **修复：续传没接上时静默损坏文件**：流式续传的原文件句柄失效（文件被移走 / 删除，或授权被拒）
+  时会回落到重新选保存位置，但断点没有归零——新的空文件从第 9 片的位置开始写，开头留一段空洞，
+  而总长度仍然对得上，完整性校验发现不了。现在从头重收：分片还在就完整重收，已释放则明确报错、
+  让发送方重发（browser 回归 t20）
+- **修复：放弃的断点记录永不清理**：房间已不在服务器上的记录永远续不上，却一直占着 IndexedDB
+  （内存模式下就是已下载的那部分文件）。现在页面启动时清理这类记录，分片段与旧布局记录一并
+  删除，房间仍在的记录保留（browser 回归 t21）。同时补上 IndexedDB 事务的 abort 处理：此前
+  "只有 abort、没有 error"的中止会让接收流水线永远停在检查点上
+- **测试**：新增明文 http 主路径的多分片用例（纯 JS AES + worker 池 + 内存模式，21 片，页面内
+  SHA-256 逐字节比对，t19）；修复 t06 的偶发失败（约 1/6：页面启动那一轮还在途的设备刷新把
+  注入的测试设备覆盖掉）
 - **文档**：README（中/英）与迁移文档按 Rust 单实现重写
 
 **v0.5.1**（2026-10-19，可靠性）

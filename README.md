@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2062-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2065-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -194,7 +194,7 @@ Link mode now resumes: reopen the same receive link (CLI: re-run the same comman
 Memory mode triggers downloads one by one and the browser asks once for permission — allow it. Chromium browsers instead show a directory picker before receiving and stream straight into it, no prompt.
 
 **How fast is the pure-JS path?**
-Encryption runs in a ×4 worker pool; a single worker does ~22 MB/s (after T-table optimization), so 4 cores reach 80–90 MB/s — near gigabit line rate. localhost/https uses native WebCrypto and is faster. X25519 is milliseconds, imperceptible.
+Plain http (`http://<LAN IP>`) is a non-secure context, so encryption runs the pure-JS AES: a single worker does about 17 MiB/s, and the page keeps 3 chunks in flight — measured receive ≈32 MiB/s and send ≈30 MiB/s (100 MiB file, headless Chrome 158, dev-machine numbers). On localhost/https the native WebCrypto path is used; memory-mode receive runs at ≈55–65 MiB/s there. X25519 is milliseconds, imperceptible.
 
 ## Project Layout
 
@@ -252,6 +252,11 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 - **Fixed: lingering rooms held the per-IP byte quota**: after a transfer the room waited for the idle sweep (2 minutes after ack, 15 minutes with no receiver), and all the while its buffered ciphertext counted against the sender IP's 96 MiB quota — the next large send from the same machine was silently stuck on backpressure. The sender (browser and CLI) now deletes the room as soon as it has observed a proof-verified ack, a rejection, an abort or a failure, and the browser also deletes the in-flight room on real page unload via `beforeunload`; an ack without a valid proof (possibly forged) does not trigger deletion and keeps the server's grace period. Browser regression t18 + a CLI assertion
 - **Idle CPU cut to about 1/10**: while a long-poll is parked the server re-reads `/proc/net/tcp` every 100 ms to detect disconnects (≈3.5 ms per read on a desktop; every open page keeps one invitation long-poll, so each parked connection cost ≈3.6% of a core). The check now runs every 1s (same-moment A/B with 16 parked long-polls: 58–60% → 6%); the trade-off is that a disconnected client's worker thread and per-IP long-poll slot are held for up to 1s longer
 - **Test infrastructure**: the browser suite now explicitly denies page-triggered downloads (older headless Chrome dropped test files into `~/Downloads`); regressions t17 / t18 added
+- **Performance: plain-http path sends and receives about 2× faster**: under `http://<LAN IP>` the page is a non-secure context, so encryption runs the pure-JS AES — and the code awaited one chunk at a time, leaving 3 of the 4 workers idle. Both sides now keep 3 chunks "read / fetch + encrypt/decrypt" in flight, overlapping with disk writes and uploads. Measured (100 MiB, headless Chrome 158, dev machine): pure-JS receive 15.6 → 32 MiB/s, pure-JS send 17.7 → 30 MiB/s, memory-mode receive with pure JS on both ends 9.7 → 25 MiB/s. Depth 3 is the ceiling: with a sender tab and a receiver tab in the same browser the 6-connections-per-host limit is exactly used up, and depth 4 deadlocks (verified)
+- **Performance: memory-mode checkpoints are append-only**: the old layout rewrote "all chunks so far" into IndexedDB at every checkpoint, so the cost grew quadratically with file size (400 MiB: 57s, versus 5s with checkpoints disabled). The checkpoint record no longer embeds the chunks; every 8 chunks only the new segment is appended (the record is updated in the same transaction): 400 MiB in about 7s, on par with checkpoints disabled
+- **Fixed: a failed resume silently corrupted the file**: when the original file handle of a streaming resume is gone (file moved/deleted, or permission denied) the receiver falls back to picking a new save location, but the checkpoint was not reset — the new empty file was written starting at chunk 9's offset, leaving a hole at the front while the total length still matched. It now restarts from zero: if the chunks are still on the server it re-receives everything, otherwise it fails with an explicit error asking the sender to resend (browser regression t20)
+- **Fixed: abandoned checkpoint records were never cleaned up**: records whose room no longer exists on the server can never be resumed, yet sat in IndexedDB forever (in memory mode that is the part of the file already downloaded). The page now prunes them at startup — segments and old-layout records included — while records for rooms that still exist are kept (browser regression t21). IndexedDB transactions also handle `abort` now: an abort without an `error` event used to leave the receive pipeline stuck on a checkpoint forever
+- **Tests**: a multi-chunk case for the plain-http main path (pure-JS AES + worker pool + memory mode, 21 chunks, SHA-256 compared in-page, t19); fixed the intermittent t06 failure (about 1 in 6: the still-in-flight device refresh from page start overwrote the injected test device)
 - **Docs**: README (en/zh) and the migration document rewritten for the Rust-only product
 
 **v0.5.1** (2026-10-19, reliability)

@@ -305,9 +305,73 @@ async function getChunk(room, i, signal) {
   }
 }
 
+// ---------- 流水线（收发共用）----------
+// 明文 http 是非安全上下文，没有 crypto.subtle，加解密走纯 JS AES：单片（1MiB）约 60ms，
+// 而加解密 worker 是一个池子，多让几片同时在途就多几个 worker 干活。此前的调用方式一次只
+// 等一片，4 个 worker 里只有 1 个在干活（实测纯 JS 接收约 16MiB/s）。下面两个流水线各保持
+// PIPE_DEPTH 路"准备"在途：下一片的加解密与本片的写盘/投递重叠（实测接收约 32MiB/s）。
+// 取 3 而不是 4，卡在浏览器的 HTTP/1.1 每主机 6 条连接上限上：同一个浏览器里同时开发送页
+// 与接收页时，接收页 3 路预取（等还没投递的分片时是挂起的长轮询）+ 接收页 1 条邀请长轮询
+// + 发送页 1 条邀请长轮询 + 发送页 1 条分片投递 = 6，正好用满。取 4 时发送页的投递请求
+// 排在队尾永远发不出去，而那些长轮询又在等它投递的分片——开头就死锁（实测，100% 复现）。
+const PIPE_DEPTH = 3
+// 断点检查点粒度（片）：每收这么多片持久化一次，崩溃后最多重拉这么多。
+const PERSIST_EVERY = 8
+
+// 接收流水线：返回 next()，按序 resolve 第 from … from+count-1 片的明文，排空后 resolve null。
+// 网络预取掩盖无线网往返（服务端支持按序号乱序拉取；串行"拉一片等一片"每片空转一个 RTT），
+// 字节一到就在 worker 里开始解密。GCM 验签失败会在 await nextPt() 处抛出。
+function chunkStream(room, key, signal, useAAD, from, count) {
+  const queue = []
+  let k = from
+  const end = from + count
+  const pump = () => {
+    while (queue.length < PIPE_DEPTH && k < end) {
+      const i = k++
+      const p = getChunk(room, i, signal)
+        .then((packed) => unsealRPC(key, packed, useAAD ? chunkAAD(room, i) : null))
+      p.catch(() => {}) // 未消费的预取在中断/失败时不成为 unhandledrejection
+      queue.push(p)
+    }
+  }
+  return async () => {
+    pump()
+    if (!queue.length) return null
+    const p = queue.shift()
+    pump() // 调用方写盘期间保持预取满员（本片的网络请求已经结束，不占连接）
+    return p
+  }
+}
+
+// 发送流水线：make 对每一项做可并行的准备（读切片 + 加密），consume 按原序等待结果并投递。
+// 准备阶段的失败只在轮到它时才抛出：之前的分片照常投完，之后的不再开始。
+async function orderedPipeline(items, make, consume) {
+  const queue = []
+  let next = 0
+  const pump = () => {
+    while (queue.length < PIPE_DEPTH && next < items.length) {
+      const p = make(items[next], next)
+      p.catch(() => {}) // 未被消费的准备步骤失败时不成为 unhandledrejection
+      queue.push(p)
+      next++
+    }
+  }
+  for (let i = 0; i < items.length; i++) {
+    pump()
+    const ready = queue.shift() // 先出队再等待，等待与投递期间其余项继续准备
+    pump()
+    await consume(await ready, i)
+  }
+}
+
 // ---------- 断点续传记录（IndexedDB,零依赖;明文 http 下同样可用） ----------
 // 链接模式接收方的进度:done = 已持久化的最后数据分片序号(0 = 尚无);
-// FSA 模式存目录内文件句柄(可结构化克隆),内存模式逐片存 Blob。
+// FSA 模式存目录内文件句柄(可结构化克隆),内存模式把已收到的分片存进 IDB(磁盘支撑)。
+// 键布局（同一个 object store）：
+//   <room>             断点记录：mode / done / meta / handle / segments（不含分片本体）
+//   <room>#<8 位段号>   内存模式的一段分片（每段 PERSIST_EVERY 片，按段追加）
+// 旧布局把"到目前为止的全部分片"内嵌在断点记录里、每个检查点整条重写，耗时随文件大小平方
+// 增长（实测内存模式 400MiB：57s，关掉断点只要 5s）。现在每个检查点只追加新落定的一段。
 const resumeDB = (() => {
   const open = () => new Promise((res, rej) => {
     const rq = indexedDB.open('cipherlane-resume', 1)
@@ -322,16 +386,47 @@ const resumeDB = (() => {
         const t = db.transaction('transfers', mode)
         const r = fn(t.objectStore('transfers'))
         t.oncomplete = () => { res(r && r.result); db.close() }
+        // 事务失败会依次触发 error 与 abort；个别中止路径只有 abort——两者都要接住，
+        // 否则这个 await 永远不返回，整条接收流水线就停在检查点上
         t.onerror = () => { rej(t.error); db.close() }
+        t.onabort = () => { rej(t.error || new Error('IDB 事务中止')); db.close() }
       })
     } catch { return undefined } // IDB 不可用(隐私模式等)→ 静默退化为不可续传
   }
+  const segRange = (room) => IDBKeyRange.bound(`${room}#`, `${room}#￿`) // 段键定长补零：字典序 = 段号序
+  const isRoomKey = (k) => typeof k === 'string' && !k.includes('#') // 断点记录的键就是房间号本身；段键一定带 '#'
   return {
     get: (room) => tx('readonly', (st) => st.get(room)),
     set: (room, rec) => tx('readwrite', (st) => st.put(rec, room)),
-    del: (room) => tx('readwrite', (st) => st.delete(room)),
+    // 追加第 n 段分片并更新断点记录（同一事务：要么都落盘，要么都不）
+    append: (room, rec, n, parts) => tx('readwrite', (st) => {
+      st.put({ parts }, `${room}#${String(n).padStart(8, '0')}`)
+      st.put(rec, room)
+    }),
+    parts: async (room) => {
+      const segs = await tx('readonly', (st) => st.getAll(segRange(room)))
+      return Array.isArray(segs) ? segs.flatMap((s) => s.parts || []) : null
+    },
+    // 删除断点记录及其全部分片段（按键区间，不必知道段数；旧布局的单条记录一并覆盖）
+    del: (room) => tx('readwrite', (st) => { st.delete(room); st.delete(segRange(room)) }),
+    rooms: async () => {
+      const keys = await tx('readonly', (st) => st.getAllKeys())
+      return Array.isArray(keys) ? keys.filter(isRoomKey) : []
+    },
   }
 })()
+
+// 启动时清理永远续不上的断点记录：房间已不在服务器上（空闲清扫 / 发送方已删 / 服务器重启过）
+// 的记录再也不会被用到，却一直占着 IndexedDB——内存模式下那就是已下载的那部分文件。
+// 只在服务器明确回答 no-room 时删除；服务器不可达时原样保留。
+async function pruneResumeRecords() {
+  for (const room of await resumeDB.rooms()) {
+    try {
+      const r = await fetchT(`/api/rooms/${room}/state`, {}, 10_000)
+      if (r.status === 404 && (await r.json()).error === 'no-room') await resumeDB.del(room)
+    } catch { /* 服务器不可达：保留 */ }
+  }
+}
 
 // progress 上报(可续传模式):滞后一片提交(同 CLI 语义);旧服务器 404 → 静默禁用
 const progressPost = (() => {
@@ -991,49 +1086,50 @@ async function startSend(kind, payload, target) {
       : { v: 2, type: isText ? 'text' : 'file', name, mime, size, count }
     await postChunk(room, token, await sealRPC(key, enc.encode(JSON.stringify(meta)), chunkAAD(room, 0)), 0, ctl.signal)
 
-    // 数据分片：Worker 加密 + 一片预加密流水线（网络发送与下一片加密重叠）
+    // 数据分片：流水线把"读切片 + Worker 加密"与网络投递重叠（见 orderedPipeline）
     const speed = makeSpeed()
+    // 每片一个条目：idx = 全局分片序号（0 号是 meta；跨文件连续，与接收端对齐），load 读明文切片
+    const items = []
     if (isBatch) {
-      let sent = 0
-      let ci = 1 // 全局分片序号（跨文件连续，与接收端 idx 对齐）
-      for (let f = 0; f < payload.length; f++) {
-        const { file, rel } = payload[f]
-        const n = manifest[f].count
-        for (let i = 0; i < n; i++) {
-          const pt = new Uint8Array(await file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size)).arrayBuffer())
-          const idx = ci++ // AAD 与 X-Chunk-Seq 用同一个全局序号（跨文件连续）
-          await postChunk(room, token, await sealRPC(key, pt, chunkAAD(room, idx)), idx, ctl.signal)
-          sent += pt.length
-          setBar('bar-sent', size ? sent / size : 1)
-          const sp = speed(sent)
-          $('#sent-meta').textContent =
-            `[${f + 1}/${payload.length}] ${rel} · ${fmtBytes(sent)} / ${fmtBytes(size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
+      payload.forEach(({ file }, f) => {
+        for (let i = 0; i < manifest[f].count; i++) {
+          items.push({
+            f, idx: items.length + 1,
+            load: () => file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size)).arrayBuffer(),
+          })
         }
+      })
+    } else if (!isText) {
+      for (let off = 0; off < size; off += CHUNK) {
+        items.push({ idx: off / CHUNK + 1, load: () => payload.slice(off, off + CHUNK).arrayBuffer() })
       }
-      if (size === 0) setBar('bar-sent', 1)
-    } else if (isText) {
+    }
+    let sent = 0
+    await orderedPipeline(
+      items,
+      // 读明文 + Worker 加密；带上明文长度供进度显示
+      async (it) => {
+        const pt = new Uint8Array(await it.load())
+        return { sealed: await sealRPC(key, pt, chunkAAD(room, it.idx)), len: pt.length }
+      },
+      // 网络投递（超时/429 重投复用同一份密文与同一 seq）
+      async ({ sealed, len }, i) => {
+        const it = items[i]
+        await postChunk(room, token, sealed, it.idx, ctl.signal)
+        sent += len
+        setBar('bar-sent', size ? sent / size : 1)
+        const sp = speed(sent)
+        $('#sent-meta').textContent = (isBatch
+          ? `[${it.f + 1}/${payload.length}] ${payload[it.f].rel} · `
+          : '') + `已发送 ${fmtBytes(sent)} / ${fmtBytes(size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
+      },
+    )
+    if (isText) {
       await postChunk(room, token, await sealRPC(key, enc.encode(payload), chunkAAD(room, 1)), 1, ctl.signal)
       setBar('bar-sent', 1)
       $('#sent-meta').textContent = '已发送 ' + fmtBytes(size)
-    } else {
-      let off = 0
-      let nextEnc = null
-      while (off < size) {
-        const idx = off / CHUNK + 1 // 本片全局序号（0 号是 meta）
-        const encThis = nextEnc || sealRPC(key, new Uint8Array(await payload.slice(off, off + CHUNK).arrayBuffer()), chunkAAD(room, idx))
-        const nextOff = off + CHUNK
-        nextEnc = nextOff < size
-          ? sealRPC(key, new Uint8Array(await payload.slice(nextOff, nextOff + CHUNK).arrayBuffer()), chunkAAD(room, idx + 1))
-          : null
-        await postChunk(room, token, await encThis, idx, ctl.signal)
-        off = Math.min(nextOff, size)
-        setBar('bar-sent', off / size)
-        const sp = speed(off)
-        $('#sent-meta').textContent =
-          `已发送 ${fmtBytes(off)} / ${fmtBytes(size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
-      }
-      if (size === 0) setBar('bar-sent', 1)
     }
+    if (size === 0) setBar('bar-sent', 1)
     await api(`/api/rooms/${room}/done`, { method: 'POST', headers: { 'X-Room-Token': token } })
     setStatus('send-status', '🟢 已全部发出，等待对方接收完成…', 'warn')
   } catch (e) {
@@ -1101,7 +1197,11 @@ async function receiveInto(room, key, fromInfo, fromLink = false) {
     if (meta.type === 'text') return await receiveText(room, key, meta, ctl, useAAD)
     if (meta.type === 'batch') return await receiveBatch(room, key, meta, ctl, useAAD)
     // 断点续传仅链接模式(设备直发的会话密钥不落盘);fromLink 由入口传入
-    const rec = fromLink ? await resumeDB.get(room) : null
+    let rec = fromLink ? await resumeDB.get(room) : null
+    if (rec && Array.isArray(rec.parts)) { // 旧布局（分片内嵌在记录里）：布局已变，丢弃后重新接收
+      await resumeDB.del(room)
+      rec = null
+    }
     return await receiveFile(room, key, meta, ctl, rec, useAAD)
   } finally {
     // 注意：批量/文件接收是“后台自动开始”（receiveBatch/receiveFile 不等待传输结束就返回），
@@ -1202,6 +1302,9 @@ async function doReceiveBatch(room, key, meta, signal, useAAD) {
   const memParts = [] // 无目录句柄时的逐文件 Blob
   let got = 0
   let idx = 1 // 下一个文件的首个数据分片序号
+  // 整批一条流水线（分片序号跨文件连续）：给上一个文件收尾、给下一个文件开目录建句柄的
+  // 期间，下一个文件的分片照常在预取、解密
+  const nextPt = chunkStream(room, key, signal, useAAD, 1, Math.max(0, (meta.count || 1) - 1))
   for (let f = 0; f < meta.files.length; f++) {
     const info = meta.files[f]
     $('#fc-name').textContent = `[${f + 1}/${meta.files.length}] ${info.name}`
@@ -1219,7 +1322,8 @@ async function doReceiveBatch(room, key, meta, signal, useAAD) {
     const n = info.count || 0
     let fgot = 0 // 本文件累计明文字节
     for (let i = 0; i < n; i++) {
-      const pt = await unsealRPC(key, await getChunk(room, idx + i, signal), useAAD ? chunkAAD(room, idx + i) : null) // GCM 验签失败直接抛错
+      const pt = await nextPt() // GCM 验签失败直接抛错
+      if (!pt) throw new Error(`完整性校验失败：分片数与 manifest 不符（${info.name || fname}）`)
       got += pt.length
       fgot += pt.length
       if (ws) await ws.write(pt)
@@ -1328,12 +1432,18 @@ async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
       if (e && e.name === 'AbortError') return 'picker-dismissed'
       sink = null // 授权失败 → 内存模式兜底(原进度作废,从头)
     }
-  } else if (rec && rec.mode === 'mem' && Array.isArray(rec.parts)) {
-    // 内存模式续传:分片 Blob 存于 IDB(明文 http 也可用,磁盘支撑)
-    sink = { mode: 'mem', parts: rec.parts.slice() }
-    done = Math.min(done, sink.parts.length)
-    sink.parts.length = done
+  } else if (rec && rec.mode === 'mem') {
+    // 内存模式续传:已持久化的分片从 IDB 按段读回(明文 http 也可用,磁盘支撑)。
+    // 只有读回的片数正好等于记录的 done 才算接上；否则当作没有断点，从头收。
+    const saved = await resumeDB.parts(room)
+    if (Array.isArray(saved) && saved.length === rec.done) {
+      sink = { mode: 'mem', parts: saved }
+      done = saved.length
+    }
   }
+  if (!sink) done = 0 // 续传没接上（句柄授权被拒 / 分片读不回 / 本来就没有记录）：必须从头。
+  // 漏掉这一步的话，下面新开的空文件会从旧断点的位置开始写——开头留一段空洞而总长度仍然
+  // 对得上，完整性校验发现不了（静默损坏）。
 
   if (!sink) {
     const useFSA = 'showSaveFilePicker' in window && hasGesture
@@ -1349,14 +1459,18 @@ async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
     if (!sink) {
       if (meta.size > 512 * 1024 * 1024 && !(await uiConfirm({ title: '大文件接收', body: '此浏览器不支持流式保存，大文件将占用较多内存，确定继续？', okText: '继续' }))) return 'picker-dismissed'
       sink = { mode: 'mem', parts: [] }
-      done = 0
     }
   }
-  const saveRec = () => resumeDB.set(room, {
+  const recOf = () => ({
     room, mode: sink.mode, done, meta: { size: meta.size, count: meta.count, name: meta.name },
     handle: sink.mode === 'fs' ? handle : undefined,
-    parts: sink.mode === 'mem' ? sink.parts : undefined,
+    segments: sink.mode === 'mem' ? done / PERSIST_EVERY : 0,
   })
+  // 检查点落盘：FSA 模式只存句柄与进度；内存模式只追加"新落定的这一段"分片
+  //（断点记录与分片段在同一事务里，要么都落盘要么都不）
+  const saveRec = () => (sink.mode === 'mem'
+    ? resumeDB.append(room, recOf(), done / PERSIST_EVERY - 1, sink.parts.slice(done - PERSIST_EVERY, done))
+    : resumeDB.set(room, recOf()))
   if (sink.mode === 'fs' && handle) await saveRec() // 句柄先存,刷新后可续
   progressPost(room, done) // 元信息 + 已续传部分对齐服务端进度
 
@@ -1365,26 +1479,12 @@ async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
   const speed = makeSpeed()
   let got = done * CHUNK
   let pos = got // FSA 绝对定位
-  // 拉取流水线：深度 3 的并行预取，掩盖无线网往返（服务端本就支持按序号乱序拉取；
-  // 串行"拉一片等一片"时空转一个 RTT，是 WiFi 实际吞吐的主要瓶颈）
-  const DEPTH = 3
-  let nextI = done + 1
-  const inflight = []
-  const pump = () => {
-    while (inflight.length < DEPTH && nextI < meta.count) {
-      const i = nextI++
-      const p = getChunk(room, i, signal)
-      p.catch(() => {}) // 未消费的预取在中断/失败时不成为 unhandledrejection
-      inflight.push({ i, p })
-    }
-  }
-  pump()
-  while (inflight.length) {
-    const { i, p } = inflight.shift()
-    pump()
-    const packed = await p
-    const j = i // 本片的绝对序号(供进度上报)
-    const pt = await unsealRPC(key, packed, useAAD ? chunkAAD(room, j) : null) // GCM 验签失败会直接抛错
+  let j = done // 最近落定一片的绝对序号(供进度上报)
+  const nextPt = chunkStream(room, key, signal, useAAD, done + 1, meta.count - 1 - done)
+  for (;;) {
+    const pt = await nextPt() // GCM 验签失败会直接抛错
+    if (!pt) break
+    j++
     got += pt.length
     if (sink.mode === 'fs') await sink.ws.write({ type: 'write', position: pos, data: pt })
     else sink.parts.push(pt)
@@ -1394,27 +1494,21 @@ async function doReceiveFile(room, key, meta, signal, rec, useAAD) {
     $('#recv-meta').textContent =
       `已接收 ${fmtBytes(got)} / ${fmtBytes(meta.size)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '')
     done = j
-    // 断点/释放粒度：每 8 片做一次持久化检查点，崩溃后最多重拉 8MB。
-    const PERSIST_EVERY = 8
-    if (sink.mode === 'mem') {
-      // 内存模式:断点记录与进度上报同粒度同节奏——每 8 片先把 parts 数组
-      // 落盘(IDB),成功后才把服务端进度推到该断点。保证 server.through 不
-      // 越过已持久化位置(否则重进房间会拉到已释放的分片→410)。整条数组
-      // 重写的耗时随片数线性增长(实测 100MB 每片 116ms),逐片写不值得;
-      // 代价为崩溃后最多重拉 8MB。
-      if (j % PERSIST_EVERY === 0) {
+    if (j % PERSIST_EVERY === 0) {
+      // 检查点：先把这一段持久化，成功后才把服务端进度推到该断点——保证 server.through
+      // 永不越过已持久化位置（否则重进房间会拉到已释放的分片 → 410）。
+      if (sink.mode === 'mem') {
+        // 内存模式：只追加新落定的这一段（整条重写的耗时随文件大小平方增长）
         await saveRec()
-        progressPost(room, j + 1)
+      } else {
+        // FSA 模式的 writable 流在 close() 前不保证数据已提交（刷新/崩溃会丢弃
+        // 未 close 的缓冲），所以"断点"只能按已 close 的数据推进：先 close 提交，
+        // 再落盘 done，最后重开 keepExistingData 流继续绝对定位写。若只写不 close
+        // 就记 done，刷新续传会从流里没提交的字节之后继续，文件中间留空洞。
+        await sink.ws.close()
+        await saveRec()
+        sink.ws = await handle.createWritable({ keepExistingData: true })
       }
-    } else if (j % PERSIST_EVERY === 0) {
-      // FSA 模式的 writable 流在 close() 前不保证数据已提交（刷新/崩溃会丢弃
-      // 未 close 的缓冲），所以"断点"只能按已 close 的数据推进：先 close 提交，
-      // 再落盘 done，最后重开 keepExistingData 流继续绝对定位写。若只写不 close
-      // 就记 done，刷新续传会从流里没提交的字节之后继续，文件中间留空洞。
-      // 顺序也保证 server.through 永不越过已提交数据（崩溃后重拉已释放分片→410）。
-      await sink.ws.close()
-      await saveRec()
-      sink.ws = await handle.createWritable({ keepExistingData: true })
       progressPost(room, j + 1)
     }
   }
@@ -1551,6 +1645,8 @@ document.addEventListener('paste', (e) => {
 // 链接/QR 的公共来源：回环打开时升级为 LAN 地址（对方可达），由服务器 /api/version 提示
 let LAN_HINT = null
 ;(async () => { try { LAN_HINT = (await (await fetchT('/api/version', {}, 5_000)).json()).lan || null } catch {} })()
+// 启动时清理"房间已不在服务器上"的断点记录（后台进行，不阻塞界面）
+pruneResumeRecords().catch(() => {})
 function publicOrigin() {
   const h = location.hostname
   const loop = h === '127.0.0.1' || h === 'localhost' || h === '::1'
