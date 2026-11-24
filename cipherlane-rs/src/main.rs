@@ -2,7 +2,11 @@
 //
 // 线协议为唯一实现；验收 = cargo test --test protocol（Rust 集成测试）对本实现全绿。
 // 架构：tiny_http（vendor 补丁版：请求头 16KiB 预算 / 每连接 60s 读写超时 /
-// 并发连接上限 256 / 任务池不丢唤醒，见 vendor/tiny_http/PATCHES.md）+ 每地址 128 工作线程；
+// 并发连接上限 256 / 任务池不丢唤醒，见 vendor/tiny_http/PATCHES.md）+ 全部监听地址共用
+// 一组工作线程（每个监听器只有一条"泵"线程在 recv() 上等，见"监听器（动态绑定）"）；
+// 监听地址动态维护：HOST 未设时每 1s、以及每次 /api/version，重新枚举 RFC1918 网卡地址，
+// 新地址补上监听——开机时服务总是先于 Wi-Fi 启动，只在启动时枚举一次会让它整个开机周期
+// 都只监听回环（别的设备连不上）；笔记本换网络 / 休眠唤醒后地址变化同理；
 // worker 带 panic 隔离（catch_unwind）与锁毒化恢复，单个请求异常不波及服务；
 // 长轮询以 Condvar 挂起（LAN 规模下每接收方 ≤4 个挂起请求，线程余量充足）；
 // 优雅停机：sigwait 专职线程 → 停止派发 → 250ms 排干 → exit 0（对齐 Node 语义）。
@@ -10,7 +14,7 @@
 // 锁序：rooms → room.inner → global_buffered → ip_bytes（全程按此序获取）。
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Condvar, Mutex};
@@ -46,10 +50,11 @@ const PER_IP_BYTES: usize = 96 * 1024 * 1024;
 const ROOM_CREATE_PER_MIN: usize = 120;
 const UPDATE_CACHE_MS: u128 = 5 * 60 * 1000;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-// 工作线程：每监听地址 128 个、128KB 小栈。足以承载 LAN 规模的长轮询并发
-// （每接收方 ≤4 挂起 × 30 设备 ≈ 120）；小栈把虚拟内存从 2MB/线程压到 128KB，
-// 避免 256×2MB=1.6GB VIRT 被 system monitor 误读为"内存泄漏"（实际 RSS ~5MB）。
-const WORKERS: usize = 128;
+// 工作线程：全部监听地址共用 256 个（= vendored tiny_http 的并发连接上限，最坏情况下每个
+// 连接一个挂起的长轮询也各有 worker），128KB 小栈。此前是"每监听地址各 128 个"，动态
+// 补绑地址后那种分法会让线程数随见过的网卡地址成倍增长；共用池每多一个地址只多 1 条泵线程。
+// 总数仍少于过去三个地址各 128 个（384）；小栈把虚拟内存从 2MB/线程压到 128KB。
+const WORKERS: usize = 256;
 const WORKER_STACK: usize = 128 * 1024;
 const ROOM_ID_LEN: usize = 10;
 
@@ -994,6 +999,182 @@ fn fetch_update(url: &str, timeout: Duration) -> (bool, String) {
     }
 }
 
+// ---------- 监听器（动态绑定） ----------
+// 背景：服务由 systemd 在开机时拉起，几乎总是早于 Wi-Fi 认证 + DHCP；而它只在启动那一刻
+// 枚举一次网卡地址。结果是每次开机都只监听了 127.0.0.1——进程在跑、托盘显示"运行中"，
+// 但别的设备连不上，托盘 / 桌面启动器打开的局域网地址也没人应答。笔记本换 Wi-Fi、休眠
+// 唤醒后 DHCP 给了新地址，是同一个问题的另一副面孔。所以监听器必须能随网卡地址变化：
+// HOST 未设时，巡检线程每 1s、以及每次 /api/version，都重新枚举 RFC1918 地址并补绑新地址。
+//
+// 线程模型：所有监听器共用一组 worker。每个监听器只起一条"泵"线程阻塞在 server.recv()，
+// 取到请求就放进共用队列，worker 从队列取请求处理。这样每多一个监听地址只多 1 条线程
+//（地址消失后它的监听器原样留着：2 条空闲线程，地址回来时立刻又能用），线程数不会随
+// "这台机器见过的网卡地址"成倍增长。只增不减，也避免了对 tiny_http 做运行期摘除监听器。
+struct RequestQueue<T> {
+    // None 是停机令牌：worker 取到即退出
+    q: Mutex<VecDeque<Option<T>>>,
+    cv: Condvar,
+}
+impl<T> RequestQueue<T> {
+    fn new() -> Self {
+        RequestQueue { q: Mutex::new(VecDeque::new()), cv: Condvar::new() }
+    }
+    fn push(&self, req: T) {
+        self.q.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(Some(req));
+        self.cv.notify_one();
+    }
+    /// 唤醒一个 worker 并让它退出。Condvar::notify_one 每次只唤醒一个，故按 worker 数投放。
+    fn unblock(&self) {
+        self.q.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(None);
+        self.cv.notify_one();
+    }
+    /// 阻塞到有请求；返回 None = 停机令牌
+    fn pop(&self) -> Option<T> {
+        let mut g = self.q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(item) = g.pop_front() {
+                return item;
+            }
+            g = self.cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+// 补绑的串行化：巡检线程与 /api/version 的处理线程可能同时进来，同一地址只绑一次
+static BIND_LOCK: Mutex<()> = Mutex::new(());
+// 停机已开始：泵线程此时退出是正常的，不要当成"监听器出错"去补绑
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// 当前绑不上的地址（只为了"首次失败 / 恢复"各打印一次，不让巡检每轮刷屏；每轮都会重试）
+static BIND_FAILED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// 重新枚举网卡地址的间隔。1s 意味着 Wi-Fi 拿到地址后最迟 1s 开始监听（期间若有
+// 页面 / 托盘来问 /api/version 会立即补绑）；枚举是一次 getifaddrs 加读一行
+// /proc/net/route，亚毫秒，常驻开销可以忽略。
+// CIPHERLANE_LISTENER_POLL_MS 可覆盖（测试把它调快，或调到很长以单独验证同步补绑那条路）。
+fn listener_poll() -> Duration {
+    let ms = std::env::var("CIPHERLANE_LISTENER_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(clamp_poll_ms(ms))
+}
+// 下限 200ms（再快没有意义）；上限 1 小时（测试用"很长"来单独验证同步补绑那条路）
+fn clamp_poll_ms(ms: u64) -> u64 {
+    ms.clamp(200, 3_600_000)
+}
+
+// 绑定一个地址、登记进监听器表并起它的泵线程。调用方负责持有 BIND_LOCK。
+// Err 是给用户看的错误文本；失败时不会留下半登记的状态。
+fn bind_listener(ctx: &Arc<Ctx>, ip: &str) -> Result<Arc<Server>, String> {
+    let bind = format!("{}:{}", ip, ctx.port);
+    let server = Server::http(bind.as_str()).map(Arc::new).map_err(|e| e.to_string())?;
+    let pumped = Arc::clone(&server);
+    let queue = Arc::clone(&ctx.queue);
+    let pump_ctx = Arc::clone(ctx);
+    let pump_ip = ip.to_string();
+    // 泵线程起不来就不登记这个监听器（Server 随即 Drop、关掉套接字）：
+    // 一个"接受连接却永远没人处理"的监听器比没有更糟
+    std::thread::Builder::new()
+        .name("cipherlane-pump".into())
+        .stack_size(WORKER_STACK)
+        .spawn(move || {
+            // recv() 只在停机（unblock）或监听器内部出错时返回 Err → 泵退出
+            while let Ok(req) = pumped.recv() {
+                queue.push(req);
+            }
+            // 监听器内部出错：tiny_http 的 accept 线程遇到错误会把错误推进队列然后退出
+            //（比如文件描述符耗尽时的 accept 失败），这个地址从此没人接受连接。把它从
+            // 监听器表摘掉——动态模式下巡检会重新绑一个；这是旧实现"一次 accept 失败 =
+            // 这个地址到重启前一直死着"的自愈。
+            if !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                pump_ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pump_ip);
+                eprintln!(
+                    "[listen] 监听器 {}:{} 已停止（内部出错），{}",
+                    pump_ip,
+                    pump_ctx.port,
+                    if pump_ctx.dynamic { "将自动重新监听" } else { "退出服务" }
+                );
+                if !pump_ctx.dynamic && pump_ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+                    // 显式 HOST 只监听这一个地址，它没了服务就没有存在意义：
+                    // 以失败码退出，交给 systemd（Restart=on-failure）/ 托盘 / 终端处理
+                    std::process::exit(1);
+                }
+            }
+        })
+        .map_err(|e| format!("无法创建监听泵线程：{e}"))?;
+    ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(ip.to_string(), server.clone());
+    Ok(server)
+}
+
+// 动态模式下：把当前所有网卡地址里"还没在监听"的补上。显式 HOST 时什么都不做。
+fn ensure_listeners(ctx: &Arc<Ctx>) {
+    ensure_listeners_if(ctx, !SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst));
+}
+// `allowed` = 现在允许补绑（停机已开始后为 false）。拆出来是为了能不碰全局状态做单元测试。
+fn ensure_listeners_if(ctx: &Arc<Ctx>, allowed: bool) {
+    if !allowed || !ctx.dynamic {
+        return;
+    }
+    let _serial = BIND_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 回环也在这里维持：托盘 / 面板 / 启动器都走它，它要是停了同样要补回来
+    let mut wanted = vec!["127.0.0.1".to_string()];
+    wanted.extend(lan_addresses().iter().map(|a| a.to_string()));
+    for ip in wanted {
+        if ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&ip) {
+            continue;
+        }
+        match bind_listener(ctx, &ip) {
+            Ok(_) => {
+                let mut failed = BIND_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let recovered = failed.contains(&ip);
+                failed.retain(|x| *x != ip);
+                println!(
+                    "  →  http://{}:{}（{}）",
+                    ip,
+                    ctx.port,
+                    if recovered { "重新监听" } else { "网卡地址已就绪，开始监听" }
+                );
+            }
+            Err(e) => {
+                let mut failed = BIND_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !failed.contains(&ip) {
+                    failed.push(ip.clone());
+                    eprintln!("[listen] 监听 {}:{} 失败（会自动重试）：{}", ip, ctx.port, e);
+                }
+            }
+        }
+    }
+}
+
+// worker：从共用队列取请求处理，取到停机令牌即退出。
+fn worker(ctx: Arc<Ctx>) {
+    while let Some(req) = ctx.queue.pop() {
+        // panic 隔离：单个请求的异常只丢该连接，不带走 worker，
+        // 也不允许毒化锁级联击杀其余 worker（Node 版为 try/catch 500）
+        INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, &ctx)));
+        INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Err(p) = r {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".to_string());
+            eprintln!("[cipherlane] 请求处理 panic（已隔离，服务继续）：{}", msg);
+        }
+    }
+}
+
+fn print_bind_error(ip: &str, port: u16, e: &str) {
+    let bind = format!("{}:{}", ip, port);
+    if e.contains("Address already in use") {
+        eprintln!("\n✗ {} 已被占用——可能有一个旧的密道实例还在运行。\n", bind);
+        eprintln!("  · 到旧实例所在终端按 Ctrl+C 停止，或执行：fuser -k {}/tcp", port);
+        eprintln!("  · 或换端口启动：PORT=7788 cipherlane\n");
+    } else {
+        eprintln!("\n✗ 监听 {} 失败：{}", bind, e);
+    }
+}
+
 // ---------- 主处理 ----------
 struct Ctx {
     world: Arc<World>,
@@ -1003,6 +1184,12 @@ struct Ctx {
     allowed_hosts: HashSet<String>,
     update: Mutex<UpdateState>,
     update_cond: Condvar,
+    // 监听器表（地址 → Server）与所有监听器共用的请求队列，见"监听器（动态绑定）"
+    listeners: Mutex<HashMap<String, Arc<Server>>>,
+    queue: Arc<RequestQueue<tiny_http::Request>>,
+    port: u16,
+    // HOST 未设：动态补绑后到的网卡地址；显式 HOST：只监听该地址（绑不上直接退出）
+    dynamic: bool,
 }
 
 fn decorate_static<R: Read>(mut resp: Response<R>, f: &StaticFile) -> Response<R> {
@@ -1153,8 +1340,16 @@ fn handle(mut req: tiny_http::Request, ctx: &Arc<Ctx>) {
     // ---- GET /api/version ----
     if path == "/api/version" && method == "GET" {
         let rooms = w.rooms.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
-        // lan：本机首选局域网地址（供回环来源的客户端升级链接/跳转目标；无则 null）
-        let lan = lan_addresses().first().map(|a| a.to_string());
+        // 先补绑再回答：回环打开的页面、托盘、桌面启动器都拿这里的 lan 提示去拼局域网链接，
+        // 刚连上 Wi-Fi 的那一瞬间点开也必须能打开。补绑是毫秒级的 getifaddrs + bind。
+        ensure_listeners(ctx);
+        // lan：本机首选的、此刻确实在监听的局域网地址（供回环来源的客户端升级链接/跳转
+        // 目标；没有这样的地址则 null，调用方退回 location.origin / 回环）。提示一个没人
+        // 监听的地址 = 对端打不开，所以这里只认监听器表里有的
+        let lan = {
+            let listeners = ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            lan_addresses().iter().map(|a| a.to_string()).find(|a| listeners.contains_key(a))
+        };
         return json_resp(req, 200, serde_json::json!({ "version": VERSION, "rooms": rooms, "startedAt": w.started_at, "lan": lan }).to_string());
     }
 
@@ -1710,7 +1905,28 @@ fn default_route_iface() -> Option<String> {
     }
     None
 }
+// CIPHERLANE_LAN_ADDRS_FILE：网卡地址来源的覆盖（测试与特殊部署用）。设置后不再枚举网卡，
+// 而是每次调用从该文件读 IPv4 地址——每行一个、# 之后是注释、首个即 lan 提示；文件不存在
+// 或读不出来 = 没有局域网地址。它让"服务启动后地址才出现 / 地址变了"这类场景可以在
+// 没有 root、不碰真实网卡的情况下被测试驱动。
+fn parse_addrs_file(text: &str) -> Vec<std::net::Ipv4Addr> {
+    let mut out: Vec<std::net::Ipv4Addr> = Vec::new();
+    for line in text.lines() {
+        let field = line.split('#').next().unwrap_or("").trim();
+        if let Ok(a) = field.parse::<std::net::Ipv4Addr>() {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
 fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
+    if let Ok(path) = std::env::var("CIPHERLANE_LAN_ADDRS_FILE") {
+        if !path.is_empty() {
+            return std::fs::read_to_string(&path).map(|s| parse_addrs_file(&s)).unwrap_or_default();
+        }
+    }
     let mut out: Vec<(Option<String>, std::net::Ipv4Addr)> = vec![];
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for i in ifaces {
@@ -1805,13 +2021,19 @@ fn wait_termination_signal() -> libc::c_int {
         sig
     }
 }
-// 停止派发 + 排干 + 退出。MessagesQueue::unblock 每次只唤醒一个阻塞在
-// recv() 的 worker，因此按 worker 数逐个投放；随后等待在途请求归零或超时。
-fn drain_and_exit(servers: &[Arc<Server>]) -> ! {
-    for s in servers {
-        for _ in 0..WORKERS {
+// 停止派发 + 排干 + 退出。先让每条泵线程的 recv() 返回（每个监听器一条泵，各唤醒一次），
+// 再给共用队列按 worker 数逐个投放停机令牌（每次只唤醒一个 worker）；随后等待在途请求
+// 归零或超时。
+fn drain_and_exit(ctx: &Arc<Ctx>) -> ! {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let listeners = ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for s in listeners.values() {
             s.unblock();
         }
+    }
+    for _ in 0..WORKERS {
+        ctx.queue.unblock();
     }
     let deadline = Instant::now() + DRAIN_MS;
     while INFLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < deadline {
@@ -1825,21 +2047,21 @@ fn drain_and_exit(servers: &[Arc<Server>]) -> ! {
 }
 
 fn main() {
+    // --version / -V：只打印版本号就退出（装完包确认跑的是哪一版）
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("cipherlane {}", VERSION);
+        return;
+    }
+
     #[cfg(unix)]
     block_termination_signals();
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
     PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     let host = std::env::var("HOST").unwrap_or_default();
-
-    // 默认绑 127.0.0.1 + 局域网（RFC1918）网卡；显式 HOST 则只绑该地址
-    let addrs: Vec<String> = if host.is_empty() {
-        let mut v = vec!["127.0.0.1".to_string()];
-        v.extend(lan_addresses().iter().map(|a| a.to_string()));
-        v
-    } else {
-        vec![host.clone()]
-    };
+    // HOST 未设 = 动态模式：监听 127.0.0.1 + 局域网（RFC1918）网卡，且地址后到 / 变化时
+    // 自动补绑（见"监听器（动态绑定）"）；显式 HOST = 只监听该地址，绑不上直接退出。
+    let dynamic = host.is_empty();
 
     // CIPHERLANE_TEST_LIMITS=1：仅降 per-IP 房间数/字节阈值，建房速率保持 120/min
     let test_limits = std::env::var("CIPHERLANE_TEST_LIMITS").map(|v| v == "1").unwrap_or(false);
@@ -1847,7 +2069,13 @@ fn main() {
         ip_rooms_max: if test_limits { 4 } else { PER_IP_ROOMS },
         ip_bytes_max: if test_limits { 2 * 1024 * 1024 } else { PER_IP_BYTES },
     };
-    let allowed_hosts = build_allowed_hosts(&addrs, &host);
+    // Host/Origin 白名单只收主机名（IP 字面量在 host_allowed 里动态放行），所以后到的
+    // 网卡地址不需要补进白名单
+    let allowed_hosts = if dynamic {
+        build_allowed_hosts(&["127.0.0.1".to_string()], &host)
+    } else {
+        build_allowed_hosts(&[host.clone()], &host)
+    };
 
     let ctx = Arc::new(Ctx {
         world: Arc::new(World {
@@ -1867,47 +2095,55 @@ fn main() {
         allowed_hosts,
         update: Mutex::new(UpdateState::default()),
         update_cond: Condvar::new(),
+        listeners: Mutex::new(HashMap::new()),
+        queue: Arc::new(RequestQueue::new()),
+        port,
+        dynamic,
     });
 
-    let mut servers = vec![];
-    for addr in &addrs {
-        let bind = format!("{}:{}", addr, port);
-        match Server::http(bind.as_str()) {
-            Ok(s) => servers.push((addr.clone(), Arc::new(s))),
-            Err(e) => {
-                if e.to_string().contains("Address already in use") {
-                    eprintln!("\n✗ {} 已被占用——可能有一个旧的密道实例还在运行。\n", bind);
-                    eprintln!("  · 到旧实例所在终端按 Ctrl+C 停止，或执行：fuser -k {}/tcp", port);
-                    eprintln!("  · 或换端口启动：PORT=7788 cipherlane\n");
-                } else {
-                    eprintln!("\n✗ 监听 {} 失败：{}", bind, e);
-                }
-                std::process::exit(1);
+    // ---- 绑定 ----
+    // 动态模式：回环必须绑上（端口被占等 → 退出并提示）；启动时已有的局域网地址单个绑不上
+    // 不算致命（比如恰好有别的程序占了那一个地址的端口），记一笔、交给巡检重试。
+    // 显式 HOST：只绑它，绑不上就退出（保持原有行为：地址写错要立刻暴露，而不是静默等待）。
+    if dynamic {
+        if let Err(e) = bind_listener(&ctx, "127.0.0.1") {
+            print_bind_error("127.0.0.1", port, &e);
+            std::process::exit(1);
+        }
+        let _serial = BIND_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let startup = lan_addresses();
+        for ip in &startup {
+            let ip = ip.to_string();
+            if let Err(e) = bind_listener(&ctx, &ip) {
+                eprintln!("[listen] 启动时无法监听局域网地址 {}:{}（会自动重试）：{}", ip, port, e);
+                BIND_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(ip);
             }
         }
+    } else if let Err(e) = bind_listener(&ctx, &host) {
+        print_bind_error(&host, port, &e);
+        std::process::exit(1);
     }
 
     // 优雅停机线程：SIGTERM/SIGINT（unix）与面板停机（跨平台）共用排干路径
-    let shutdown_servers: Vec<Arc<Server>> = servers.iter().map(|(_, s)| s.clone()).collect();
     #[cfg(unix)]
     {
-        let servers = shutdown_servers.clone();
+        let ctx = ctx.clone();
         std::thread::spawn(move || loop {
             match wait_termination_signal() {
                 libc::SIGINT => println!("\n再见"),
                 _ => println!("\n收到 SIGTERM，正在优雅停机…"),
             }
-            drain_and_exit(&servers);
+            drain_and_exit(&ctx);
         });
     }
     {
-        let servers = shutdown_servers;
+        let ctx = ctx.clone();
         std::thread::spawn(move || loop {
             if SHUTDOWN_BY_PANEL.load(std::sync::atomic::Ordering::SeqCst) {
                 // 先给 150ms 让 /api/shutdown 的 200 响应送达客户端（对齐 Node 版），
                 // 再停派发、排干、退出
                 std::thread::sleep(Duration::from_millis(150));
-                drain_and_exit(&servers);
+                drain_and_exit(&ctx);
             }
             std::thread::sleep(Duration::from_millis(50));
         });
@@ -1918,39 +2154,42 @@ fn main() {
         move || sweeper(ctx)
     });
 
-    for (_, server) in &servers {
-        for _ in 0..WORKERS {
-            let server = server.clone();
-            let ctx = ctx.clone();
-            let _ = std::thread::Builder::new()
-                .stack_size(WORKER_STACK)
-                .spawn(move || loop {
-                    match server.recv() {
-                        Ok(req) => {
-                            // panic 隔离：单个请求的异常只丢该连接，不带走 worker，
-                            // 也不允许毒化锁级联击杀其余 worker（Node 版为 try/catch 500）
-                            INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(req, &ctx)));
-                            INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            if let Err(p) = r {
-                                let msg = p
-                                    .downcast_ref::<&str>()
-                                    .map(|s| (*s).to_string())
-                                    .or_else(|| p.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "未知 panic".to_string());
-                                eprintln!("[cipherlane] 请求处理 panic（已隔离，服务继续）：{}", msg);
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                });
+    // 巡检线程：只负责"没人在页面上时地址才到"的情况；页面 / 托盘问 /api/version 时
+    // 还会同步补绑一次，所以开机后第一次点开主页不需要等这个周期
+    if ctx.dynamic {
+        let ctx = ctx.clone();
+        let poll = listener_poll();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(poll);
+            ensure_listeners(&ctx);
+        });
+    }
+
+    // 共用的工作线程池：所有监听地址的请求都在这里处理
+    let mut spawned = 0usize;
+    for _ in 0..WORKERS {
+        let ctx = ctx.clone();
+        if std::thread::Builder::new().stack_size(WORKER_STACK).spawn(move || worker(ctx)).is_ok() {
+            spawned += 1;
         }
+    }
+    // 线程起不来不能静默：一个 worker 都没有 = 接受请求却永远不处理
+    if spawned == 0 {
+        eprintln!("\n✗ 无法创建工作线程（系统线程数已达上限？），退出。");
+        std::process::exit(1);
+    } else if spawned < WORKERS {
+        eprintln!("[cipherlane] 警告：工作线程只创建了 {spawned}/{WORKERS} 个，高并发时吞吐会下降");
     }
 
     println!("cipherlane · 密道 v{}（Rust）—— 局域网端到端加密传输", VERSION);
     println!("  服务器零知识：只中转密文，密钥永不离开收发双方的浏览器\n");
-    for (addr, _) in &servers {
-        println!("  →  http://{}:{}", addr, port);
+    let mut bound: Vec<String> = ctx.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keys().cloned().collect();
+    bound.sort_by_key(|a| (a.as_str() != "127.0.0.1", a.parse::<IpAddr>().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))));
+    for ip in &bound {
+        println!("  →  http://{}:{}", ip, port);
+    }
+    if dynamic && bound.len() < 2 {
+        println!("  （还没有局域网地址：连上 Wi-Fi / 插上网线后会自动开始监听，不需要重启）");
     }
     println!("\n等待传输…（Ctrl+C 退出）");
     loop {
@@ -2093,6 +2332,169 @@ mod tests {
         ] {
             assert!(parse_chunk_seq(bad).is_none(), "应拒绝 {:?}", bad);
         }
+    }
+
+    // 地址来源文件：每行一个 IPv4，# 之后是注释；去重、保持顺序；非法行忽略
+    #[test]
+    fn addrs_file_parsing() {
+        use std::net::Ipv4Addr;
+        let none: Vec<Ipv4Addr> = Vec::new();
+        assert_eq!(parse_addrs_file(""), none);
+        assert_eq!(parse_addrs_file("# 只有注释\n\n   \n"), none);
+        assert_eq!(parse_addrs_file("文件不存在时读到的是空串也一样"), none);
+        assert_eq!(
+            parse_addrs_file("127.0.0.2\n# 192.168.9.9\n 192.168.1.5 # 行尾注释\n127.0.0.2\nnot-an-ip\nfe80::1\n999.1.1.1\n"),
+            vec!["127.0.0.2".parse::<Ipv4Addr>().unwrap(), "192.168.1.5".parse::<Ipv4Addr>().unwrap()]
+        );
+    }
+
+    // 共用请求队列：先进先出；停机令牌只让取到它的那一个 worker 退出，不会吞掉前后的请求
+    #[test]
+    fn request_queue_is_fifo_and_tokens_are_per_worker() {
+        let q: RequestQueue<u32> = RequestQueue::new();
+        q.push(1);
+        q.unblock();
+        q.push(2);
+        q.unblock();
+        q.push(3);
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), None, "第一个令牌：取到它的 worker 退出");
+        assert_eq!(q.pop(), Some(2), "令牌之后的请求照常处理");
+        assert_eq!(q.pop(), None, "第二个令牌");
+        assert_eq!(q.pop(), Some(3));
+    }
+
+    // 巡检周期的钳位：默认 1s；下限 200ms；上限 1 小时
+    #[test]
+    fn listener_poll_is_clamped() {
+        assert_eq!(clamp_poll_ms(1000), 1000);
+        assert_eq!(clamp_poll_ms(0), 200);
+        assert_eq!(clamp_poll_ms(1), 200);
+        assert_eq!(clamp_poll_ms(199), 200);
+        assert_eq!(clamp_poll_ms(200), 200);
+        assert_eq!(clamp_poll_ms(u64::MAX), 3_600_000);
+    }
+
+    // 仅供单元测试：在指定端口上建一个动态模式的 Ctx（World 是全新的空状态）
+    fn test_ctx(port: u16) -> Arc<Ctx> {
+        Arc::new(Ctx {
+            world: Arc::new(World {
+                rooms: Mutex::new(HashMap::new()),
+                devices: Mutex::new(HashMap::new()),
+                offers_by_id: Mutex::new(HashMap::new()),
+                global_buffered: Mutex::new(0),
+                ip_bytes: Mutex::new(HashMap::new()),
+                ip_creates: Mutex::new(HashMap::new()),
+                longpoll_count: Mutex::new(HashMap::new()),
+                offers_mutex: Mutex::new(()),
+                offers_cond: Condvar::new(),
+                started_at: 0,
+            }),
+            statics: static_routes(),
+            limits: Limits { ip_rooms_max: PER_IP_ROOMS, ip_bytes_max: PER_IP_BYTES },
+            allowed_hosts: HashSet::new(),
+            update: Mutex::new(UpdateState::default()),
+            update_cond: Condvar::new(),
+            listeners: Mutex::new(HashMap::new()),
+            queue: Arc::new(RequestQueue::new()),
+            port,
+            dynamic: true,
+        })
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    // 自愈：某个监听器的泵退出（等价于 tiny_http 的 accept 线程出错）后，这个地址从监听器表
+    // 摘掉，下一次 ensure_listeners 重新绑上，连接继续被接受。旧实现里一次 accept 失败
+    // 意味着这个地址到重启前一直死着。
+    // 用 unblock() 触发泵退出：对泵而言 recv() 返回 Err 的两种原因（停机 / 内部出错）在此等价。
+    #[test]
+    fn dead_listener_is_rebound() {
+        use std::sync::atomic::Ordering;
+        // 供 ensure_listeners 用的地址来源：只列回环（不依赖本机真实网卡）
+        let dir = std::env::temp_dir().join(format!("cipherlane-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("addrs.txt");
+        std::fs::write(&file, "127.0.0.1\n").unwrap();
+
+        let port = free_port();
+        let ctx = test_ctx(port);
+        // 共用队列需要有 worker 在消费（main 里同样起这些线程）
+        for _ in 0..2 {
+            std::thread::spawn({
+                let ctx = ctx.clone();
+                move || worker(ctx)
+            });
+        }
+        std::env::set_var("CIPHERLANE_LAN_ADDRS_FILE", &file);
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+        let _guard = EnvGuard("CIPHERLANE_LAN_ADDRS_FILE"); // 断言失败也把环境变量清掉
+        ensure_listeners(&ctx);
+        let first = ctx.listeners.lock().unwrap().get("127.0.0.1").cloned().expect("回环应已绑定");
+        assert!(
+            matches!(first.server_addr(), tiny_http::ListenAddr::IP(a) if a.port() == port),
+            "监听器应在测试选的端口上：{:?}",
+            first.server_addr()
+        );
+        assert!(!SHUTTING_DOWN.load(Ordering::SeqCst), "测试前不应处于停机状态");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "刚绑上就应接受连接");
+
+        // 泵退出 = 这个监听器死了
+        first.unblock();
+        let gone = (0..200).any(|_| {
+            if ctx.listeners.lock().unwrap().contains_key("127.0.0.1") {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            } else {
+                true
+            }
+        });
+        assert!(gone, "泵退出后监听器应从表里摘掉");
+
+        // 生产环境里没有人再持有旧监听器：泵一退出它就被 Drop，Drop 会让 tiny_http 的 accept
+        // 线程退出、套接字关闭。测试这边同样放手，再去重新绑
+        drop(first);
+        // 自愈：重新绑上（旧套接字可能还要几毫秒才关完，所以这里允许几轮重试——生产里由
+        // 巡检的下一轮承担同样的重试），然后请求照常被处理
+        let rebound = (0..300).any(|_| {
+            ensure_listeners(&ctx);
+            if ctx.listeners.lock().unwrap().contains_key("127.0.0.1") {
+                true
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(rebound, "应重新绑上");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("重新绑上的地址应接受连接");
+        stream.write_all(b"GET /api/version HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        assert!(buf.starts_with(b"HTTP/1."), "请求应被处理：{}", String::from_utf8_lossy(&buf));
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 停机开始后不再补绑：drain_and_exit 期间泵退出是正常的，不能反过来触发重新监听。
+    // 不动全局的 SHUTTING_DOWN（单元测试并行跑），直接验证"不允许时什么都不绑"
+    #[test]
+    fn no_rebinding_once_shutting_down() {
+        let ctx = test_ctx(free_port());
+        ensure_listeners_if(&ctx, false);
+        assert!(ctx.listeners.lock().unwrap().is_empty(), "停机中不应绑任何地址");
+        // 对照：允许时把当前枚举到的地址都绑上（地址来源仍是真实网卡——只验证"会绑"，不验证绑了谁）
+        ensure_listeners_if(&ctx, true);
+        assert!(ctx.listeners.lock().unwrap().contains_key("127.0.0.1"), "允许时应至少绑上回环");
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //!  10) 独立实现互操作：本测试用 x25519-dalek/aes-gcm/sha2 独立构造房间密钥/hint/v2 分片/ackProof，
 //!      由 Rust CLI listen 解密、展示指纹并 ack——锁定 KDF/指纹/AAD/ackProof 逐字节兼容。
 //!  11) 终端注入净化（设备名 / 文件名中的 ANSI/BEL 控制字符）
+//!  12) --version / -V（版本号来自 Cargo.toml）
 //!
 //! 所有测试通过 `common::serial()` 跨进程串行，避免端口/设备单 IP 模型互相干扰。
 #![cfg(unix)]
@@ -970,3 +971,20 @@ fn terminal_injection_sanitized() {
     assert!(!txt.contains('\u{7}'), "CLI 输出不应含 BEL: {txt:?}");
     assert!(txt.contains("evilPWNED"), "净化后应保留可见文本: {txt:?}");
 }
+
+// ============================================================
+// 12) --version / -V：版本号来自 Cargo.toml（装完包确认跑的是哪一版）
+// ============================================================
+#[test]
+fn version_flag() {
+    let expect = format!("cipherlane-cli {}", env!("CARGO_PKG_VERSION"));
+    for flag in ["--version", "-V"] {
+        let out = Command::new(common::cli_bin()).arg(flag).output().expect("运行 --version");
+        assert!(out.status.success(), "{flag} 应成功退出");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expect, "{flag} 的输出");
+        assert!(out.stderr.is_empty(), "{flag} 不该往 stderr 写东西");
+    }
+    let help = run_cli("http://127.0.0.1:1", &["--help"]).1;
+    assert!(help.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))), "--help 的标题行也应带真实版本号：{help}");
+}
+

@@ -10,7 +10,7 @@
 
 [English](README.md) | 简体中文
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2068-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.1-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2079-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -132,7 +132,8 @@ cipherlane-cli recv 'http://.../#ROOM.KEY' [-o 保存路径]           # 链接�
 - **设备直发无法自动防服务器主动 MITM**：设备公钥由服务器分发，恶意服务器理论上可调包公钥冒充接收方。防线是**公钥指纹**（TOFU）：设备卡/名片显示 **128bit（32 hex）** 指纹，公钥变化会持续标"⚠ 公钥已变化"；设备直发与收到的邀请在公钥变化时都会强制二次确认，CLI 用 `--verify <指纹前缀>` 可强制校验——双方口头比对指纹可识破调包，但系统不会替你比对；名片上的 ↻ 可随时重置身份密钥。极高安全需求请用链接模式
 - **页面本身经明文 HTTP 下发**：端到端加密只防被动嗅探；路径上的主动攻击者理论上可替换下发的 JS（与浏览器打开任何 http 站点同级的风险）。不可信网络请配合 VPN 使用
 - 设备名称与在线状态对服务器及局域网内打开页面的用户可见——这是"设备发现"的固有代价
-- 服务默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不绑 VPN/tun、虚拟网卡等非信任网段；deb 服务模板同样按此默认，确有全网卡需求时用 systemd drop-in 覆盖 `HOST=0.0.0.0`
+- 服务默认只绑 127.0.0.1 与局域网（RFC1918）网卡，不绑 VPN/tun、虚拟网卡等非信任网段；deb 服务模板同样按此默认，确有全网卡需求时用 systemd drop-in 覆盖 `HOST=0.0.0.0`。网卡地址后到（开机时 Wi-Fi 还没连上）或变化（换网络、休眠唤醒）时会自动补绑，不需要重启（v1.0.1 起）
+- 进阶开关：`CIPHERLANE_LAN_ADDRS_FILE=<文件>` 把局域网地址来源换成文件（每行一个 IPv4，`#` 之后是注释；测试与特殊部署用），`CIPHERLANE_LISTENER_POLL_MS` 调整巡检周期（默认 1000）
 - `/api/*` 会校验 Host 与 Origin（防 DNS rebinding 与跨站 CSRF）；若通过自定义域名（反向代理、mDNS、hosts 别名）打开页面，需用 `CIPHERLANE_EXTRA_HOSTS=<域名1>,<域名2>` 放行，否则页面能打开但 API 返回 403
 - 链接模式接收支持断点续传（服务端分片可重放 + 进度释放；浏览器用 IndexedDB、CLI 用 `.part` 定位断点）；设备直发模式与浏览器多文件批量接收不支持，刷新后需发送方重发
 - 恶意丢弃流量属于 DoS，可检测（传输卡住/报错）但无法防止
@@ -179,6 +180,9 @@ CLI 为原生二进制（`cipherlane-cli`），无需任何运行时。
 
 **手机上看不到设备 / 别人看不到我？**
 必须连**同一个 WiFi / 网段**；首次使用注意系统防火墙是否放行了端口（Windows 会弹一次询问）；确认打开的是启动时打印的局域网地址而不是 `127.0.0.1`（回环只有本机能访问）。
+
+**开机后托盘显示"运行中"，但别的设备连不上、本机点托盘图标也打不开主页？**
+v1.0.0 及更早版本的开机竞态：服务由 systemd 在开机时拉起，比 Wi-Fi 先启动，启动那一刻找不到局域网地址，于是只绑定了 `127.0.0.1`，之后也不会再补。v1.0.1 起服务会自动补绑后到的网卡地址（最迟 1 秒），不需要重启。旧版本的临时办法：托盘菜单 → 停止服务 → 再点一次启动。判断当前是哪种情况：`ss -tlnp | grep 7777` 只看到 `127.0.0.1:7777` 就是没绑上；v1.0.1 起重启后 `journalctl -b -u cipherlane | grep '→'` 能看到 Wi-Fi 连上之后补上的那一行。
 
 **在 ZCode / Electron 等嵌入式浏览器里弹窗不生效？**
 部分嵌入式 webview 的 `alert/confirm` 与文件保存器不可用，属宿主限制。正式使用建议系统浏览器（Chrome / Edge / Safari）。
@@ -230,12 +234,21 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 ```
 
 - **crypto**：迁移 FIPS 197 / FIPS 180-4 / RFC 7748 标准向量与随机交叉（AES-256-GCM 含 AAD、SHA-256、X25519、二维码、头像）；期望值由 RustCrypto 计算
-- **protocol**：驱动真实 Rust 服务器二进制，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/ETag/Host 校验/链接模式全链路（CI 另对 musl 发布二进制直跑）
+- **protocol**：驱动真实 Rust 服务器二进制，覆盖在线/邀请/接受/拒绝/上限/同 IP 轮换/并发拉取/ack 凭证/ETag/Host 校验/链接模式全链路，以及监听地址动态维护（开机后地址才到、换网络、绑不上重试、显式 `HOST`、`--version`；地址来源用 `CIPHERLANE_LAN_ADDRS_FILE` 驱动，不碰真实网卡）（CI 另对 musl 发布二进制直跑）
 - **cli**：真实子进程端到端——`cipherlane-cli` ↔ Rust 服务器：单文件/目录递归批量（嵌套·中文·空文件·隐藏项跳过）/多路径混合/文本/SIGKILL 续传，字节级比对
 - **browser**：Rust CDP 客户端驱动真实无头 Chrome 的端到端冒烟（双页收发、错误路径、Worker 池断言）；无 Chrome 时自动跳过
 - **consistency**：README 徽章 ↔ `Cargo.toml` 版本、`include_bytes!` ↔ `public/`、必需 bin 与测试目标，以及对产品代码/构建脚本/CI/README 命令块的零 Node 守卫
 
 ## 更新日志
+
+**v1.0.1**（2026-11-24，开机后局域网连不上）
+- **修复：开机后服务只监听回环，别的设备连不上。** 服务由 systemd 在开机时拉起，几乎总是早于 Wi-Fi 认证 + DHCP，而旧版只在启动那一刻枚举一次网卡地址——于是每次开机都只绑定了 `127.0.0.1`：进程在跑、托盘显示"运行中"，但局域网里的设备连不上，托盘 / 桌面启动器打开的局域网地址也没人应答（本机三次开机的 journal 都是这个现象）。笔记本换 Wi-Fi、休眠唤醒后 DHCP 给了新地址，是同一个问题。现在服务持续维护监听地址：巡检线程每 1 秒、以及每次 `/api/version`，重新枚举网卡地址并补上监听；`/api/version` 的 `lan` 提示只认真正在监听的地址，所以开机后第一次点开主页就是通的。显式 `HOST=` 仍是"只监听该地址"。为此所有监听地址改为共用一组工作线程（每多一个地址只多 1 条线程；总数 256，少于过去三个地址各 128 个）
+- **修复：显式 `HOST=127.0.0.1` 时 `lan` 提示指向没人监听的地址**（回环页面拼出的链接 / 二维码 / 启动器地址都打不开）
+- 后到地址绑不上（端口被别的程序占着）不再可能拖垮启动：单个地址失败只告警一次并自动重试
+- **自愈：监听器内部出错后自动重新监听。** HTTP 库的 accept 线程遇到错误（比如文件描述符耗尽）会退出，旧实现里这等于该地址到重启前一直死着；现在出错的监听器会被摘掉并自动重绑。显式 `HOST=` 模式下唯一的监听器出错则服务以失败码退出，交给 systemd 重启
+- 新增 `cipherlane --version` / `cipherlane-cli --version`（`-V`）：装完包确认跑的是哪一版；CLI 用法标题的版本号改为取自 `Cargo.toml`（原先硬编码）
+- 测试：protocol 新增 5 组（地址后到由巡检补绑 / `/api/version` 同步补绑 / 绑不上自动重试 / 显式 `HOST` 不补绑 / `--version`），默认绑定面用例加强为"本机每个局域网地址都真的可达"；CLI 新增 `--version` 用例；服务端单元测试新增 5 个（地址文件解析、共用队列、巡检周期钳位、监听器自愈、停机中不补绑）
+- 升级：`sudo dpkg -i cipherlane_1.0.1_amd64.deb`，之后用 `cipherlane --version` 确认。真实重启机器的验证步骤见 FAQ"开机后别的设备连不上"
 
 **v1.0.0**（2026-10-20，单一实现）
 - **产品与测试彻底去 Node**：服务器、CLI、托盘与全部测试合并为同一套 Rust 实现；Node 版中继/CLI、Node 单文件可执行打包链与 Node 测试运行器全部移除；浏览器前端保持原生 JS，由 Rust 测试通过 CDP 驱动 Chrome 验证

@@ -1,6 +1,6 @@
 [package]
 name = "cipherlane"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 # is_some_and(1.70)/div_ceil(1.73)/let-else(1.65) + rustls 0.23 的 MSRV 要求
 rust-version = "1.75"

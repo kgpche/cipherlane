@@ -54,6 +54,7 @@ struct Opts {
     name: Option<String>,
     yes: bool,
     help: bool,
+    version: bool,
 }
 
 fn parse_args() -> Opts {
@@ -84,6 +85,7 @@ fn parse_args() -> Opts {
             }
             "--yes" | "-y" => o.yes = true,
             "--help" | "-h" => o.help = true,
+            "--version" | "-V" => o.version = true,
             _ => o.pos.push(argv[i].clone()),
         }
         i += 1;
@@ -93,7 +95,7 @@ fn parse_args() -> Opts {
 }
 
 fn usage() {
-    println!("cipherlane · 密道 CLI（Rust 版，v1.0）");
+    println!("cipherlane · 密道 CLI（Rust 版，v{}）", env!("CARGO_PKG_VERSION"));
     println!();
     println!("用法:");
     println!("  cipherlane-cli devices                       [--server http://<局域网IP>:7777]");
@@ -101,6 +103,7 @@ fn usage() {
     println!("  cipherlane-cli send-text <文本> [--to <设备IP>] [--verify <指纹hex≥8>] [--name <名称>] [--server ...]");
     println!("  cipherlane-cli recv '<接收链接>' [-o 输出路径]");
     println!("  cipherlane-cli listen [--yes] [-o 保存目录] [--name <名称>] [--server ...]");
+    println!("  cipherlane-cli --version                                   # 版本号");
     println!();
     println!("设备直发：--to 指定在线设备（cipherlane-cli devices 查看），密钥 X25519 协商，无需传链接。");
     println!("  指纹 = SHA256(X25519 公钥) 前 16 字节（32 hex）；可用 --verify 核对目标指纹（≥8 位前缀）。");
@@ -1647,6 +1650,11 @@ fn do_devices(server: &UrlParts) -> CResult<()> {
 // ============================================================
 fn main() {
     let opts = parse_args();
+    if opts.version {
+        // 装完包确认跑的是哪一版；服务器端是 cipherlane --version
+        println!("cipherlane-cli {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if opts.help {
         usage();
         return;

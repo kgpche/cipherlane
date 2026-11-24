@@ -172,6 +172,8 @@ After=network.target
 
 [Service]
 ExecStart=/usr/bin/cipherlane
+# 开机时服务常先于 Wi-Fi 启动：网卡地址后到 / 变化（换网络、休眠唤醒）由服务自动
+# 补绑监听，所以这里不需要等网络就绪（After=network-online 会拖慢开机）。
 # 默认与源码运行一致：只绑 127.0.0.1 + 局域网（RFC1918）网卡，避免把明文页暴露到
 # VPN/公网网卡。确有全网卡需求（如 VPN 内访问）时用 drop-in 覆盖：
 #   systemctl edit cipherlane  →  [Service] Environment=HOST=0.0.0.0

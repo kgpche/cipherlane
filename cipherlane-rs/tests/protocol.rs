@@ -29,6 +29,14 @@
 //!   group 26 SIGTERM 优雅停机：退出码 0 +「优雅停机」
 //!   group 27 突发连接：一批并发 keep-alive 连接全部有人处理
 //!   group 28 任务池不丢任务（直接驱动 vendor/tiny_http 的 TaskPool；g27 的确定性版本）
+//!   group 29 地址后到：服务启动后 Wi-Fi 才拿到地址 → 巡检线程自动补上监听（开机竞态）
+//!   group 30 /api/version 同步补绑：提示出去的局域网地址一定已经有人在监听
+//!   group 31 后到地址绑不上（端口被别的程序占着）→ 不致命、只打印一次、自动重试到成功
+//!   group 32 显式 HOST：只监听该地址，不动态补绑，lan 提示为 null
+//!   group 33 --version / -V
+//!
+//! 地址后到 / 地址变化用 CIPHERLANE_LAN_ADDRS_FILE 驱动（地址来源覆盖），不碰真实网卡、
+//! 不需要 root：往文件里写一个回环别名地址（127.0.0.2 等）就相当于"Wi-Fi 拿到了地址"。
 mod common;
 
 // 按路径引入 vendored tiny_http 的任务池源码：测的就是服务器编译进去的那份文件
@@ -37,8 +45,10 @@ mod common;
 #[allow(dead_code)]
 mod task_pool;
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -744,7 +754,30 @@ fn g12_default_binding() {
     for ip in &shown {
         assert!(is_trusted_lan(ip), "默认绑定面出现非信任网段地址: {ip}\n{out}");
     }
-    ok(&format!("默认绑定面仅回环/RFC1918（横幅 {}）", shown.join(", ")));
+    // 不只看横幅：本机此刻每一个 RFC1918 地址上都必须真的有人接受连接——别的设备只能
+    // 通过这些地址访问（地址后到的情况由 g29 覆盖，这里管"启动时就在的地址一个不漏"）
+    let mut private: Vec<String> = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for i in ifaces {
+            if let std::net::IpAddr::V4(v4) = i.ip() {
+                if !v4.is_loopback() && v4.is_private() {
+                    let a = v4.to_string();
+                    if !private.contains(&a) {
+                        private.push(a);
+                    }
+                }
+            }
+        }
+    }
+    let p = srv.port;
+    for ip in &private {
+        let up = common::wait_until(Duration::from_secs(8), || {
+            common::tcp_accepts(ip, p, Duration::from_millis(300)).then_some(())
+        });
+        assert!(up.is_some(), "本机的局域网地址 {ip} 没有被监听（横幅只列了 {shown:?}）");
+    }
+    assert!(common::tcp_accepts("127.0.0.1", p, Duration::from_millis(300)), "回环必须监听");
+    ok(&format!("默认绑定面仅回环/RFC1918，且本机 {} 个局域网地址全部可达（横幅 {}）", private.len(), shown.join(", ")));
 }
 
 // ==================== group 13) 长轮询并发上限 ====================
@@ -1268,3 +1301,190 @@ fn g28_task_pool_never_strands_a_task() {
         if pinned { "钉在单个 CPU 上" } else { "未能钉核" }
     ));
 }
+
+// ==================== group 29-33) 监听地址动态维护（开机竞态 / 换网络） ====================
+// 背景：服务由 systemd 在开机时拉起，几乎总是早于 Wi-Fi 认证 + DHCP；旧实现只在启动时枚举
+// 一次网卡地址，于是每次开机都只监听了 127.0.0.1——进程在跑、托盘显示"运行中"，但别的
+// 设备连不上（本机三次开机的 journal 都是这个现象）。现在 HOST 未设时会持续补绑。
+// 这些测试用 CIPHERLANE_LAN_ADDRS_FILE 当地址来源：往文件里写 127.0.0.x 就相当于
+// "Wi-Fi 拿到了地址"，不需要 root、不碰真实网卡。
+
+/// 起一台"地址来源是文件"的服务器：地址文件内容 + 巡检周期由调用方指定。
+fn spawn_file_server(dir: &std::path::Path, addrs: &str, poll_ms: &str) -> (common::Server, std::path::PathBuf) {
+    let file = dir.join("lan-addrs.txt");
+    fs::write(&file, addrs).expect("写地址文件");
+    // HOST=""：动态模式（基建默认只绑回环 127.0.0.1，这里要的是开机时的默认行为）
+    let srv = common::spawn_server(&[
+        ("HOST", ""),
+        ("CIPHERLANE_LAN_ADDRS_FILE", file.to_str().unwrap()),
+        ("CIPHERLANE_LISTENER_POLL_MS", poll_ms),
+    ]);
+    (srv, file)
+}
+
+fn version(port: u16) -> Value {
+    common::http(port, "GET", "/api/version", &[], None).expect("GET /api/version").json()
+}
+
+#[test]
+fn g29_lan_addr_appearing_after_start_gets_listener() {
+    let _g = common::serial();
+    let dir = common::unique_dir("cl-dyn-boot");
+    // 开机瞬间：Wi-Fi 还没连上，地址文件是空的
+    let (srv, file) = spawn_file_server(&dir, "", "400");
+    let p = srv.port;
+
+    // 此时只有回环；没人监听的地址不会被提示出去
+    assert_eq!(version(p)["version"], Value::String(env!("CARGO_PKG_VERSION").to_string()));
+    assert_eq!(version(p)["lan"], Value::Null, "还没有局域网地址时 lan 提示必须是 null");
+    assert!(
+        !common::tcp_accepts("127.0.0.2", p, Duration::from_millis(300)),
+        "还没出现的地址不该有人在监听"
+    );
+    assert!(srv.stdout().contains("还没有局域网地址"), "启动日志应说明会自动开始监听：{}", srv.stdout());
+
+    // Wi-Fi 连上：地址出现。之后完全不碰 /api/version，只靠巡检线程
+    fs::write(&file, "127.0.0.2\n").expect("写入地址");
+    let t0 = Instant::now();
+    let bound = common::wait_until(Duration::from_secs(10), || {
+        common::tcp_accepts("127.0.0.2", p, Duration::from_millis(200)).then_some(())
+    });
+    assert!(bound.is_some(), "地址出现 {}ms 后仍没开始监听", t0.elapsed().as_millis());
+
+    // 经新地址真的能办事：版本、主页、一次完整的分片收发
+    let r = common::http_at("127.0.0.2", p, "GET", "/api/version", &[], None).expect("经新地址取版本");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["lan"], "127.0.0.2");
+    let page = common::http_at("127.0.0.2", p, "GET", "/", &[], None).expect("经新地址取主页");
+    assert_eq!(page.status, 200);
+    assert!(page.header("Content-Security-Policy").is_some(), "新监听器上的响应头要齐全");
+    let created = common::http_at("127.0.0.2", p, "POST", "/api/rooms", &[], None).expect("建房");
+    assert_eq!(created.status, 200);
+    let (room, token) = (created.json()["room"].as_str().unwrap().to_string(), created.json()["token"].as_str().unwrap().to_string());
+    let posted = common::http_at(
+        "127.0.0.2",
+        p,
+        "POST",
+        &format!("/api/rooms/{room}/chunk"),
+        &[("X-Room-Token", token.as_str())],
+        Some(b"through-the-late-listener"),
+    )
+    .expect("投递分片");
+    assert_eq!(posted.status, 200, "经新监听器的写请求：{}", posted.text());
+    let got = common::http_at("127.0.0.2", p, "GET", &format!("/api/rooms/{room}/chunk?i=0"), &[], None).expect("拉取分片");
+    assert_eq!(got.status, 200);
+    assert_eq!(got.body, b"through-the-late-listener".to_vec());
+
+    // 原有回环地址不受影响；日志记录了开始监听的那一刻
+    assert_eq!(version(p)["lan"], "127.0.0.2");
+    let out = srv.stdout();
+    assert!(out.contains(&format!("http://127.0.0.2:{p}")), "日志应有新监听地址：{out}");
+
+    // 换网络：地址变成另一个
+    fs::write(&file, "127.0.0.3\n").expect("写入新地址");
+    let moved = common::wait_until(Duration::from_secs(10), || {
+        common::tcp_accepts("127.0.0.3", p, Duration::from_millis(200)).then_some(())
+    });
+    assert!(moved.is_some(), "换网络后新地址没被监听");
+    assert_eq!(version(p)["lan"], "127.0.0.3", "lan 提示应换成新地址");
+    assert_eq!(common::http_at("127.0.0.3", p, "GET", "/", &[], None).expect("经新地址取主页").status, 200);
+    let _ = fs::remove_dir_all(&dir);
+    ok("地址后到：开机时 Wi-Fi 未就绪 → 拿到地址后自动开始监听（新地址上收发可用）；换网络同理");
+}
+
+#[test]
+fn g30_version_endpoint_binds_new_addr_synchronously() {
+    let _g = common::serial();
+    let dir = common::unique_dir("cl-dyn-sync");
+    // 巡检周期调到 1 小时：测试期间巡检线程不可能运行，下面的补绑只能来自 /api/version
+    let (srv, file) = spawn_file_server(&dir, "", "3600000");
+    let p = srv.port;
+
+    fs::write(&file, "127.0.0.3\n").expect("写入地址");
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !common::tcp_accepts("127.0.0.3", p, Duration::from_millis(300)),
+        "巡检停掉时干等不该绑上——不然证明不了下面是同步补绑干的"
+    );
+
+    // 回环来源的页面 / 托盘 / 启动器问一次版本
+    assert_eq!(version(p)["lan"], "127.0.0.3", "lan 提示应立刻是新地址");
+    // 紧接着经提示出去的地址访问：必须已经可用，不用等巡检周期
+    let r = common::http_at("127.0.0.3", p, "GET", "/", &[], None).expect("经刚提示的地址取主页");
+    assert_eq!(r.status, 200);
+    assert!(common::tcp_accepts("127.0.0.3", p, Duration::from_millis(300)));
+    let _ = fs::remove_dir_all(&dir);
+    ok("/api/version 同步补绑：提示出去的局域网地址在回答之前就已经在监听");
+}
+
+#[test]
+fn g31_late_bind_failure_is_retried_not_fatal() {
+    let _g = common::serial();
+    let dir = common::unique_dir("cl-dyn-retry");
+    let (srv, file) = spawn_file_server(&dir, "", "300");
+    let p = srv.port;
+
+    // 另一个程序先占了 127.0.0.4:p（比如恰好同端口的别的服务）
+    let squatter = TcpListener::bind(("127.0.0.4", p)).expect("占用 127.0.0.4");
+    fs::write(&file, "127.0.0.4\n").expect("写入地址");
+
+    // 触发好几轮补绑（同步的 + 巡检的），每次都该失败
+    for _ in 0..6 {
+        assert_eq!(version(p)["lan"], Value::Null, "绑不上的地址不能被提示成可用");
+        thread::sleep(Duration::from_millis(350));
+    }
+    // 服务必须还活着，回环照常工作
+    assert_eq!(common::http(p, "GET", "/", &[], None).expect("回环取主页").status, 200);
+    let out = srv.stdout();
+    let failures = out.matches("失败（会自动重试）").count();
+    assert_eq!(failures, 1, "同一个地址的失败只该打印一次，实际 {failures} 次：\n{out}");
+
+    // 端口腾出来之后自动补上
+    drop(squatter);
+    let up = common::wait_until(Duration::from_secs(10), || {
+        common::http_at("127.0.0.4", p, "GET", "/api/version", &[], None)
+            .ok()
+            .filter(|r| r.status == 200)
+            .map(|_| ())
+    });
+    assert!(up.is_some(), "端口释放后没有自动补绑：{}", srv.stdout());
+    assert!(srv.stdout().contains("重新监听"), "恢复时应打印一次：{}", srv.stdout());
+    let _ = fs::remove_dir_all(&dir);
+    ok("后到地址绑不上：不致命、只告警一次、自动重试直到成功");
+}
+
+#[test]
+fn g32_explicit_host_is_static() {
+    let _g = common::serial();
+    let dir = common::unique_dir("cl-dyn-static");
+    // 显式 HOST=127.0.0.1：这是用户的明确选择，只监听它
+    let file = dir.join("lan-addrs.txt");
+    fs::write(&file, "127.0.0.5\n").expect("写地址文件");
+    let srv = common::spawn_server(&[
+        ("HOST", "127.0.0.1"),
+        ("CIPHERLANE_LAN_ADDRS_FILE", file.to_str().unwrap()),
+        ("CIPHERLANE_LISTENER_POLL_MS", "300"),
+    ]);
+    let p = srv.port;
+    thread::sleep(Duration::from_millis(1300));
+    assert!(!common::tcp_accepts("127.0.0.5", p, Duration::from_millis(300)), "显式 HOST 时不该补绑别的地址");
+    // 没有在监听的局域网地址 → 不提示（旧实现会提示一个没人监听的地址，回环页面拼出的链接打不开）
+    assert_eq!(version(p)["lan"], Value::Null);
+    assert_eq!(common::http(p, "GET", "/", &[], None).expect("回环取主页").status, 200);
+    let _ = fs::remove_dir_all(&dir);
+    ok("显式 HOST：只监听该地址、不动态补绑，lan 提示为 null");
+}
+
+#[test]
+fn g33_version_flag() {
+    let _g = common::serial();
+    let expect = format!("cipherlane {}", env!("CARGO_PKG_VERSION"));
+    for flag in ["--version", "-V"] {
+        let out = Command::new(common::server_bin()).arg(flag).output().expect("运行 --version");
+        assert!(out.status.success(), "{flag} 应成功退出");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expect, "{flag} 的输出");
+        assert!(out.stderr.is_empty(), "{flag} 不该往 stderr 写东西：{:?}", String::from_utf8_lossy(&out.stderr));
+    }
+    ok(&format!("--version / -V 输出「{expect}」"));
+}
+

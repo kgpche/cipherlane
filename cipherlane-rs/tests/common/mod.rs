@@ -192,8 +192,11 @@ pub fn spawn_server(extra_env: &[(&str, &str)]) -> Server {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        cmd.stdout(Stdio::from(std::fs::File::create(&log).expect("创建 server 日志失败")));
-        cmd.stderr(Stdio::null());
+        // stdout 与 stderr 写进同一个日志文件：补绑失败之类的告警走 stderr，测试要能断言
+        // "只打印一次、不刷屏"，panic 信息也能留在日志里便于排查
+        let log_file = std::fs::File::create(&log).expect("创建 server 日志失败");
+        cmd.stdout(Stdio::from(log_file.try_clone().expect("复制日志句柄失败")));
+        cmd.stderr(Stdio::from(log_file));
         let child = cmd.spawn().expect("启动 cipherlane 服务器失败");
         let mut srv = Server { child, port, stdout_path: log };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -220,6 +223,29 @@ pub fn spawn_server(extra_env: &[(&str, &str)]) -> Server {
     panic!("服务器 3 次启动均失败：{last_log}");
 }
 
+// ---------- 可达性 ----------
+/// 指定地址的端口此刻是否接受 TCP 连接（限时）。
+pub fn tcp_accepts(ip: &str, port: u16, timeout: Duration) -> bool {
+    match TcpStream::connect_timeout(&std::net::SocketAddr::new(ip.parse().expect("合法 IP"), port), timeout) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// 轮询直到条件成立；超时返回 None，否则返回条件谓词最后一次的值。
+pub fn wait_until<T: Clone>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ---------- 原始 HTTP ----------
 pub struct HttpResponse {
     pub status: u16,
@@ -244,6 +270,7 @@ impl HttpResponse {
 }
 
 /// HTTP/1.1 原始请求（默认 Host + Connection: close；headers 可覆盖 Host）。
+/// 连接的是 127.0.0.1；要打别的地址（如动态补绑的 127.0.0.2）用 `http_at`。
 pub fn http(
     port: u16,
     method: &str,
@@ -251,7 +278,20 @@ pub fn http(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> std::io::Result<HttpResponse> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    http_at("127.0.0.1", port, method, path, headers, body)
+}
+
+/// 同 `http`，但连接指定地址（服务器监听在哪个地址上就打哪个）。
+/// 默认 Host 头仍是 127.0.0.1:port（服务器对 IP 字面量的 Host 一律放行）。
+pub fn http_at(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> std::io::Result<HttpResponse> {
+    let mut stream = TcpStream::connect((ip, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(40)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut has_host = false;

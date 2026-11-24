@@ -154,3 +154,37 @@ Rust 化 review 发现的三类缺口全部修复：
   `--repo`（空跑不执行 publish job，所以空跑发现不了）。已改为显式 `--repo
   "$GITHUB_REPOSITORY"`；tag v1.0.0 重新指向修复后的提交，再由工作流发布。
 
+## v1.0.1：开机后只监听回环（2026-11-24）
+
+v1.0.0 发布后用户问"开机后服务正常吗"——此前从未测过。查 journal 发现本机有记录的三次
+开机 `cipherlane.service` 都由 systemd 自动启动、启动输出都只有一行 `127.0.0.1`：服务
+比 Wi-Fi 先启动（最近一次 17:09:05 启动，Wi-Fi 17:09:08 才开始认证），启动时枚举不到
+RFC1918 地址，而 `main()` 只枚举一次。托盘 / 启动器打开的是 `/api/version` 现算的
+局域网地址（没人监听）→ 连接被拒。
+
+- **修法**（`cipherlane-rs/src/main.rs`"监听器（动态绑定）"）：`Ctx` 持有监听器表与共用
+  请求队列 `RequestQueue<T>`；`bind_listener` 绑定地址并起一条泵线程（`recv()` →
+  队列）；`ensure_listeners` 在 HOST 未设时枚举地址补绑，调用点有两个——巡检线程
+  （`CIPHERLANE_LISTENER_POLL_MS`，默认 1s）与 `/api/version` 处理路径（同步，保证
+  提示出去的地址一定已在监听）。所有监听器共用 256 个 worker（= vendored tiny_http 的
+  连接上限），取代"每地址各 128 个"。只增不减：地址消失后监听器留着（2 条空闲线程），
+  地址回来立刻可用，也免去对 tiny_http 做运行期摘除监听器。
+- **`lan` 提示语义变化**：只认监听器表里有的地址（之前是"枚举到的首个 RFC1918 地址"，
+  显式 `HOST=127.0.0.1` 时会提示一个没人监听的地址）。
+- **测试**：protocol g29–g33 + g12 加强；地址来源可用 `CIPHERLANE_LAN_ADDRS_FILE` 覆盖
+  （往文件写 127.0.0.x = "Wi-Fi 拿到地址"），不需要 root。变异验证：停用补绑 → g29/g30/g31
+  失败；去掉 `/api/version` 的同步补绑 → g30 失败；`lan` 恢复旧语义 → g31/g32 失败。
+  另在临时 docker 容器里用真实网卡地址变化重演了开机顺序（服务先启动、后配地址 →
+  局域网地址 200）。
+- **监听器自愈**：泵线程退出（= tiny_http 的 accept 线程出错后退出）时把该地址从
+  监听器表摘掉，动态模式下巡检下一轮重绑（回环也在维持范围内）；显式 HOST 模式下唯一
+  监听器出错则 exit(1)。停机开始后（`SHUTTING_DOWN`）不再补绑。单元测试
+  `dead_listener_is_rebound` 用 `unblock()` 触发泵退出来驱动（没有 worker 的队列会让
+  测试永远挂着——单元测试里要自己起 `worker()`）。
+- `worker()` 从 main 里抽成函数；worker 一个都起不来时退出并报错，起不满时告警。
+- **仍未做**：真实重启机器的验证；`unshare -Urn` 在本机被 AppArmor 限制，无特权下
+  建不了带 veth 的网络命名空间；systemd 单元未改（`After=network.target` 只管顺序，
+  动态补绑后不需要等网络）。
+- 顺带：`cipherlane --version` / `cipherlane-cli --version`（`-V`）；CLI 用法标题版本号
+  取自 `Cargo.toml`；worker 线程一个都起不来时不再静默（退出并报错）。
+

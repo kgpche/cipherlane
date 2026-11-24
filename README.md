@@ -10,7 +10,7 @@ Send device-to-device (X25519 key agreement) or via shareable links. Content sta
 
 English | [简体中文](README.zh-CN.md)
 
-![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.0-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2068-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
+![CI](https://github.com/kgpche/cipherlane/actions/workflows/ci.yml/badge.svg) ![version](https://img.shields.io/badge/version-1.0.1-37d4a0) ![rust](https://img.shields.io/badge/rust-stable-dea584) ![tests](https://img.shields.io/badge/tests-cargo%20test%2079-f9ab00) ![license](https://img.shields.io/badge/license-MIT-8291b0)
 
 </div>
 
@@ -133,7 +133,8 @@ Limits: 64 chunks / 64 MB backpressure per room, 256 MB global, 64 rooms / 96 MB
 - **Device-direct mode cannot automatically stop an active MITM by the server**: device public keys are distributed by the server, so a malicious server could substitute keys and impersonate the receiver. The mitigation is **public-key fingerprints** (TOFU): device cards and your own card show a **128-bit (32-hex)** fingerprint, and a changed key is flagged "⚠ key changed" persistently; both direct sends and incoming invitations require explicit confirmation when the key changes, and the CLI can pin it with `--verify <prefix>` — comparing fingerprints out loud defeats substitution, but the system will not compare them for you; the ↻ button on your card resets the identity key at any time. For the highest assurance, use link mode
 - **The page itself is served over plain HTTP**: E2EE protects against passive observers only; an active on-path attacker could in principle replace the served JavaScript (the same class of risk as opening any plain-http site). Use a VPN on untrusted networks
 - Device names and presence are visible to the server and to anyone who opens the page on the LAN — the inherent cost of device discovery
-- The server binds 127.0.0.1 + LAN (RFC1918) interfaces by default, not VPN/tun or virtual adapters; the deb service template follows the same default — override with a systemd drop-in setting `HOST=0.0.0.0` only if you really need all interfaces
+- The server binds 127.0.0.1 + LAN (RFC1918) interfaces by default, not VPN/tun or virtual adapters; the deb service template follows the same default — override with a systemd drop-in setting `HOST=0.0.0.0` only if you really need all interfaces. Addresses that arrive later (Wi-Fi still connecting at boot) or change (new network, resume from sleep) are picked up automatically — no restart needed (since v1.0.1)
+- Advanced switches: `CIPHERLANE_LAN_ADDRS_FILE=<file>` takes the LAN address list from a file instead of the interfaces (one IPv4 per line, `#` starts a comment; for tests and unusual setups), and `CIPHERLANE_LISTENER_POLL_MS` adjusts the rescan interval (default 1000)
 - `/api/*` validates Host and Origin (anti-DNS-rebinding / CSRF); if you open the page through a custom hostname (reverse proxy, mDNS, hosts alias), whitelist it via `CIPHERLANE_EXTRA_HOSTS=<host1>,<host2>` or API calls return 403 while the page still loads
 - Resumable receiving in link mode (replayable chunks + progress release; browsers use IndexedDB, CLI resumes via `.part`); not supported for device-direct mode or multi-file batch receives — those must be resent after a refresh
 - Malicious packet dropping is DoS — detectable (stalled transfer / errors) but not preventable
@@ -180,6 +181,9 @@ The port is taken. Start with `PORT=7788 ./cipherlane` (source build) or set `PO
 
 **My phone can't see devices / others can't see me?**
 All devices must be on the **same Wi-Fi/subnet**; check that the OS firewall allows the port (Windows asks once); make sure you opened the LAN address printed at startup, not `127.0.0.1` (loopback is local-only).
+
+**After a reboot the tray says "running", but other devices can't connect and clicking the tray icon doesn't open the page?**
+A boot race in v1.0.0 and earlier: systemd starts the service before Wi-Fi is up, it finds no LAN address at that moment and binds only `127.0.0.1`, never catching up. Since v1.0.1 the service binds LAN addresses as they arrive (within about a second) — no restart needed. Workaround for older versions: tray menu → stop the service → click the tray icon to start it again. To tell which situation you are in: `ss -tlnp | grep 7777` showing only `127.0.0.1:7777` means it is not bound; on v1.0.1 `journalctl -b -u cipherlane | grep '→'` shows the LAN line appearing once Wi-Fi connects.
 
 **Popups don't work in ZCode / Electron embedded browsers?**
 Some embedded webviews lack `alert/confirm` and file savers — a host limitation. Use a real browser (Chrome / Edge / Safari) for serious work.
@@ -231,12 +235,21 @@ cargo test  --release --manifest-path cipherlane-rs/Cargo.toml --test screenshot
 ```
 
 - **crypto**: ported FIPS 197 / FIPS 180-4 / RFC 7748 vectors and random cross-checks (AES-256-GCM incl. AAD, SHA-256, X25519, QR code, avatars); expected values are computed with RustCrypto crates
-- **protocol**: spawns the real Rust server binary; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/ETag/Host checks/link mode end to end (CI also runs it against the musl release binary)
+- **protocol**: spawns the real Rust server binary; covers presence/invitations/accept/reject/limits/same-IP rotation/concurrent pulls/ack proofs/ETag/Host checks/link mode end to end, plus dynamic listener maintenance (addresses arriving after start, network changes, bind-failure retry, explicit `HOST`, `--version`; driven through `CIPHERLANE_LAN_ADDRS_FILE` without touching real interfaces) (CI also runs it against the musl release binary)
 - **cli**: real-subprocess end-to-end against `cipherlane-cli` + the Rust server — single file / recursive directory batch (nested · CJK names · empty files · hidden entries skipped) / mixed paths / text / SIGKILL-resume, byte-level comparison
 - **browser**: a Rust CDP client drives a real headless Chrome (two-page send/receive, error paths, worker-pool assertion); auto-skips when no Chrome is available
 - **consistency**: README badges ↔ `Cargo.toml` version, `include_bytes!` ↔ `public/`, required bins and test targets, plus a zero-Node guard over product code, build scripts, CI workflows and README command blocks
 
 ## Changelog
+
+**v1.0.1** (2026-11-24, unreachable from the LAN after boot)
+- **Fixed: after boot the service only listened on loopback, so other devices could not connect.** systemd starts the service at boot, almost always before Wi-Fi has authenticated and got a DHCP lease, and the old code enumerated interface addresses exactly once at startup — so on every boot it bound only `127.0.0.1`: the process was running and the tray said "running", but devices on the LAN could not connect and the LAN address opened by the tray / desktop launcher had nobody answering (the journal of all three recorded boots on the dev machine shows exactly this). Joining a different Wi-Fi or resuming from sleep with a new lease is the same problem. The service now maintains its listeners continuously: a watcher thread every second — and every `/api/version` call — re-enumerates interface addresses and binds the new ones; the `lan` hint in `/api/version` only ever names an address that is really being listened on, so the first click on the homepage after boot works. An explicit `HOST=` still means "listen on that address only". All listeners now share one worker pool (one extra thread per address; 256 in total, fewer than the old 128 per address × 3)
+- **Fixed: with an explicit `HOST=127.0.0.1` the `lan` hint pointed at an address nobody listened on** (links, QR codes and the launcher address built from a loopback page could not be opened)
+- An address that cannot be bound when it arrives (port already taken on that address by another program) can no longer take the startup down: one warning per address, retried automatically
+- **Self-healing: a listener that fails internally is rebound automatically.** The HTTP library's accept thread exits when it hits an error (file-descriptor exhaustion, for example); in the old code that left the address dead until restart. A failed listener is now dropped and rebound. In explicit `HOST=` mode, if the only listener fails the service exits with a failure code so systemd restarts it
+- Added `cipherlane --version` / `cipherlane-cli --version` (`-V`) so you can tell which build is installed; the CLI usage banner now takes its version from `Cargo.toml` (it used to be hard-coded)
+- Tests: 5 new protocol groups (late address bound by the watcher / synchronous binding on `/api/version` / bind-failure retry / explicit `HOST` stays static / `--version`), the default-binding case now asserts that every LAN address of the machine is really reachable, a `--version` case for the CLI, and 5 new server unit tests (address-file parsing, the shared queue, the poll-interval clamp, listener self-healing, no rebinding during shutdown)
+- Upgrading: `sudo dpkg -i cipherlane_1.0.1_amd64.deb`, then check with `cipherlane --version`. The steps to verify on a real reboot are in the FAQ entry "unreachable from the LAN after boot"
 
 **v1.0.0** (2026-10-20, single implementation)
 - **Node is gone from the repository**: server, CLI, tray and the entire test suite are Rust. The Node relay/CLI, the Node single-executable packaging path and the Node test runner are all removed; the browser frontend stays plain JS and is exercised by Rust tests through CDP
